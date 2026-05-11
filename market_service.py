@@ -303,9 +303,17 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
     for q in quotes:
         pct = float(q["pct_change"])
         meets = pct <= -th
-        alerted = already_alerted(q["symbol"], day)
-        would_send = meets and not alerted
-        need_more = max(0.0, th + pct)
+        
+        last_alert_pct = last_alerted_pct(q["symbol"], day)
+        if last_alert_pct is None:
+            alerted_today = False
+            would_send = meets
+            need_more = max(0.0, th + pct)
+        else:
+            alerted_today = True
+            would_send = pct <= last_alert_pct - MIN_DEEPER_STEP
+            need_more = max(0.0, (last_alert_pct - MIN_DEEPER_STEP) - pct) if not would_send else 0.0
+
         instruments.append(
             {
                 "symbol": q["symbol"],
@@ -316,7 +324,8 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
                 "pct_change_vs_prev_close": pct,
                 "dip_threshold_percent": th,
                 "condition_pct_vs_prev_close_lte_neg_threshold": meets,
-                "already_alerted_today_ist": alerted,
+                "already_alerted_today_ist": alerted_today,
+                "last_alerted_pct": last_alert_pct,
                 "would_send_telegram_now": would_send,
                 "percent_points_more_decline_to_hit_threshold": round(need_more, 4),
             }
@@ -328,7 +337,7 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
         "data_source": "Yahoo Finance via yfinance (often delayed vs NSE live ticks; not official).",
         "dip_rule_plain": (
             f"Fire when change vs previous session close is <= -{th:g}% "
-            f"(at least {th:g}% down). One Telegram per symbol per IST day."
+            f"(at least {th:g}% down). Subsequent alerts fire every {MIN_DEEPER_STEP}% deeper drop."
         ),
         "dip_threshold_percent": th,
         "instruments": instruments,
@@ -353,8 +362,11 @@ def format_dip_status_telegram(status: dict[str, Any]) -> str:
         )
         if i["would_send_telegram_now"]:
             lines.append("  → Would ALERT on next monitor tick ✅")
-        elif i["already_alerted_today_ist"] and i["condition_pct_vs_prev_close_lte_neg_threshold"]:
-            lines.append("  → Dip condition met but already messaged today ⏸")
+        elif i["already_alerted_today_ist"]:
+            extra = i["percent_points_more_decline_to_hit_threshold"]
+            last_pct = i["last_alerted_pct"]
+            lines.append(f"  → Already alerted today at {last_pct:.2f}% ⏸")
+            lines.append(f"  → Needs to drop to {last_pct - MIN_DEEPER_STEP:.2f}% for next alert (~{extra:.2f}% more)")
         else:
             extra = i["percent_points_more_decline_to_hit_threshold"]
             lines.append(
