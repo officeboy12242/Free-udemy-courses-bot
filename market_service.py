@@ -15,6 +15,9 @@ from typing import Any
 
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
+
+load_dotenv()
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +35,7 @@ SYMBOL_FALLBACKS: dict[str, tuple[str, ...]] = {
     "NIFTYBEES.NS": ("NIFTYBEES.BO",),
 }
 
-MARKET_ALERT_CHAT_ID = os.getenv("MARKET_ALERT_CHAT_ID", "@Its_Mirror_Here")
+MARKET_ALERT_CHAT_ID = os.getenv("MARKET_ALERT_CHAT_ID", "")
 DIP_THRESHOLD_PERCENT = float(os.getenv("DIP_THRESHOLD_PERCENT", "1.0"))
 MARKET_POLL_INTERVAL = int(os.getenv("MARKET_POLL_INTERVAL", "120"))
 MARKET_FEATURES_ENABLED = os.getenv("MARKET_FEATURES_ENABLED", "1").lower() in (
