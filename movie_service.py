@@ -18,6 +18,9 @@ from typing import Any
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()  # ensure .env is loaded before base-URL constants are evaluated below
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +28,13 @@ log = logging.getLogger(__name__)
 # Sign up free at https://www.scraperapi.com  — 5,000 req/month free
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 SCRAPER_API_URL = "http://api.scraperapi.com"
+
+# ── Configurable base URLs ─────────────────────────────────────────────────────
+# Override any of these in .env (or Render dashboard) when a domain changes:
+#   HDH_BASE_URL=https://new-4khdhub-domain.link
+#   MD_BASE_URL=https://new-moviesdrives-domain.my
+#   M4U_BASE_URL=https://new-movies4u-domain.ee
+#   VEGA_BASE_URL=https://new-vegamovies-domain.global
 
 # Full browser-like headers to avoid 403 blocks
 HEADERS = {
@@ -49,7 +59,8 @@ HEADERS = {
 }
 
 # Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
-_NO_VERIFY_HOSTS = {"4khdhub.link"}
+# Automatically tracks HDH_BASE_URL so it still works after a domain change.
+_NO_VERIFY_HOSTS = {urllib.parse.urlparse(os.getenv("HDH_BASE_URL", "https://4khdhub.link")).hostname or "4khdhub.link"}
 
 # Per-host persistent sessions so cookies are carried across requests
 _sessions: dict[str, requests.Session] = {}
@@ -138,7 +149,7 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
 
 # ─── 4KHDHub ────────────────────────────────────────────────────────────────
 
-HDH_BASE = "https://4khdhub.link"
+HDH_BASE     = os.getenv("HDH_BASE_URL", "https://4khdhub.link")
 HDH_CATEGORY = f"{HDH_BASE}/category/hindi-movies/"
 
 
@@ -245,7 +256,7 @@ def hdh_movie_links(movie_url: str) -> dict[str, Any]:
 
 # ─── MoviesDrive ─────────────────────────────────────────────────────────────
 
-MD_BASE = "https://new2.moviesdrives.my"
+MD_BASE = os.getenv("MD_BASE_URL", "https://new2.moviesdrives.my")
 
 
 MD_PAGE_SIZE = 10
@@ -515,7 +526,7 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
     try:
         # The frontend JS uses GET with ?q= and ?page= params
         resp = _get(
-            "https://new2.moviesdrives.my/search.php",
+            f"{MD_BASE}/search.php",
             params={"q": query, "page": 1},
             timeout=15,
         )
@@ -529,7 +540,7 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
             poster = doc.get("post_thumbnail", "")
             if not permalink:
                 continue
-            url = "https://new2.moviesdrives.my" + permalink if not permalink.startswith("http") else permalink
+            url = MD_BASE + permalink if not permalink.startswith("http") else permalink
             movies.append({"title": title, "url": url, "poster": poster, "source": "md"})
             if len(movies) >= limit:
                 break
@@ -541,7 +552,7 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 # ─── Movies4U ────────────────────────────────────────────────────────────────
 
-M4U_BASE   = "https://movies4u.ee"
+M4U_BASE   = os.getenv("M4U_BASE_URL", "https://movies4u.ee")
 M4U_SEARCH = f"{M4U_BASE}/?s="
 
 # Domains to treat as ads / skip
@@ -986,7 +997,7 @@ def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = Tru
 #  Vegamovies  (https://vegamovies.global/)
 # ══════════════════════════════════════════════════════════════════════════════
 
-VEGA_BASE = "https://vegamovies.global"
+VEGA_BASE        = os.getenv("VEGA_BASE_URL", "https://vegamovies.global")
 _VEGA_SEARCH_URL = VEGA_BASE + "/?do=search&subaction=search&story={}"
 
 

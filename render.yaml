@@ -15,6 +15,15 @@ services:
         sync: false
       - key: SCRAPER_API_KEY
         sync: false
+      # Movie site domains — update value here when a domain changes
+      - key: HDH_BASE_URL
+        value: "https://4khdhub.link"
+      - key: MD_BASE_URL
+        value: "https://new2.moviesdrives.my"
+      - key: M4U_BASE_URL
+        value: "https://movies4u.ee"
+      - key: VEGA_BASE_URL
+        value: "https://vegamovies.global"
       - key: DIP_THRESHOLD_PERCENT
         value: "1"
       - key: MIN_DEEPER_STEP
