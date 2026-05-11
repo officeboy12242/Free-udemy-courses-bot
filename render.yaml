@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: telegram-course-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_with_healthcheck.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      # Optional market alerts (defaults: @Its_Mirror_Here, dip 1%, polling on)
+      # - key: MARKET_ALERT_CHAT_ID
+      #   value: "@Its_Mirror_Here"
+      # - key: DIP_THRESHOLD_PERCENT
+      #   value: "1"
+      # - key: MARKET_FEATURES_ENABLED
+      #   value: "1"
+    healthCheckPath: /health
+    autoDeploy: true
