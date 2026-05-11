@@ -100,8 +100,20 @@ Here's what I can do:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_message:
+    if not update.effective_message or not update.effective_chat:
         return
+        
+    # Save user to DB so they receive market alerts
+    chat_id = update.effective_chat.id
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute("INSERT OR IGNORE INTO bot_users (chat_id) VALUES (?)", (chat_id,))
+        con.commit()
+    except Exception as e:
+        log.error("Failed to save user %s: %s", chat_id, e)
+    finally:
+        con.close()
+        
     await update.effective_message.reply_html(WELCOME_HTML)
 
 
@@ -290,9 +302,16 @@ def init_db():
             posted_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bot_users (
+            chat_id INTEGER PRIMARY KEY
+        )
+    """)
     con.commit()
     con.close()
     ensure_market_tables()
+    from news_service import ensure_news_table
+    ensure_news_table()
     log.info("✅ SQLite DB ready: %s", DB_FILE)
 
 

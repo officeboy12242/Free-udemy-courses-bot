@@ -426,6 +426,42 @@ async def build_dip_status_async(threshold_percent: float | None = None) -> dict
     return await asyncio.to_thread(build_dip_status, threshold_percent)
 
 
+def get_all_subscribers() -> list[int]:
+    """Return all chat IDs that should receive market alerts."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        users = []
+        try:
+            rows = con.execute("SELECT chat_id FROM bot_users").fetchall()
+            users = [r[0] for r in rows]
+        except sqlite3.OperationalError:
+            pass  # Table might not exist yet if no one sent /start
+            
+        # Also include the main MARKET_ALERT_CHAT_ID if it's set
+        try:
+            main_id = int(MARKET_ALERT_CHAT_ID)
+            if main_id not in users:
+                users.append(main_id)
+        except (ValueError, TypeError):
+            pass
+            
+        return users
+    finally:
+        con.close()
+
+
+def remove_subscriber(chat_id: int):
+    """Remove a user who blocked the bot."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute("DELETE FROM bot_users WHERE chat_id = ?", (chat_id,))
+        con.commit()
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+
 async def run_market_monitor(bot, alert_chat_id: str | None = None):
     """Poll markets; alert every time dip grows deeper by MIN_DEEPER_STEP%."""
     if not MARKET_FEATURES_ENABLED:
@@ -463,16 +499,26 @@ async def run_market_monitor(bot, alert_chat_id: str | None = None):
                     continue
                 count = alert_count_today(sym, day) + 1
                 text = format_dip_alert(s["name"], pct, threshold)
-                try:
-                    await bot.send_message(chat_id=chat, text=text)
+                
+                subscribers = get_all_subscribers()
+                if not subscribers:
+                    log.warning("No subscribers found to send dip alert to.")
                     record_alert(sym, day, pct)
-                    log.info("Dip alert #%d sent: %s %.2f%%", count, s["name"], pct)
-                except TelegramError as e:
-                    log.error(
-                        "Telegram dip alert FAILED for %s → chat=%s | error: %s | "
-                        "Fix: user must /start the bot, or use a numeric chat_id.",
-                        sym, chat, e,
-                    )
+                    continue
+
+                sent_count = 0
+                for cid in subscribers:
+                    try:
+                        await bot.send_message(chat_id=cid, text=text)
+                        sent_count += 1
+                        await asyncio.sleep(0.1)  # Rate limit protection
+                    except TelegramError as e:
+                        log.error("Telegram dip alert FAILED for %s → chat=%s | error: %s", sym, cid, e)
+                        if "Forbidden" in str(e) or "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                            remove_subscriber(cid)
+                            
+                record_alert(sym, day, pct)
+                log.info("Dip alert #%d sent to %d users: %s %.2f%%", count, sent_count, s["name"], pct)
         except Exception as e:
             log.exception("Market monitor iteration error: %s", e)
 
