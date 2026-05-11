@@ -129,7 +129,7 @@ def minutes_since_last_alert(symbol: str, alert_date: str) -> float:
                ORDER BY alerted_at DESC LIMIT 1""",
             (symbol, alert_date),
         ).fetchone()
-        if not row:
+        if not row or not row[0]:
             return float("inf")
         last = datetime.fromisoformat(row[0])
         now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
@@ -245,11 +245,32 @@ async def fetch_all_snapshots_async() -> list[dict[str, Any]]:
 
 def format_dip_alert(name: str, pct_change: float, threshold: float) -> str:
     down = abs(pct_change)
+
+    if down >= 3:
+        intensity = "\U0001f6a8\U0001f6a8 MAJOR DIP \U0001f6a8\U0001f6a8"
+        bar = "\u2588" * 10
+        arrow = "\U0001f4a5"
+    elif down >= 2:
+        intensity = "\u26a0\ufe0f STRONG DIP \u26a0\ufe0f"
+        bar = "\u2588" * 7 + "\u2591" * 3
+        arrow = "\U0001f53b"
+    else:
+        intensity = "\U0001f4c9 DIP ALERT \U0001f4c9"
+        bar = "\u2588" * 4 + "\u2591" * 6
+        arrow = "\u2b07\ufe0f"
+
     return (
-        f"{name} is down {down:.2f}% vs yesterday's close "
-        f"(threshold {threshold:g}%). Time to SIP the dip 📉\n\n"
-        f"Manual SIP idea: consider your planned equity allocation on dips "
-        f"— stay within your risk budget and goals."
+        f"{arrow} {intensity}\n"
+        f"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n"
+        f"\U0001f3af  {name}\n"
+        f"\U0001f4ca  Drop: -{down:.2f}%  [{bar}]\n"
+        f"\u23f0  Threshold: {threshold:g}%\n"
+        f"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n"
+        f"\U0001f4b0 Time to SIP the Dip!\n\n"
+        f"\U0001f9fe  Consider your planned equity allocation\n"
+        f"\u2714\ufe0f  Stay within your risk budget & goals\n"
+        f"\U0001f680  Every dip is an opportunity\n\n"
+        f"\u26a1 Powered by @CoursesDrivee"
     )
 
 
@@ -262,8 +283,8 @@ def format_test_dip_alert(
     th = threshold if threshold is not None else DIP_THRESHOLD_PERCENT
     body = format_dip_alert(name, pct_change, th)
     return (
-        "🧪 TEST ALERT — dip trigger preview\n"
-        "(Not a live market signal.)\n\n"
+        "\U0001f9ea TEST ALERT \u2014 not a live market signal\n"
+        "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
         f"{body}"
     )
 
