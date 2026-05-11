@@ -154,7 +154,22 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
                 href = a_tag.get("href", "")
                 link_text = re.sub(r"\s+", " ", a_tag.text.strip())
                 if href and link_text:
-                    links.append({"label": label, "name": link_text, "url": href})
+                    if "mdrive.lol" in href:
+                        # Fetch inner links
+                        try:
+                            inner_resp = requests.get(href, headers=HEADERS, timeout=10)
+                            inner_soup = BeautifulSoup(inner_resp.text, "html.parser")
+                            # Inner links are usually in <p> tags with images like hubcloud or gdflix
+                            for inner_a in inner_soup.select(".entry-content p a"):
+                                inner_href = inner_a.get("href", "")
+                                if inner_href and ("hubcloud" in inner_href or "gdflix" in inner_href):
+                                    provider = "HubCloud" if "hubcloud" in inner_href else "GDFlix"
+                                    links.append({"label": label, "name": f"{link_text} ({provider})", "url": inner_href})
+                        except Exception as e:
+                            log.error("Failed to fetch inner mdrive link %s: %s", href, e)
+                            links.append({"label": label, "name": link_text, "url": href})
+                    else:
+                        links.append({"label": label, "name": link_text, "url": href})
             i += 1
 
         # Remove duplicates preserving order
@@ -196,7 +211,20 @@ def format_md_message(movie_title: str, data: dict[str, Any]) -> str:
         return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
 
     lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (MoviesDrive)</b>\n"]
+    
+    # Group links by label (e.g. "480p[430.36 MB]")
+    grouped = {}
     for l in links:
-        lines.append(f"<a href='{l['url']}'>{l['name']}</a>")
+        grouped.setdefault(l["label"], []).append(l)
+        
+    for label, group_links in list(grouped.items())[:6]:
+        lines.append(f"📼 <b>{label}</b>")
+        parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
+        lines.append("  " + " | ".join(parts))
+        lines.append("")
+        
+    if len(grouped) > 6:
+        lines.append(f"<i>…and {len(grouped) - 6} more on the website.</i>")
+        
     lines.append("\n⚡ Powered by @CoursesDrivee")
     return "\n".join(lines)

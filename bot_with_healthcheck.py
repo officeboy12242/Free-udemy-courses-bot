@@ -275,16 +275,27 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         poster_url = detail.get("poster") or movie.get("poster", "")
         back_cb = f"msite_{source}"
 
-        # Send poster first, then links as a separate message
-        if poster_url:
+        # Send poster with text as caption if possible
+        if poster_url and len(text) <= 1024:  # Telegram caption limit is 1024 chars
             try:
                 await query.message.reply_photo(
                     photo=poster_url,
-                    caption=f"🎬 <b>{movie['title']}</b>",
+                    caption=text,
                     parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("« Back to list", callback_data=back_cb)]]
+                    ),
                 )
+                return
             except Exception:
-                pass  # Poster failed — still send links below
+                pass  # Poster failed or caption issue — fallback to text only
+
+        # Fallback: send poster without caption, then text message
+        if poster_url:
+            try:
+                await query.message.reply_photo(photo=poster_url)
+            except Exception:
+                pass
 
         await query.message.reply_html(
             text,
