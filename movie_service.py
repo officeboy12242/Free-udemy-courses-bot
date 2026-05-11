@@ -188,9 +188,31 @@ def hdh_movie_links(movie_url: str) -> dict[str, Any]:
             title_el = parent.select_one(".flex-1.text-left.font-semibold")
             if not title_el:
                 continue
-            quality_title = " ".join(
+
+            # First text node = "Movie Name (quality spec)" — strip movie name
+            raw_title = " ".join(
                 (title_el.contents[0] if title_el.contents else "").strip().split()
             )
+            # Extract just the quality part inside the last parentheses
+            m = re.search(r"\(([^)]+)\)\s*$", raw_title)
+            quality_title = m.group(1).strip() if m else raw_title
+
+            # Extract badges: size (orange), audio/languages (teal), format (green)
+            size_badge = ""
+            audio_badge = ""
+            format_badge = ""
+            for badge in title_el.select("span.badge"):
+                style = badge.get("style", "")
+                text = badge.get_text(strip=True)
+                if not text:
+                    continue
+                if "#ea580c" in style:        # orange → file size
+                    size_badge = text
+                elif "#0d9488" in style:      # teal  → languages / audio
+                    audio_badge = text
+                elif "#15803d" in style:      # green → format
+                    format_badge = text
+
             links = []
             for a in content_div.select("a.btn"):
                 text = re.sub(r"\s+", " ", a.text.strip()).replace("Download ", "")
@@ -198,7 +220,13 @@ def hdh_movie_links(movie_url: str) -> dict[str, Any]:
                 if text and href:
                     links.append({"name": text, "url": href})
             if links:
-                qualities.append({"quality": quality_title, "links": links})
+                qualities.append({
+                    "quality": quality_title,
+                    "size": size_badge,
+                    "audio": audio_badge,
+                    "format": format_badge,
+                    "links": links,
+                })
 
         return {"poster": poster, "qualities": qualities}
     except Exception as e:
@@ -551,7 +579,7 @@ def format_hdh_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
         lines.append(f"🎬 <b>{movie_title}</b>")
     lines.append("━" * 32)
 
-    # Info block (HDH pages don't usually have structured metadata, skip if empty)
+    # Info block from page metadata (if any)
     info = data.get("info", {})
     info_lines = _info_block(info)
     if info_lines:
@@ -560,9 +588,21 @@ def format_hdh_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
 
     lines.append("\n📥 <b>Download Links</b>  <i>(4KHDHub)</i>\n")
     for q in qualities:
+        # Quality header line
         lines.append(f"📦 <b>{q['quality']}</b>")
+        # Inline badges: size | audio | format
+        meta_parts = []
+        if q.get("size"):
+            meta_parts.append(f"📁 {q['size']}")
+        if q.get("audio"):
+            meta_parts.append(f"🗣 {q['audio']}")
+        if q.get("format"):
+            meta_parts.append(f"📺 {q['format']}")
+        if meta_parts:
+            lines.append("   " + "  |  ".join(meta_parts))
+        # Download links
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in q["links"]]
-        lines.append("   " + " · ".join(parts))
+        lines.append("   🔗 " + " · ".join(parts))
         lines.append("")
     if footer:
         lines.append("━" * 32)
