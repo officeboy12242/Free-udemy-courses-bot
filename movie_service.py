@@ -69,14 +69,21 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
     """
     # ── ScraperAPI mode ──────────────────────────────────────────────────────
     if SCRAPER_API_KEY:
-        api_url = SCRAPER_API_URL
-        params = {"api_key": SCRAPER_API_KEY, "url": url, "render": "false"}
-        # remove any timeout kwarg and re-apply a generous default
+        # If the caller passed query params (e.g. search functions), bake them
+        # into the URL first — ScraperAPI uses its own `params` dict so we
+        # cannot pass two separate `params` kwargs to requests.get().
+        caller_params = kwargs.pop("params", None)
+        if caller_params:
+            encoded = urllib.parse.urlencode(caller_params)
+            sep = "&" if "?" in url else "?"
+            url = url + sep + encoded
+
+        api_params = {"api_key": SCRAPER_API_KEY, "url": url, "render": "false"}
         kwargs.setdefault("timeout", 30)
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                resp = requests.get(api_url, params=params, **kwargs)
+                resp = requests.get(SCRAPER_API_URL, params=api_params, **kwargs)
                 if resp.status_code in (403, 429, 500, 503) and attempt < retries:
                     log.warning("ScraperAPI %s → HTTP %s (attempt %d), retrying…",
                                 url, resp.status_code, attempt + 1)
