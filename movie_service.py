@@ -537,6 +537,228 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         return []
 
 
+# ─── Movies4U ────────────────────────────────────────────────────────────────
+
+M4U_BASE   = "https://movies4u.ee"
+M4U_SEARCH = f"{M4U_BASE}/?s="
+
+# Domains to treat as ads / skip
+_M4U_AD_HOSTS = {"swagvio.com", "fuckmaza.com", "hianime.mx"}
+
+# Recognised download providers on mdrive.ink
+_M4U_DL_HOSTS = {
+    "fastdl.zip", "vcloud.zip", "filebee.xyz", "dgdrive.site",
+    "hubcloud.foo", "hubdrive.space", "gdflix.pro", "gofile.io",
+    "mediafire.com", "pixeldrain.com", "1fichier.com",
+}
+
+
+def _is_m4u_dl(href: str) -> bool:
+    host = urllib.parse.urlparse(href).hostname or ""
+    return any(h in host for h in _M4U_DL_HOSTS)
+
+
+def _m4u_provider(href: str) -> str:
+    host = urllib.parse.urlparse(href).hostname or ""
+    host = host.lstrip("www.")
+    # Friendly names
+    _MAP = {
+        "fastdl.zip": "G-Direct",
+        "vcloud.zip": "V-Cloud",
+        "filebee.xyz": "Filepress",
+        "dgdrive.site": "DropGalaxy",
+    }
+    for domain, name in _MAP.items():
+        if domain in host:
+            return name
+    return host.split(".")[0].title()
+
+
+def _scrape_mdrive_ink(mdrive_url: str) -> list[dict[str, Any]]:
+    """Scrape an mdrive.ink/mdisk page — returns links grouped by quality label."""
+    try:
+        resp = _get(mdrive_url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        links: list[dict[str, Any]] = []
+        current_label = "Download"
+
+        # Walk all children of <body> in order; h5 = quality label, a = link
+        for tag in soup.find_all(["h5", "a"]):
+            if tag.name == "h5":
+                current_label = tag.get_text(strip=True)
+            elif tag.name == "a":
+                href = tag.get("href", "")
+                host = urllib.parse.urlparse(href).hostname or ""
+                # Skip ads and non-download links
+                if not href.startswith("http"):
+                    continue
+                if any(ad in host for ad in _M4U_AD_HOSTS):
+                    continue
+                if not _is_m4u_dl(href):
+                    continue
+                prov = _m4u_provider(href)
+                links.append({
+                    "label": current_label,
+                    "name": f"{current_label} ({prov})",
+                    "url": href,
+                })
+        return links
+    except Exception as e:
+        log.error("mdrive.ink scrape failed (%s): %s", mdrive_url, e)
+        return []
+
+
+def _scrape_m4u_info(content) -> dict[str, str]:
+    """Parse movies4u.ee info block (plain text 'Label:\\nValue' format)."""
+    info: dict[str, str] = {}
+    text = content.get_text("\n", strip=True)
+
+    # Map of search patterns → field name
+    _PATTERNS = [
+        (r"IMDb\s+Rating\s*[:\-]+\s*([\d./]+)", "imdb"),
+        (r"Language\s*:\s*\n?((?:(?!(?:Subtitle|Size|Quality|Format|Movie|Release|Genre|Director|Cast|Plot|Synopsis))[^\n])+)", "language"),
+        (r"Genre\s*:\s*\n?([^\n]+)", "genre"),
+        (r"Quality\s*:\s*\n?([^\n]+)", "quality"),
+        (r"(?:Director|Directed by)\s*:\s*\n?([^\n]+)", "director"),
+        (r"(?:Stars?|Cast)\s*:\s*\n?([^\n]+)", "stars"),
+    ]
+    for pattern, field in _PATTERNS:
+        if field in info:
+            continue
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip().rstrip(".")
+            if val:
+                info[field] = val
+    return info
+
+
+def m4u_latest_movies(page: int = 1) -> list[dict[str, str]]:
+    """Scrape page N of movies4u.ee homepage."""
+    try:
+        url = M4U_BASE + "/" if page == 1 else f"{M4U_BASE}/page/{page}/"
+        resp = _get(url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        movies: list[dict[str, str]] = []
+        for art in soup.select("article"):
+            title_a = art.select_one(".entry-title a, h2 a, h3 a")
+            if not title_a:
+                continue
+            title = title_a.get_text(strip=True)
+            link  = title_a.get("href", "")
+            img   = art.select_one("img")
+            poster = img.get("src", "") or img.get("data-src", "") if img else ""
+            if link:
+                movies.append({"title": title, "url": link,
+                               "poster": poster, "source": "m4u"})
+            if len(movies) >= 10:
+                break
+        return movies
+    except Exception as e:
+        log.error("Movies4U listing failed: %s", e)
+        return []
+
+
+def m4u_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape a movies4u.ee movie page → poster, info, and quality/download links."""
+    try:
+        resp = _get(movie_url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Poster
+        poster = ""
+        og = soup.find("meta", property="og:image")
+        if og:
+            poster = og.get("content", "")
+
+        # Info block (IMDB, language, quality, etc.) — movies4u uses plain text format
+        content = soup.select_one(".entry-content") or soup.find("main") or soup
+        info = _scrape_m4u_info(content)
+
+        # Find the first mdrive.ink link on the page
+        mdrive_url = ""
+        for a in (content or soup).find_all("a", href=True):
+            href = a.get("href", "")
+            if "mdrive.ink/mdisk" in href:
+                mdrive_url = href
+                break
+
+        links: list[dict[str, Any]] = []
+        if mdrive_url:
+            links = _scrape_mdrive_ink(mdrive_url)
+
+        return {"poster": poster, "links": links, "info": info}
+    except Exception as e:
+        log.error("Movies4U movie page failed (%s): %s", movie_url, e)
+        return {"poster": "", "links": [], "info": {}}
+
+
+def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search movies4u.ee via WordPress ?s= parameter."""
+    try:
+        resp = _get(M4U_SEARCH + urllib.parse.quote_plus(query), timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        movies: list[dict[str, str]] = []
+        for art in soup.select("article"):
+            title_a = art.select_one(".entry-title a, h2 a, h3 a")
+            if not title_a:
+                continue
+            title = title_a.get_text(strip=True)
+            link  = title_a.get("href", "")
+            img   = art.select_one("img")
+            poster = img.get("src", "") or img.get("data-src", "") if img else ""
+            if link:
+                movies.append({"title": title, "url": link,
+                               "poster": poster, "source": "m4u"})
+            if len(movies) >= limit:
+                break
+        return movies
+    except Exception as e:
+        log.error("Movies4U search failed for '%s': %s", query, e)
+        return []
+
+
+def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
+    """Format movies4u.ee result — same style as MoviesDrive."""
+    links = data.get("links", [])
+    if not links:
+        return ""
+
+    lines = []
+    if movie_title:
+        lines.append(f"🎬 <b>{movie_title}</b>")
+    lines.append("━" * 32)
+
+    info = data.get("info", {})
+    info_lines = _info_block(info)
+    if info_lines:
+        lines.extend(info_lines)
+        lines.append("━" * 32)
+
+    lines.append("\n📥 <b>Download Links</b>  <i>(Movies4U)</i>\n")
+
+    # Group by quality label
+    by_label: dict[str, list] = {}
+    for lnk in links:
+        by_label.setdefault(lnk["label"], []).append(lnk)
+
+    for label, group in by_label.items():
+        lines.append(f"📦 <b>{label}</b>")
+        parts = [f"<a href='{l['url']}'>{_m4u_provider(l['url'])}</a>" for l in group]
+        lines.append("   🔗 " + " · ".join(parts))
+        lines.append("")
+
+    if footer:
+        lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    return "\n".join(lines)
+
+
 # ─── Formatting helpers ──────────────────────────────────────────────────────
 
 def _base_name(link: dict) -> str:

@@ -46,7 +46,8 @@ from news_service import (
 from movie_service import (
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
     md_latest_movies, md_movie_links, format_md_message,
-    hdh_search, md_search,
+    m4u_latest_movies, m4u_movie_links, format_m4u_message,
+    hdh_search, md_search, m4u_search,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -198,8 +199,9 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     keyboard = [
-        [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)", callback_data="msite_hdh")],
-        [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)", callback_data="msite_md")],
+        [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",      callback_data="msite_hdh")],
+        [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",  callback_data="msite_md")],
+        [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",  callback_data="msite_m4u")],
     ]
     await update.effective_message.reply_text(
         "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
@@ -274,7 +276,9 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             page = int(p)
 
         await query.answer(f"Loading page {page}…")
-        fetch_fn = hdh_latest_movies if source == "hdh" else md_latest_movies
+        fetch_fn = (hdh_latest_movies if source == "hdh"
+                    else md_latest_movies if source == "md"
+                    else m4u_latest_movies)
         movies = await asyncio.to_thread(fetch_fn, page)
 
         if not movies:
@@ -307,7 +311,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )])
         keyboard.append([InlineKeyboardButton("« Back to sources", callback_data="mback_sites")])
 
-        site_label = "4KHDHub" if source == "hdh" else "MoviesDrive"
+        site_label = {"hdh": "4KHDHub", "md": "MoviesDrive", "m4u": "Movies4U"}.get(source, source)
         await _edit_or_reply(
             f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -322,8 +326,9 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ── Back to site picker ──────────────────────────────────────────────────
     elif data == "mback_sites":
         keyboard = [
-            [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)", callback_data="msite_hdh")],
-            [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)", callback_data="msite_md")],
+            [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",      callback_data="msite_hdh")],
+            [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",  callback_data="msite_md")],
+            [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",  callback_data="msite_m4u")],
         ]
         await _edit_or_reply(
             "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
@@ -347,9 +352,12 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
             text = format_hdh_message(movie["title"], detail)
-        else:
+        elif source == "md":
             detail = await asyncio.to_thread(md_movie_links, movie["url"])
             text = format_md_message(movie["title"], detail)
+        else:
+            detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
+            text = format_m4u_message(movie["title"], detail)
 
         poster_url = detail.get("poster") or movie.get("poster", "")
         page = idx // 10 + 1
@@ -405,9 +413,10 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Store query and show source picker
     context.user_data["pending_search"] = search_query
     keyboard = [
-        [InlineKeyboardButton("🎬 4KHDHub", callback_data="msrc_hdh"),
+        [InlineKeyboardButton("🎬 4KHDHub",    callback_data="msrc_hdh"),
          InlineKeyboardButton("🎥 MoviesDrive", callback_data="msrc_md")],
-        [InlineKeyboardButton("🔍 Both Sites", callback_data="msrc_both")],
+        [InlineKeyboardButton("🍿 Movies4U",   callback_data="msrc_m4u"),
+         InlineKeyboardButton("🔍 All Sites",  callback_data="msrc_both")],
     ]
     await update.effective_message.reply_html(
         f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
@@ -443,9 +452,10 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Session expired — run /search again.", show_alert=True)
             return
         keyboard = [
-            [InlineKeyboardButton("🎬 4KHDHub", callback_data="msrc_hdh"),
+            [InlineKeyboardButton("🎬 4KHDHub",    callback_data="msrc_hdh"),
              InlineKeyboardButton("🎥 MoviesDrive", callback_data="msrc_md")],
-            [InlineKeyboardButton("🔍 Both Sites", callback_data="msrc_both")],
+            [InlineKeyboardButton("🍿 Movies4U",   callback_data="msrc_m4u"),
+             InlineKeyboardButton("🔍 All Sites",  callback_data="msrc_both")],
         ]
         await _src_edit(
             f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
@@ -459,26 +469,34 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Session expired — run /search again.", show_alert=True)
         return
 
-    source_label = {"hdh": "4KHDHub", "md": "MoviesDrive", "both": "Both Sites"}.get(source, source)
+    source_label = {
+        "hdh": "4KHDHub", "md": "MoviesDrive",
+        "m4u": "Movies4U", "both": "All Sites",
+    }.get(source, source)
     await _src_edit(
         f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
         parse_mode="HTML",
     )
 
     # Fetch from selected source(s)
+    hdh_results: list = []
+    md_results:  list = []
+    m4u_results: list = []
+
     if source == "hdh":
         hdh_results = await asyncio.to_thread(hdh_search, search_query, 10)
-        md_results = []
     elif source == "md":
-        hdh_results = []
         md_results = await asyncio.to_thread(md_search, search_query, 10)
-    else:
-        hdh_results, md_results = await asyncio.gather(
-            asyncio.to_thread(hdh_search, search_query, 8),
-            asyncio.to_thread(md_search, search_query, 8),
+    elif source == "m4u":
+        m4u_results = await asyncio.to_thread(m4u_search, search_query, 10)
+    else:  # both / all sites
+        hdh_results, md_results, m4u_results = await asyncio.gather(
+            asyncio.to_thread(hdh_search,  search_query, 6),
+            asyncio.to_thread(md_search,   search_query, 6),
+            asyncio.to_thread(m4u_search,  search_query, 6),
         )
 
-    if not hdh_results and not md_results:
+    if not hdh_results and not md_results and not m4u_results:
         await _src_edit(
             f"❌ No results found for <b>{search_query}</b> on {source_label}.",
             parse_mode="HTML",
@@ -488,6 +506,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     # Store results in user_data
     all_results = {f"hdh_{i}": m for i, m in enumerate(hdh_results)}
     all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
+    all_results.update({f"m4u_{i}": m for i, m in enumerate(m4u_results)})
     context.user_data["search_results"] = all_results
 
     keyboard = []
@@ -503,11 +522,17 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🎥 {title}", callback_data=f"msres_md_{i}")])
 
+    if m4u_results:
+        keyboard.append([InlineKeyboardButton("━━ Movies4U ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(m4u_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"🍿 {title}", callback_data=f"msres_m4u_{i}")])
+
     # Post to channel + back
     keyboard.append([InlineKeyboardButton("📢 Post to Channel", callback_data="mpost_search")])
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
 
-    total = len(hdh_results) + len(md_results)
+    total = len(hdh_results) + len(md_results) + len(m4u_results)
     await _src_edit(
         f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
         f"  <i>({source_label})</i>\n\nTap a movie for download links:",
@@ -542,15 +567,40 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Session expired — search again.", show_alert=True)
         return
 
-    await query.answer("Fetching links from both sites…")
+    await query.answer("Fetching links…")
 
-    # Find matching movie from the OTHER site stored in same search results
-    other_source = "md" if source == "hdh" else "hdh"
-    # Extract first significant words (up to 4) for cross-site matching
+    # ── For m4u, just show its own detail (no cross-site matching needed) ──
     import re as _re
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
+    if source == "m4u":
+        detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
+        text = format_m4u_message(movie["title"], detail)
+        poster_url = detail.get("poster") or movie.get("poster", "")
+        context.user_data[f"search_pair_{source}_{idx}"] = {
+            "primary": movie, "primary_source": "m4u",
+            "other": None, "other_source": None,
+        }
+        post_cb = f"mpost_combined_{source}_{idx}"
+        action_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Post to Channel", callback_data=post_cb)],
+            [InlineKeyboardButton("« Back to results", callback_data="msrc_back")],
+        ])
+        if poster_url:
+            try:
+                await query.message.reply_photo(photo=poster_url)
+            except Exception:
+                pass
+        await query.message.reply_html(
+            text or "❌ No download links found.",
+            disable_web_page_preview=True,
+            reply_markup=action_kb,
+        )
+        return
+
+    # ── For hdh / md: try to find matching movie on the other site ────────
+    other_source = "md" if source == "hdh" else "hdh"
     movie_words = _title_words(movie["title"])
     other_movie = None
     best_overlap = 0
@@ -561,11 +611,9 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         if overlap > best_overlap:
             best_overlap = overlap
             other_movie = v
-    # Require at least 2 words to match
     if best_overlap < 2:
         other_movie = None
 
-    # Fetch from both sites concurrently
     async def fetch_hdh(url):
         return await asyncio.to_thread(hdh_movie_links, url)
 
@@ -649,9 +697,12 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         if source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
             text = format_hdh_message(movie["title"], detail)
-        else:
+        elif source == "md":
             detail = await asyncio.to_thread(md_movie_links, movie["url"])
             text = format_md_message(movie["title"], detail)
+        else:  # m4u
+            detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
+            text = format_m4u_message(movie["title"], detail)
 
         if not text:
             text = f"🎬 <b>{movie['title']}</b>\n\n❌ No download links found."
@@ -757,7 +808,7 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
             await query.message.reply_text("❌ No search results in session.")
             return
         for k, m in sorted(results.items(), key=lambda x: x[0]):
-            src = "hdh" if k.startswith("hdh_") else "md"
+            src = "hdh" if k.startswith("hdh_") else ("md" if k.startswith("md_") else "m4u")
             movies_to_post.append((m, src))
 
     if not movies_to_post:
