@@ -1593,24 +1593,69 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
     links:    list[dict] = []
     episodes: list[dict] = []
 
-    # ── ZIP / quality pack links (between DL and Single Episode markers) ───────
-    end_pack = ep_sec if ep_sec > 0 else len(all_h)
-    for h in all_h[dl_idx + 1: end_pack]:
-        a = h.find("a", href=True)
-        if a:
-            href  = a.get("href", "")
-            label = a.get_text(strip=True)
-            if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS:
-                links.append({"label": label, "url": href})
+    _EP_PAT = re.compile(r"EP(?:i?SODE)?\s*\d+", re.I)
+    _AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site"}
 
-    # ── Series: detect and parse episode sections ─────────────────────────────
-    # Episodes live in div.Z1hOCe — they may be flat h4 siblings or in nested divs
-    is_series = ep_sec >= 0
+    def _is_ad_url(href: str) -> bool:
+        from urllib.parse import urlparse
+        return urlparse(href).netloc in _AD_DOMAINS
+
+    # ── Flat pack/quality links (between DL and Single Episode markers) ────────
+    end_pack = ep_sec if ep_sec > 0 else len(all_h)
+    flat_has_episodes = False
+    for h in all_h[dl_idx + 1: end_pack]:
+        all_a = [a for a in h.find_all("a", href=True) if a["href"].startswith("http")]
+        if not all_a:
+            continue
+        first_label = all_a[0].get_text(strip=True)
+        if _EP_PAT.search(first_label):
+            flat_has_episodes = True
+            break
+
+    if flat_has_episodes:
+        # ── Flat-episode layout (e.g. Undekhi): each h3 = "EPiSODE N | WATCH" ──
+        for h in all_h[dl_idx + 1: end_pack]:
+            all_a = [a for a in h.find_all("a", href=True) if a["href"].startswith("http")]
+            if not all_a:
+                continue
+            first_label = all_a[0].get_text(strip=True)
+            if not _EP_PAT.search(first_label):
+                continue
+            ep_entry: dict[str, Any] = {"ep": first_label, "qualities": {}}
+            # Collect download links and watch links separately
+            dl_links  = []
+            wt_links  = []
+            for a in all_a:
+                lbl  = a.get_text(strip=True)
+                href = a["href"]
+                if lbl.lower() in ("watch", "watch online", "player-2", "player 2"):
+                    wt_links.append({"label": "\U0001f4fa Watch Online", "url": href})
+                elif _is_ad_url(href):
+                    # Keep ad-gated links but flag them
+                    dl_links.append({"label": "\U0001f4e5 Download", "url": href})
+                else:
+                    dl_links.append({"label": lbl, "url": href})
+            # Combine: direct downloads first, then watch links
+            combined = dl_links + wt_links
+            if combined:
+                ep_entry["qualities"]["Download"] = combined
+                episodes.append(ep_entry)
+    else:
+        # ── Normal pack/quality layout (Lukkhe ZIP packs, single movies) ──────
+        for h in all_h[dl_idx + 1: end_pack]:
+            a = h.find("a", href=True)
+            if a:
+                href  = a.get("href", "")
+                label = a.get_text(strip=True)
+                if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS and not _is_ad_url(href):
+                    links.append({"label": label, "url": href})
+
+    # ── Series: detect and parse episode sections (Lukkhe-style div.Z1hOCe) ───
+    is_series = ep_sec >= 0 or flat_has_episodes
 
     # Find the "Single Episode" h2 element, then its next sibling div.Z1hOCe
     ep_h2 = all_h[ep_sec] if ep_sec >= 0 else None
     if ep_h2 is not None:
-        # Walk forward in the DOM tree to find the Z1hOCe div
         z_div = None
         for candidate in ep_h2.find_next_siblings():
             if getattr(candidate, "name", None) == "div":
@@ -1618,18 +1663,15 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                 break
 
         if z_div:
-            # All h4s inside Z1hOCe — group into episodes by detecting episode-header h4s
             all_ep_h4 = z_div.find_all("h4")
             current_ep: dict[str, Any] | None = None
             for h4 in all_ep_h4:
                 raw   = h4.get_text(" ", strip=True)
-                # Episode header: contains "episode" / "EP" but has no external links
                 ext_a = [a for a in h4.find_all("a", href=True) if a["href"].startswith("http")]
-                if not ext_a and re.search(r"EP(?:i?SODE)?\s*\d+", raw, re.I):
+                if not ext_a and _EP_PAT.search(raw):
                     if current_ep and current_ep["qualities"]:
                         episodes.append(current_ep)
-                    ep_label = re.sub(r"<[^>]+>", "", raw).strip()
-                    current_ep = {"ep": ep_label, "qualities": {}}
+                    current_ep = {"ep": raw.strip(), "qualities": {}}
                 elif ext_a and current_ep is not None:
                     q_match = re.match(r"(4K|2160p|1080p|720p|480p|360p)", raw, re.I)
                     quality = q_match.group(1) if q_match else "Link"
@@ -1698,12 +1740,23 @@ def format_hdhub_message(movie_title: str, data: dict, footer: bool = True) -> s
         lines.append("\u2501" * 32)
         lines.append("\U0001f5c2 <b>Episode-wise Download</b>")
         for ep in episodes:
-            lines.append(f"\n<b>{ep['ep']}</b>")
-            for quality, ql in ep["qualities"].items():
-                server_parts = " | ".join(
+            ep_label = ep["ep"]
+            qualities = ep["qualities"]
+            # Flat-episode layout: single "Download" key with mixed links
+            if list(qualities.keys()) == ["Download"]:
+                ql = qualities["Download"]
+                dl_parts = " | ".join(
                     "<a href='" + lk["url"] + "'>" + lk["label"] + "</a>" for lk in ql
                 )
-                lines.append(f"  {quality} \u2014 {server_parts}")
+                lines.append(f"\n\U0001f4c1 <b>{ep_label}</b>  \u2014  {dl_parts}")
+            else:
+                # Quality-keyed layout (e.g. Lukkhe 720p/1080p per episode)
+                lines.append(f"\n<b>{ep_label}</b>")
+                for quality, ql in qualities.items():
+                    server_parts = " | ".join(
+                        "<a href='" + lk["url"] + "'>" + lk["label"] + "</a>" for lk in ql
+                    )
+                    lines.append(f"  {quality} \u2014 {server_parts}")
         lines.append("")
 
     if footer:
