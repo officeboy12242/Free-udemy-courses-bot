@@ -432,15 +432,13 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     parts = [f"🎬 <b>{movie['title']}</b>\n"]
 
-    hdh_links_text = format_hdh_message("", hdh_detail).replace("🎬 <b></b>\n\n", "")
     if hdh_detail.get("qualities"):
         parts.append("━━ <b>4KHDHub (4K/HDR)</b> ━━")
-        parts.append(hdh_links_text)
+        parts.append(format_hdh_message("", hdh_detail, footer=False))
 
-    md_links_text = format_md_message("", md_detail).replace("🎬 <b></b>\n\n", "")
     if md_detail.get("links"):
         parts.append("━━ <b>MoviesDrive (480p–4K)</b> ━━")
-        parts.append(md_links_text)
+        parts.append(format_md_message("", md_detail, footer=False))
 
     if not hdh_detail.get("qualities") and not md_detail.get("links"):
         parts.append("❌ No download links found on either site.")

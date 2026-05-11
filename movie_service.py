@@ -249,43 +249,48 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 # ─── Formatting ──────────────────────────────────────────────────────────────
 
-def format_hdh_message(movie_title: str, data: dict[str, Any]) -> str:
+FOOTER = "\n⚡ Powered by @CoursesDrivee"
+
+
+def format_hdh_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
     qualities = data.get("qualities", [])
     if not qualities:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
+        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found on 4KHDHub."
 
-    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (4KHDHub)</b>\n"]
-    for q in qualities[:6]:
+    lines = []
+    if movie_title:
+        lines.append(f"🎬 <b>{movie_title}</b>\n")
+    lines.append("📥 <b>Download Links (4KHDHub)</b>\n")
+    for q in qualities:
         lines.append(f"📼 <b>{q['quality']}</b>")
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in q["links"]]
         lines.append("  " + " | ".join(parts))
         lines.append("")
-    if len(qualities) > 6:
-        lines.append(f"<i>…and {len(qualities) - 6} more on the website.</i>")
-    lines.append("\n⚡ Powered by @CoursesDrivee")
+    if footer:
+        lines.append(FOOTER)
     return "\n".join(lines)
 
 
-def format_md_message(movie_title: str, data: dict[str, Any]) -> str:
+def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
     links = data.get("links", [])
     if not links:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
+        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found on MoviesDrive."
 
-    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (MoviesDrive)</b>\n"]
-    
-    # Group links by label (e.g. "480p[430.36 MB]")
-    grouped = {}
+    lines = []
+    if movie_title:
+        lines.append(f"🎬 <b>{movie_title}</b>\n")
+    lines.append("📥 <b>Download Links (MoviesDrive)</b>\n")
+
+    grouped: dict[str, list] = {}
     for l in links:
         grouped.setdefault(l["label"], []).append(l)
-        
-    for label, group_links in list(grouped.items())[:6]:
+
+    for label, group_links in grouped.items():
         lines.append(f"📼 <b>{label}</b>")
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
         lines.append("  " + " | ".join(parts))
         lines.append("")
-        
-    if len(grouped) > 6:
-        lines.append(f"<i>…and {len(grouped) - 6} more on the website.</i>")
-        
-    lines.append("\n⚡ Powered by @CoursesDrivee")
+
+    if footer:
+        lines.append(FOOTER)
     return "\n".join(lines)
