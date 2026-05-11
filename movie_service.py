@@ -1,7 +1,9 @@
 """
-Movie scraper — supports two sources:
-  - 4KHDHub  (https://4khdhub.link/category/hindi-movies/)
+Movie scraper — supports multiple sources:
+  - 4KHDHub     (https://4khdhub.link/category/hindi-movies/)
   - MoviesDrive (https://new2.moviesdrives.my/)
+  - Movies4U    (https://movies4u.ee/)
+  - Vegamovies  (https://vegamovies.global/)
 """
 from __future__ import annotations
 
@@ -972,6 +974,226 @@ def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = Tru
             parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
             lines.append("   🔗 " + " · ".join(parts))
 
+        lines.append("")
+
+    if footer:
+        lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Vegamovies  (https://vegamovies.global/)
+# ══════════════════════════════════════════════════════════════════════════════
+
+VEGA_BASE = "https://vegamovies.global"
+_VEGA_SEARCH_URL = VEGA_BASE + "/?do=search&subaction=search&story={}"
+
+
+def _vega_abs(url: str) -> str:
+    """Make relative Vegamovies URLs absolute."""
+    if url.startswith("http"):
+        return url
+    if url.startswith("/"):
+        return VEGA_BASE + url
+    return url
+
+
+def _scrape_vega_info(soup: BeautifulSoup) -> dict[str, str]:
+    """Extract movie metadata from a vegamovies.global movie page."""
+    info: dict[str, str] = {}
+    content = soup.select_one(".entry-content, article") or soup
+    text = content.get_text("\n", strip=True)
+
+    _PATTERNS = [
+        (r"IMDb\s+Rating\s*[:\-]+\s*([\d.]+)", "imdb"),
+        (r"Genre[s]?\s*[:\-]+\s*([^\n]+)", "genre"),
+        (r"Original\s+language\s*[:\-]+\s*([^\n]+)", "language"),
+        (r"Quality\s*[:\-]+\s*([^\n]+)", "quality"),
+        (r"Runtime\s*[:\-]+\s*([^\n]+)", "runtime"),
+        (r"(?:Cast|Stars?)\s*[:\-]+\s*([^\n]+)", "stars"),
+        (r"Release\s+Year\s*[:\-]+\s*([^\n]+)", "year"),
+        (r"Format\s*[:\-]+\s*([^\n]+)", "format"),
+    ]
+    for pattern, field in _PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip().rstrip(".")
+            val = re.split(r"\s{2,}|\n", val)[0].strip()
+            if val:
+                info[field] = val
+    return info
+
+
+def vega_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
+    """Fetch latest movies from vegamovies.global with pagination.
+
+    DLE CMS uses ``?from=N`` offset where N = (page-1) * limit.
+    """
+    from_offset = (page - 1) * limit
+    url = VEGA_BASE + "/" if from_offset == 0 else f"{VEGA_BASE}/?from={from_offset}"
+    try:
+        resp = _get(url, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("vega_latest_movies page=%d failed: %s", page, exc)
+        return []
+
+    movies: list[dict] = []
+    for art in soup.select("article.post-item"):
+        if len(movies) >= limit:
+            break
+        a = art.select_one("a.blog-img, a[title]")
+        img = art.select_one("img[src], img[data-src]")
+        if not a:
+            continue
+        title = (a.get("title") or a.get_text(strip=True)).strip()
+        href  = a.get("href", "")
+        poster = ""
+        if img:
+            poster = _vega_abs(img.get("src") or img.get("data-src") or "")
+        if title and href:
+            movies.append({"title": title, "url": href, "poster": poster})
+    return movies
+
+
+def vega_search(query: str, limit: int = 10) -> list[dict]:
+    """Search vegamovies.global using the DLE search endpoint."""
+    url = _VEGA_SEARCH_URL.format(urllib.parse.quote(query))
+    try:
+        resp = _get(url, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("vega_search '%s' failed: %s", query, exc)
+        return []
+
+    movies: list[dict] = []
+    for art in soup.select("article.post-item"):
+        if len(movies) >= limit:
+            break
+        a = art.select_one("a.blog-img, a[title]")
+        img = art.select_one("img[src], img[data-src]")
+        if not a:
+            continue
+        title = (a.get("title") or a.get_text(strip=True)).strip()
+        href  = a.get("href", "")
+        poster = ""
+        if img:
+            poster = _vega_abs(img.get("src") or img.get("data-src") or "")
+        if title and href:
+            movies.append({"title": title, "url": href, "poster": poster})
+    return movies
+
+
+def vega_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape download links from a vegamovies.global movie page.
+
+    Returns::
+        {
+          "poster": str,
+          "links":  [{"quality": str, "url": str, "size": str}],
+          "info":   {imdb, genre, language, quality, runtime, stars, year, format},
+        }
+    """
+    try:
+        resp = _get(movie_url, timeout=20)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("vega_movie_links %s failed: %s", movie_url, exc)
+        return {"poster": "", "links": [], "info": {}}
+
+    og = soup.find("meta", property="og:image")
+    poster = og.get("content", "") if og else ""
+
+    info = _scrape_vega_info(soup)
+
+    # Download links — structure:
+    #   <h5>—–== Download Links ==—–</h5>
+    #   <div class="download-links-div">
+    #     <h3><span>QUALITY_LABEL</span></h3>
+    #     <h3><div><a href="URL">Click Here To Download [SIZE]</a></div></h3>
+    #     ...
+    #   </div>
+    content = soup.select_one(".entry-content, article") or soup
+
+    dl_marker = None
+    for el in content.find_all(["h5", "h4", "h3", "strong"]):
+        if "download links" in el.get_text(strip=True).lower():
+            dl_marker = el
+            break
+
+    links: list[dict] = []
+    if dl_marker:
+        # The links live inside the next <div> sibling (div.download-links-div)
+        dl_div = dl_marker.find_next_sibling("div")
+        if dl_div is None:
+            dl_div = dl_marker.parent  # fallback: walk parent's children
+
+        current_quality = ""
+        for child in dl_div.find_all(["h3", "h4", "h2"], recursive=True):
+            a_el = child.find("a", href=True)
+            txt  = child.get_text(strip=True)
+
+            if a_el:
+                href = a_el.get("href", "")
+                if href.startswith("http") and "vegamovies" not in href:
+                    size_m = re.search(r"\[([^\]]+(?:MB|GB)[^\]]*)\]", txt, re.I)
+                    size   = size_m.group(1) if size_m else ""
+                    if current_quality:
+                        links.append({
+                            "quality": current_quality,
+                            "url":     href,
+                            "size":    size,
+                        })
+                    current_quality = ""
+                    continue
+
+            # Plain heading without a link = quality label
+            if txt and not any(kw in txt.lower() for kw in
+                               ("click here", "download", "thank you", "screenshot",
+                                "vegamovies", "winding")):
+                current_quality = txt
+
+    return {"poster": poster, "links": links, "info": info}
+
+
+def format_vega_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format a Vegamovies result as HTML for Telegram."""
+    links = data.get("links", [])
+    info  = data.get("info", {})
+
+    def _info_block() -> str:
+        parts: list[str] = []
+        if info.get("imdb"):     parts.append(f"⭐ <b>IMDb:</b> {info['imdb']}")
+        if info.get("genre"):    parts.append(f"🎭 <b>Genre:</b> {info['genre'][:70]}")
+        if info.get("language"): parts.append(f"🗣 <b>Language:</b> {info['language'][:50]}")
+        if info.get("quality"):  parts.append(f"🎞 <b>Quality:</b> {info['quality'][:60]}")
+        if info.get("runtime"):  parts.append(f"⏱ <b>Runtime:</b> {info['runtime'][:30]}")
+        stars = info.get("stars", "")
+        if stars:
+            cast_list = [x.strip() for x in stars.split(",")][:3]
+            parts.append(f"🎬 <b>Cast:</b> {', '.join(cast_list)}")
+        return "\n".join(parts)
+
+    lines: list[str] = []
+    if movie_title:
+        lines.append(f"🌟 <b>{movie_title}</b>")
+
+    ib = _info_block()
+    if ib:
+        lines.append("━" * 32)
+        lines.append(ib)
+
+    if links:
+        lines.append("━" * 32)
+        lines.append("📥 <b>Download Links (Vegamovies)</b>")
+        for lk in links:
+            quality = lk.get("quality", "")
+            url_    = lk.get("url", "")
+            size    = lk.get("size", "")
+            label   = f"{quality}  [{size}]" if size else quality
+            lines.append(f"\n📦 <b>{label}</b>")
+            lines.append(f"   🔗 <a href='{url_}'>Download</a>")
         lines.append("")
 
     if footer:
