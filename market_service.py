@@ -99,10 +99,12 @@ def _today_ist() -> str:
 
 # Minimum additional drop (%) beyond the last alerted pct to trigger another alert
 MIN_DEEPER_STEP = float(os.getenv("MIN_DEEPER_STEP", "0.5"))
+# Minimum minutes between alerts if the market is just hovering below the threshold
+MIN_ALERT_GAP_MINUTES = int(os.getenv("MIN_ALERT_GAP_MINUTES", "120"))
 
 
 def last_alerted_pct(symbol: str, alert_date: str) -> float | None:
-    """Return the pct_change of the most recent alert for this symbol today, or None."""
+    """Return the pct_change of the deepest alert for this symbol today, or None."""
     con = sqlite3.connect(DB_FILE)
     try:
         row = con.execute(
@@ -116,16 +118,44 @@ def last_alerted_pct(symbol: str, alert_date: str) -> float | None:
         con.close()
 
 
+def minutes_since_last_alert(symbol: str, alert_date: str) -> float:
+    """Minutes elapsed since the most recent alert for this symbol today."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            """SELECT alerted_at FROM market_dip_alerts
+               WHERE symbol = ? AND alert_date = ?
+               ORDER BY alerted_at DESC LIMIT 1""",
+            (symbol, alert_date),
+        ).fetchone()
+        if not row or not row[0]:
+            return float("inf")
+        last = datetime.fromisoformat(row[0])
+        now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        return (now - last).total_seconds() / 60
+    finally:
+        con.close()
+
+
 def should_alert(symbol: str, alert_date: str, current_pct: float) -> bool:
     """
     Alert if:
     - No alert sent today yet, OR
-    - Current dip is at least MIN_DEEPER_STEP% deeper than the last alerted dip.
+    - Current dip is at least MIN_DEEPER_STEP% deeper than the deepest alerted dip, OR
+    - It's been MIN_ALERT_GAP_MINUTES since the last alert (and we are still below threshold).
     """
-    last = last_alerted_pct(symbol, alert_date)
-    if last is None:
+    last_pct = last_alerted_pct(symbol, alert_date)
+    if last_pct is None:
         return True
-    return current_pct <= last - MIN_DEEPER_STEP
+        
+    if current_pct <= last_pct - MIN_DEEPER_STEP:
+        return True
+        
+    gap = minutes_since_last_alert(symbol, alert_date)
+    if gap >= MIN_ALERT_GAP_MINUTES:
+        return True
+        
+    return False
 
 
 def record_alert(symbol: str, alert_date: str, pct_change: float):
@@ -309,10 +339,15 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
             alerted_today = False
             would_send = meets
             need_more = max(0.0, th + pct)
+            mins_left = 0.0
         else:
             alerted_today = True
-            would_send = pct <= last_alert_pct - MIN_DEEPER_STEP
-            need_more = max(0.0, (last_alert_pct - MIN_DEEPER_STEP) - pct) if not would_send else 0.0
+            gap = minutes_since_last_alert(q["symbol"], day)
+            time_met = gap >= MIN_ALERT_GAP_MINUTES
+            depth_met = pct <= last_alert_pct - MIN_DEEPER_STEP
+            would_send = meets and (time_met or depth_met)
+            need_more = max(0.0, (last_alert_pct - MIN_DEEPER_STEP) - pct) if not depth_met else 0.0
+            mins_left = max(0.0, MIN_ALERT_GAP_MINUTES - gap) if not time_met else 0.0
 
         instruments.append(
             {
@@ -328,6 +363,7 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
                 "last_alerted_pct": last_alert_pct,
                 "would_send_telegram_now": would_send,
                 "percent_points_more_decline_to_hit_threshold": round(need_more, 4),
+                "minutes_left_for_time_alert": round(mins_left, 1),
             }
         )
     return {
@@ -337,7 +373,8 @@ def build_dip_status(threshold_percent: float | None = None) -> dict[str, Any]:
         "data_source": "Yahoo Finance via yfinance (often delayed vs NSE live ticks; not official).",
         "dip_rule_plain": (
             f"Fire when change vs previous session close is <= -{th:g}% "
-            f"(at least {th:g}% down). Subsequent alerts fire every {MIN_DEEPER_STEP}% deeper drop."
+            f"(at least {th:g}% down). Subsequent alerts fire every {MIN_DEEPER_STEP}% deeper drop, "
+            f"OR every {MIN_ALERT_GAP_MINUTES} minutes if still below threshold."
         ),
         "dip_threshold_percent": th,
         "instruments": instruments,
@@ -364,9 +401,11 @@ def format_dip_status_telegram(status: dict[str, Any]) -> str:
             lines.append("  → Would ALERT on next monitor tick ✅")
         elif i["already_alerted_today_ist"]:
             extra = i["percent_points_more_decline_to_hit_threshold"]
+            mins = i["minutes_left_for_time_alert"]
             last_pct = i["last_alerted_pct"]
             lines.append(f"  → Already alerted today at {last_pct:.2f}% ⏸")
-            lines.append(f"  → Needs to drop to {last_pct - MIN_DEEPER_STEP:.2f}% for next alert (~{extra:.2f}% more)")
+            lines.append(f"  → Next alert if drops to {last_pct - MIN_DEEPER_STEP:.2f}% (~{extra:.2f}% more)")
+            lines.append(f"  → OR in ~{mins:.0f} mins if it stays below threshold")
         else:
             extra = i["percent_points_more_decline_to_hit_threshold"]
             lines.append(
@@ -412,8 +451,8 @@ async def run_market_monitor(bot, alert_chat_id: str | None = None):
                 sym = s["symbol"]
                 if not should_alert(sym, day, pct):
                     log.debug(
-                        "Dip alert skipped for %s (%.2f%%) — needs %.2f%% deeper than last alert",
-                        s["name"], pct, MIN_DEEPER_STEP,
+                        "Dip alert skipped for %s (%.2f%%) — needs %.2f%% deeper OR %d mins gap",
+                        s["name"], pct, MIN_DEEPER_STEP, MIN_ALERT_GAP_MINUTES
                     )
                     continue
                 count = alert_count_today(sym, day) + 1
