@@ -43,6 +43,11 @@ from news_service import (
     format_news_posts,
     mark_news_posted,
 )
+from movie_service import (
+    scrape_latest_movies,
+    scrape_movie_download_links,
+    format_movie_links_message,
+)
 
 # ─── Load env ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -89,6 +94,7 @@ Here's what I can do:
 
 <b>Commands:</b>
 /start — this menu
+/movies — get latest 4K Hindi movies
 /news — preview latest tech news (Post / Skip)
 /market — live market snapshot + dip status
 /testdip — sample dip alert (not real data)
@@ -181,6 +187,66 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch latest movies and show them as inline buttons."""
+    if not update.effective_message or not update.effective_user:
+        return
+        
+    # Only allow admin
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+        return
+        
+    msg = await update.effective_message.reply_text("Fetching latest movies from 4KHDHub...")
+    
+    movies = await asyncio.to_thread(scrape_latest_movies, 5)
+    if not movies:
+        await msg.edit_text("❌ Failed to fetch movies or no movies found.")
+        return
+        
+    keyboard = []
+    for i, m in enumerate(movies):
+        # We pass the index as callback data to keep it short
+        keyboard.append([InlineKeyboardButton(m["title"], callback_data=f"movie_{i}")])
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    context.user_data["latest_movies"] = movies
+    
+    await msg.edit_text(
+        "🍿 <b>Latest Hindi Movies</b>\n\nSelect a movie to get download links:",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle movie button press to fetch download links."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+        
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission.", show_alert=True)
+        return
+        
+    await query.answer("Fetching download links...")
+    
+    try:
+        idx = int(query.data.split("_")[1])
+        movies = context.user_data.get("latest_movies", [])
+        if not movies or idx >= len(movies):
+            await query.message.reply_text("❌ Session expired. Please run /movies again.")
+            return
+            
+        movie = movies[idx]
+        qualities = await asyncio.to_thread(scrape_movie_download_links, movie["url"])
+        
+        text = format_movie_links_message(movie["title"], qualities)
+        await query.message.reply_html(text, disable_web_page_preview=True)
+    except Exception as e:
+        log.error("Movie callback error: %s", e)
+        await query.message.reply_text("❌ An error occurred while fetching links.")
+
+
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Preview latest tech news; offer Post/Skip buttons."""
     if not update.effective_message or not update.effective_user:
@@ -261,8 +327,10 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("testdip", cmd_testdip))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("market", cmd_market))
+    app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
+    app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^movie_"))
     return app
 
 
