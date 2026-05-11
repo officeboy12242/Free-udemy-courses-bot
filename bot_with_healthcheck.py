@@ -121,6 +121,18 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(format_dip_status_telegram(status))
 
 
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with the sender's numeric chat ID — use this as MARKET_ALERT_CHAT_ID."""
+    if not update.effective_message or not update.effective_chat:
+        return
+    cid = update.effective_chat.id
+    await update.effective_message.reply_html(
+        f"Your numeric chat ID is:\n\n<code>{cid}</code>\n\n"
+        "Copy that value and set it in your <code>.env</code>:\n"
+        f"<code>MARKET_ALERT_CHAT_ID={cid}</code>"
+    )
+
+
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Diagnose dip alert delivery: tries to send a test message to MARKET_ALERT_CHAT_ID."""
     if not update.effective_message:
@@ -221,6 +233,7 @@ async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_telegram_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("testdip", cmd_testdip))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("market", cmd_market))
