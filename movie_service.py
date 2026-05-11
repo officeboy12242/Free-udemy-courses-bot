@@ -662,39 +662,123 @@ def m4u_latest_movies(page: int = 1) -> list[dict[str, str]]:
         return []
 
 
+_M4U_SKIP_HEADINGS = {
+    "series info:", "movie info:", "series-synopsis/plot:", "screenshots:",
+    "synopsis/plot:", "plot:", "——", "—–", "download",
+}
+
+_M4U_QUALITY_KEYWORDS = ("480p", "720p", "1080p", "2160p", "4k", "season", "episode", "blu", "web")
+
+
+def _is_gdirect(text: str) -> bool:
+    t = text.lower()
+    return "g-direct" in t or "instant" in t
+
+
 def m4u_movie_links(movie_url: str) -> dict[str, Any]:
-    """Scrape a movies4u.ee movie page → poster, info, and quality/download links."""
+    """Scrape a movies4u.ee movie page.
+
+    Two page layouts:
+      A) Series  — h3/h4 quality labels, multiple mdrive.ink buttons per label
+                   → parse labels from page, keep only G-Direct mdrive.ink link per quality
+      B) Movie   — single mdrive.ink URL for all qualities
+                   → follow it, parse quality sections inside, keep G-Direct links
+    """
     try:
         resp = _get(movie_url, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Poster
         poster = ""
         og = soup.find("meta", property="og:image")
         if og:
             poster = og.get("content", "")
 
-        # Info block (IMDB, language, quality, etc.) — movies4u uses plain text format
         content = soup.select_one(".entry-content") or soup.find("main") or soup
         info = _scrape_m4u_info(content)
 
-        # Find the first mdrive.ink link on the page
-        mdrive_url = ""
-        for a in (content or soup).find_all("a", href=True):
-            href = a.get("href", "")
-            if "mdrive.ink/mdisk" in href:
-                mdrive_url = href
-                break
+        # ── Walk DOM in order: headings become labels, <a> → mdrive.ink ────────
+        current_label = ""
+        collected: list[dict] = []   # {"label", "url", "is_gdirect"}
+
+        for tag in content.find_all(["h2", "h3", "h4", "h5", "strong", "a"]):
+            if tag.name in ("h2", "h3", "h4", "h5"):
+                txt = tag.get_text(strip=True)
+                # Skip non-quality headings
+                if txt.lower().rstrip(":").strip() in _M4U_SKIP_HEADINGS:
+                    continue
+                if any(kw in txt.lower() for kw in _M4U_QUALITY_KEYWORDS):
+                    current_label = txt
+            elif tag.name == "strong":
+                txt = tag.get_text(strip=True)
+                # Some pages use <strong> as quality label
+                if any(kw in txt.lower() for kw in _M4U_QUALITY_KEYWORDS) and len(txt) > 8:
+                    current_label = txt
+            elif tag.name == "a":
+                href = tag.get("href", "")
+                if "mdrive.ink/mdisk" not in href:
+                    continue
+                btn_text = tag.get_text(strip=True)
+                collected.append({
+                    "label": current_label,
+                    "url": href,
+                    "is_gdirect": _is_gdirect(btn_text),
+                    "btn_text": btn_text,
+                })
+
+        # ── Detect layout ────────────────────────────────────────────────────
+        labeled = [c for c in collected if c["label"]]
+        unique_urls = {c["url"] for c in collected}
 
         links: list[dict[str, Any]] = []
-        if mdrive_url:
-            links = _scrape_mdrive_ink(mdrive_url)
+
+        if labeled and len(unique_urls) > 1:
+            # ── Layout A: Series — multiple labeled mdrive.ink URLs ───────────
+            # One link per quality: prefer G-Direct, else first available
+            by_label: dict[str, list] = {}
+            for c in collected:
+                label = c["label"] or "Download"
+                by_label.setdefault(label, []).append(c)
+
+            for label, entries in by_label.items():
+                gdirect = [e for e in entries if e["is_gdirect"]]
+                best = gdirect[0] if gdirect else entries[0]
+                links.append({
+                    "label": label,
+                    "name": "G‑Direct" if best["is_gdirect"] else _m4u_provider_from_btn(best["btn_text"]),
+                    "url": best["url"],
+                })
+
+        elif collected:
+            # ── Layout B: Movie — one mdrive.ink URL, follow it ───────────────
+            mdrive_url = list(unique_urls)[0]
+            raw_links = _scrape_mdrive_ink(mdrive_url)
+            # Per quality: show G-Direct if available, else best provider
+            by_lbl: dict[str, list] = {}
+            for l in raw_links:
+                by_lbl.setdefault(l["label"], []).append(l)
+            for lbl, entries in by_lbl.items():
+                gdirect = [l for l in entries if "fastdl.zip" in l.get("url", "")]
+                best = gdirect[0] if gdirect else entries[0]
+                links.append({
+                    "label": best["label"],
+                    "name": "G‑Direct" if gdirect else _m4u_provider(best["url"]),
+                    "url": best["url"],
+                })
 
         return {"poster": poster, "links": links, "info": info}
     except Exception as e:
         log.error("Movies4U movie page failed (%s): %s", movie_url, e)
         return {"poster": "", "links": [], "info": {}}
+
+
+def _m4u_provider_from_btn(btn_text: str) -> str:
+    t = btn_text.lower()
+    if "v-cloud" in t or "resumable" in t:
+        return "V‑Cloud"
+    if "batch" in t or "zip" in t:
+        return "Batch/Zip"
+    return btn_text.strip("⚡ ").split("[")[0].strip()
 
 
 def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
@@ -749,7 +833,7 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
 
     for label, group in by_label.items():
         lines.append(f"📦 <b>{label}</b>")
-        parts = [f"<a href='{l['url']}'>{_m4u_provider(l['url'])}</a>" for l in group]
+        parts = [f"<a href='{l['url']}'>{l.get('name') or _m4u_provider(l['url'])}</a>" for l in group]
         lines.append("   🔗 " + " · ".join(parts))
         lines.append("")
 
