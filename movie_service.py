@@ -1028,10 +1028,10 @@ def _scrape_vega_info(soup: BeautifulSoup) -> dict[str, str]:
 def vega_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
     """Fetch latest movies from vegamovies.global with pagination.
 
-    DLE CMS uses ``?from=N`` offset where N = (page-1) * limit.
+    Vegamovies uses WordPress-style ``/page/N/`` pagination.
+    Each site page has ~25 posts; we take the first ``limit`` per call.
     """
-    from_offset = (page - 1) * limit
-    url = VEGA_BASE + "/" if from_offset == 0 else f"{VEGA_BASE}/?from={from_offset}"
+    url = VEGA_BASE + "/" if page == 1 else f"{VEGA_BASE}/page/{page}/"
     try:
         resp = _get(url, timeout=20)
         soup = BeautifulSoup(resp.text, "html.parser")
