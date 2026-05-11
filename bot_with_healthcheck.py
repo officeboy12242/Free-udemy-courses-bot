@@ -44,12 +44,13 @@ from news_service import (
     mark_news_posted,
 )
 from movie_service import (
+    hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
     md_latest_movies, md_movie_links, format_md_message,
     m4u_latest_movies, m4u_movie_links, format_m4u_message,
     vega_latest_movies, vega_movie_links, format_vega_message,
     sdmp_latest_movies, sdmp_movie_links, format_sdmp_message,
-    hdh_search, md_search, m4u_search, vega_search, sdmp_search,
+    hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -201,6 +202,7 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     keyboard = [
+        [InlineKeyboardButton("⭐ HDHub4u (4K/HDR – Best)",  callback_data="msite_hdhub")],
         [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",        callback_data="msite_hdh")],
         [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",    callback_data="msite_md")],
         [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
@@ -226,6 +228,7 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     from movie_service import SCRAPER_API_KEY, _get as movie_get
     tests = [
+        ("HDHub4u",        "https://new1.hdhub4u.limo/"),
         ("4KHDHub",        "https://4khdhub.link/category/hindi-movies/"),
         ("MoviesDrive",    "https://new2.moviesdrives.my/"),
         ("Vegamovies",     "https://vegamovies.global/"),
@@ -282,8 +285,9 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             page = int(p)
 
         await query.answer(f"Loading page {page}…")
-        fetch_fn = (hdh_latest_movies   if source == "hdh"
-                    else md_latest_movies   if source == "md"
+        fetch_fn = (hdhub_latest_movies  if source == "hdhub"
+                    else hdh_latest_movies   if source == "hdh"
+                    else md_latest_movies    if source == "md"
                     else vega_latest_movies  if source == "vega"
                     else sdmp_latest_movies  if source == "sdmp"
                     else m4u_latest_movies)
@@ -319,8 +323,8 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )])
         keyboard.append([InlineKeyboardButton("« Back to sources", callback_data="mback_sites")])
 
-        site_label = {"hdh": "4KHDHub", "md": "MoviesDrive", "m4u": "Movies4U",
-                      "vega": "Vegamovies", "sdmp": "SDMoviesPoint"}.get(source, source)
+        site_label = {"hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
+                      "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint"}.get(source, source)
         await _edit_or_reply(
             f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -335,6 +339,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # ── Back to site picker ──────────────────────────────────────────────────
     elif data == "mback_sites":
         keyboard = [
+            [InlineKeyboardButton("⭐ HDHub4u (4K/HDR – Best)",  callback_data="msite_hdhub")],
             [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",        callback_data="msite_hdh")],
             [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",    callback_data="msite_md")],
             [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
@@ -360,7 +365,10 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await query.answer("Fetching links…")
 
-        if source == "hdh":
+        if source == "hdhub":
+            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            text = format_hdhub_message(movie["title"], detail)
+        elif source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
             text = format_hdh_message(movie["title"], detail)
         elif source == "md":
@@ -430,12 +438,13 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Store query and show source picker
     context.user_data["pending_search"] = search_query
     keyboard = [
-        [InlineKeyboardButton("🎬 4KHDHub",     callback_data="msrc_hdh"),
-         InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md")],
-        [InlineKeyboardButton("🍿 Movies4U",    callback_data="msrc_m4u"),
-         InlineKeyboardButton("🌟 Vegamovies",  callback_data="msrc_vega")],
-        [InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp"),
-         InlineKeyboardButton("🔍 All Sites",   callback_data="msrc_both")],
+        [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
+         InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
+        [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
+         InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
+        [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
+         InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
+        [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
     ]
     await update.effective_message.reply_html(
         f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
@@ -471,12 +480,13 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Session expired — run /search again.", show_alert=True)
             return
         keyboard = [
-            [InlineKeyboardButton("🎬 4KHDHub",     callback_data="msrc_hdh"),
-             InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md")],
-            [InlineKeyboardButton("🍿 Movies4U",    callback_data="msrc_m4u"),
-             InlineKeyboardButton("🌟 Vegamovies",  callback_data="msrc_vega")],
-            [InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp"),
-             InlineKeyboardButton("🔍 All Sites",   callback_data="msrc_both")],
+            [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
+             InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
+            [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
+             InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
+            [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
+             InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
+            [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
         ]
         await _src_edit(
             f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
@@ -491,8 +501,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     source_label = {
-        "hdh": "4KHDHub", "md": "MoviesDrive", "m4u": "Movies4U",
-        "vega": "Vegamovies", "sdmp": "SDMoviesPoint", "both": "All Sites",
+        "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
+        "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint", "both": "All Sites",
     }.get(source, source)
     await _src_edit(
         f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
@@ -500,13 +510,16 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     )
 
     # Fetch from selected source(s)
-    hdh_results:  list = []
-    md_results:   list = []
-    m4u_results:  list = []
-    vega_results: list = []
-    sdmp_results: list = []
+    hdhub_results: list = []
+    hdh_results:   list = []
+    md_results:    list = []
+    m4u_results:   list = []
+    vega_results:  list = []
+    sdmp_results:  list = []
 
-    if source == "hdh":
+    if source == "hdhub":
+        hdhub_results = await asyncio.to_thread(hdhub_search, search_query, 10)
+    elif source == "hdh":
         hdh_results = await asyncio.to_thread(hdh_search, search_query, 10)
     elif source == "md":
         md_results = await asyncio.to_thread(md_search, search_query, 10)
@@ -517,15 +530,16 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     elif source == "sdmp":
         sdmp_results = await asyncio.to_thread(sdmp_search, search_query, 10)
     else:  # all sites
-        hdh_results, md_results, m4u_results, vega_results, sdmp_results = await asyncio.gather(
-            asyncio.to_thread(hdh_search,  search_query, 4),
-            asyncio.to_thread(md_search,   search_query, 4),
-            asyncio.to_thread(m4u_search,  search_query, 4),
-            asyncio.to_thread(vega_search, search_query, 4),
-            asyncio.to_thread(sdmp_search, search_query, 4),
+        hdhub_results, hdh_results, md_results, m4u_results, vega_results, sdmp_results = await asyncio.gather(
+            asyncio.to_thread(hdhub_search, search_query, 4),
+            asyncio.to_thread(hdh_search,   search_query, 3),
+            asyncio.to_thread(md_search,    search_query, 3),
+            asyncio.to_thread(m4u_search,   search_query, 3),
+            asyncio.to_thread(vega_search,  search_query, 3),
+            asyncio.to_thread(sdmp_search,  search_query, 3),
         )
 
-    if not hdh_results and not md_results and not m4u_results and not vega_results and not sdmp_results:
+    if not hdhub_results and not hdh_results and not md_results and not m4u_results and not vega_results and not sdmp_results:
         await _src_edit(
             f"❌ No results found for <b>{search_query}</b> on {source_label}.",
             parse_mode="HTML",
@@ -533,7 +547,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Store results in user_data
-    all_results = {f"hdh_{i}": m for i, m in enumerate(hdh_results)}
+    all_results = {f"hdhub_{i}": m for i, m in enumerate(hdhub_results)}
+    all_results.update({f"hdh_{i}": m for i, m in enumerate(hdh_results)})
     all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
     all_results.update({f"m4u_{i}": m for i, m in enumerate(m4u_results)})
     all_results.update({f"vega_{i}": m for i, m in enumerate(vega_results)})
@@ -559,6 +574,12 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🍿 {title}", callback_data=f"msres_m4u_{i}")])
 
+    if hdhub_results:
+        keyboard.append([InlineKeyboardButton("━━ HDHub4u ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(hdhub_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"⭐ {title}", callback_data=f"msres_hdhub_{i}")])
+
     if vega_results:
         keyboard.append([InlineKeyboardButton("━━ Vegamovies ━━", callback_data="msearch_noop")])
         for i, m in enumerate(vega_results):
@@ -575,7 +596,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     keyboard.append([InlineKeyboardButton("📢 Post to Channel", callback_data="mpost_search")])
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
 
-    total = len(hdh_results) + len(md_results) + len(m4u_results) + len(vega_results) + len(sdmp_results)
+    total = len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results) + len(vega_results) + len(sdmp_results)
     await _src_edit(
         f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
         f"  <i>({source_label})</i>\n\nTap a movie for download links:",
@@ -617,8 +638,11 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("m4u", "vega", "sdmp"):
-        if source == "vega":
+    if source in ("m4u", "vega", "sdmp", "hdhub"):
+        if source == "hdhub":
+            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            text = format_hdhub_message(movie["title"], detail)
+        elif source == "vega":
             detail = await asyncio.to_thread(vega_movie_links, movie["url"])
             text = format_vega_message(movie["title"], detail)
         elif source == "sdmp":
@@ -744,7 +768,10 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
     """Fetch full download links for one movie and post poster + links to channel.
     Returns a status string for logging."""
     try:
-        if source == "hdh":
+        if source == "hdhub":
+            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            text = format_hdhub_message(movie["title"], detail)
+        elif source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
             text = format_hdh_message(movie["title"], detail)
         elif source == "md":
@@ -863,17 +890,20 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
         if not results:
             await query.message.reply_text("❌ No search results in session.")
             return
+        movies_to_post = []
         for k, m in sorted(results.items(), key=lambda x: x[0]):
-                    if k.startswith("hdh_"):
-                        src = "hdh"
-                    elif k.startswith("md_"):
-                        src = "md"
-                    elif k.startswith("vega_"):
-                        src = "vega"
-                    elif k.startswith("sdmp_"):
-                        src = "sdmp"
-                    else:
-                        src = "m4u"
+            if k.startswith("hdhub_"):
+                src = "hdhub"
+            elif k.startswith("hdh_"):
+                src = "hdh"
+            elif k.startswith("md_"):
+                src = "md"
+            elif k.startswith("vega_"):
+                src = "vega"
+            elif k.startswith("sdmp_"):
+                src = "sdmp"
+            else:
+                src = "m4u"
             movies_to_post.append((m, src))
 
     if not movies_to_post:

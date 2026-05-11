@@ -1,5 +1,6 @@
 """
 Movie scraper — supports multiple sources:
+  - HDHub4u         (https://new1.hdhub4u.limo/)          ← primary
   - 4KHDHub         (https://4khdhub.link/category/hindi-movies/)
   - MoviesDrive     (https://new2.moviesdrives.my/)
   - Movies4U        (https://movies4u.ee/)
@@ -1447,4 +1448,265 @@ def format_sdmp_message(movie_title: str, data: dict, footer: bool = True) -> st
     if footer:
         lines.append("━" * 32)
         lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HDHub4u  (https://new1.hdhub4u.limo/)  — primary source
+# ══════════════════════════════════════════════════════════════════════════════
+
+HDHUB_BASE        = os.getenv("HDHUB_BASE_URL", "https://new1.hdhub4u.limo")
+_HDHUB_SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search"
+_HDHUB_SKIP_LABELS = {"watch", "player-2", "player 2", "stream"}
+
+
+def _hdhub_clean_poster(src: str) -> str:
+    """Normalise i0.wp.com proxy URLs to the original TMDB URL."""
+    m = re.search(r"i\d\.wp\.com/(.+?)(?:\?|$)", src)
+    return "https://" + m.group(1) if m else src
+
+
+def _scrape_hdhub_info(text: str) -> dict[str, str]:
+    """Extract movie metadata from plain text of an HDHub4u page."""
+    info: dict[str, str] = {}
+    patterns = {
+        "imdb":     r"iMDB Rating:\s*([^\n\[]+)",
+        "genre":    r"Genre:\s*([^\n]+)",
+        "stars":    r"Stars:\s*([^\n]+)",
+        "director": r"Director:\s*([^\n]+)",
+        "language": r"Language:\s*([^\n]+)",
+        "quality":  r"Quality:\s*([^\n]+)",
+        "rating":   r"Rating:\s*([^\n]+)",
+        "genres":   r"Genres:\s*([^\n]+)",
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text, re.I)
+        if m:
+            val = m.group(1).strip().rstrip("/").strip()
+            dest = "genre" if key == "genres" else ("imdb" if key == "rating" and "imdb" not in info else key)
+            if dest not in info:
+                info[dest] = val
+    return info
+
+
+def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
+    """Fetch latest movies from HDHub4u homepage with WordPress /page/N/ pagination."""
+    url = HDHUB_BASE + "/" if page == 1 else f"{HDHUB_BASE}/page/{page}/"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("hdhub_latest_movies page=%d failed: %s", page, exc)
+        return []
+
+    movies: list[dict] = []
+    for li in soup.select("ul.recent-movies li.thumb"):
+        if len(movies) >= limit:
+            break
+        img = li.find("img", src=True)
+        fig = li.find("figcaption")
+        a   = li.find("a", href=True)
+        if not (a and fig):
+            continue
+        title  = fig.get_text(strip=True)
+        href   = a["href"]
+        poster = _hdhub_clean_poster(img.get("src", "")) if img else ""
+        if title and href:
+            movies.append({"title": title, "url": href, "poster": poster})
+    return movies
+
+
+def hdhub_search(query: str, limit: int = 10) -> list[dict]:
+    """Search HDHub4u via Typesense API (JS search backend)."""
+    try:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        resp = sess.get(
+            _HDHUB_SEARCH_API,
+            params={
+                "q":                query,
+                "query_by":         "post_title,category,stars,director,imdb_id",
+                "sort_by":          "sort_by_date:desc",
+                "limit":            limit,
+                "highlight_fields": "none",
+                "use_cache":        "true",
+            },
+            timeout=20,
+        )
+        data = resp.json()
+    except Exception as exc:
+        log.error("hdhub_search '%s' failed: %s", query, exc)
+        return []
+
+    movies: list[dict] = []
+    for hit in data.get("hits", []):
+        doc       = hit.get("document", {})
+        title     = doc.get("post_title", "")
+        permalink = doc.get("permalink", "")
+        thumbnail = doc.get("post_thumbnail", "")
+        if title and permalink:
+            movies.append({
+                "title":  title,
+                "url":    HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/"),
+                "poster": thumbnail,
+            })
+    return movies
+
+
+def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape download links from an HDHub4u movie or series page.
+
+    Returns::
+        {
+          "poster":    str,
+          "info":      {imdb, genre, stars, director, language, quality},
+          "links":     [{"label": str, "url": str}],
+          "episodes":  [{"ep": str, "qualities": {"720p": [{"label","url"}], ...}}],
+          "is_series": bool,
+        }
+    """
+    try:
+        resp = _get(movie_url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("hdhub_movie_links %s failed: %s", movie_url, exc)
+        return {"poster": "", "info": {}, "links": [], "episodes": [], "is_series": False}
+
+    og = soup.find("meta", property="og:image")
+    poster = _hdhub_clean_poster(og.get("content", "")) if og else ""
+
+    content   = soup.select_one("main.page-body, .entry-content, article") or soup
+    full_text = content.get_text("\n", strip=True)
+    info      = _scrape_hdhub_info(full_text)
+
+    # ── Collect all headings in document order ────────────────────────────────
+    all_h = content.find_all(["h2", "h3", "h4"])
+    dl_idx   = -1
+    ep_sec   = -1
+    for i, h in enumerate(all_h):
+        t = h.get_text(strip=True).lower()
+        if dl_idx == -1 and "download links" in t:
+            dl_idx = i
+        elif dl_idx >= 0 and ep_sec == -1 and "single episode" in t:
+            ep_sec = i
+
+    links:    list[dict] = []
+    episodes: list[dict] = []
+
+    # ── ZIP / quality pack links (between DL and Single Episode markers) ───────
+    end_pack = ep_sec if ep_sec > 0 else len(all_h)
+    for h in all_h[dl_idx + 1: end_pack]:
+        a = h.find("a", href=True)
+        if a:
+            href  = a.get("href", "")
+            label = a.get_text(strip=True)
+            if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS:
+                links.append({"label": label, "url": href})
+
+    # ── Series: detect and parse episode sections ─────────────────────────────
+    # Episodes live in div.Z1hOCe — they may be flat h4 siblings or in nested divs
+    is_series = ep_sec >= 0
+
+    # Find the "Single Episode" h2 element, then its next sibling div.Z1hOCe
+    ep_h2 = all_h[ep_sec] if ep_sec >= 0 else None
+    if ep_h2 is not None:
+        # Walk forward in the DOM tree to find the Z1hOCe div
+        z_div = None
+        for candidate in ep_h2.find_next_siblings():
+            if getattr(candidate, "name", None) == "div":
+                z_div = candidate
+                break
+
+        if z_div:
+            # All h4s inside Z1hOCe — group into episodes by detecting episode-header h4s
+            all_ep_h4 = z_div.find_all("h4")
+            current_ep: dict[str, Any] | None = None
+            for h4 in all_ep_h4:
+                raw   = h4.get_text(" ", strip=True)
+                # Episode header: contains "episode" / "EP" but has no external links
+                ext_a = [a for a in h4.find_all("a", href=True) if a["href"].startswith("http")]
+                if not ext_a and re.search(r"EP(?:i?SODE)?\s*\d+", raw, re.I):
+                    if current_ep and current_ep["qualities"]:
+                        episodes.append(current_ep)
+                    ep_label = re.sub(r"<[^>]+>", "", raw).strip()
+                    current_ep = {"ep": ep_label, "qualities": {}}
+                elif ext_a and current_ep is not None:
+                    q_match = re.match(r"(4K|2160p|1080p|720p|480p|360p)", raw, re.I)
+                    quality = q_match.group(1) if q_match else "Link"
+                    ql: list[dict] = []
+                    for a in ext_a:
+                        lbl = a.get_text(strip=True)
+                        if lbl.lower() not in _HDHUB_SKIP_LABELS and lbl.lower() != "watch":
+                            ql.append({"label": lbl, "url": a["href"]})
+                    if ql:
+                        existing = current_ep["qualities"].get(quality, [])
+                        current_ep["qualities"][quality] = existing + ql
+            if current_ep and current_ep["qualities"]:
+                episodes.append(current_ep)
+
+    return {
+        "poster":    poster,
+        "info":      info,
+        "links":     links,
+        "episodes":  episodes,
+        "is_series": is_series,
+    }
+
+
+def format_hdhub_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format an HDHub4u result as HTML for Telegram."""
+    links     = data.get("links", [])
+    episodes  = data.get("episodes", [])
+    info      = data.get("info", {})
+    is_series = data.get("is_series", False)
+
+    def _info_block() -> str:
+        parts: list[str] = []
+        if info.get("imdb"):     parts.append(f"\u2b50 <b>IMDb:</b> {str(info['imdb']).split('/')[0].strip()}")
+        if info.get("genre"):    parts.append(f"\U0001f3ad <b>Genre:</b> {info['genre'][:70]}")
+        if info.get("language"): parts.append(f"\U0001f5e3 <b>Language:</b> {info['language'][:50]}")
+        if info.get("quality"):  parts.append(f"\U0001f4fa <b>Quality:</b> {info['quality'][:60]}")
+        stars = info.get("stars", "")
+        if stars:
+            parts.append(f"\U0001f3ac <b>Cast:</b> {', '.join(x.strip() for x in stars.split(',')[:3])}")
+        director = info.get("director", "")
+        if director:
+            parts.append(f"\U0001f3a5 <b>Director:</b> {director[:50]}")
+        return "\n".join(parts)
+
+    lines: list[str] = []
+    icon = "\U0001f4fa" if is_series else "\U0001f39e"
+    if movie_title:
+        lines.append(f"{icon} <b>{movie_title}</b>")
+
+    ib = _info_block()
+    if ib:
+        lines.append("\u2501" * 32)
+        lines.append(ib)
+
+    if links:
+        lines.append("\u2501" * 32)
+        hdr = "\U0001f4e5 <b>Full Pack / ZIP Download</b>" if is_series else "\U0001f4e5 <b>Download Links (HDHub4u)</b>"
+        lines.append(hdr)
+        for lk in links:
+            lk_url   = lk["url"]
+            lk_label = lk["label"]
+            lines.append(f"\n\U0001f517 <a href='{lk_url}'>{lk_label}</a>")
+        lines.append("")
+
+    if episodes:
+        lines.append("\u2501" * 32)
+        lines.append("\U0001f5c2 <b>Episode-wise Download</b>")
+        for ep in episodes:
+            lines.append(f"\n<b>{ep['ep']}</b>")
+            for quality, ql in ep["qualities"].items():
+                server_parts = " | ".join(
+                    "<a href='" + lk["url"] + "'>" + lk["label"] + "</a>" for lk in ql
+                )
+                lines.append(f"  {quality} \u2014 {server_parts}")
+        lines.append("")
+
+    if footer:
+        lines.append("\u2501" * 32)
+        lines.append("\u26a1 <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
     return "\n".join(lines)

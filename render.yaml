@@ -25,6 +25,8 @@ services:
         value: "1"
       - key: PORT
         value: "10000"
+      - key: HDHUB_BASE_URL
+        value: "https://new1.hdhub4u.limo"
       - key: HDH_BASE_URL
         value: "https://4khdhub.link"
       - key: MD_BASE_URL
