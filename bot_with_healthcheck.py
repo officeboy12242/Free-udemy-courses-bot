@@ -183,8 +183,14 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Preview latest tech news; offer Post/Skip buttons."""
-    if not update.effective_message:
+    if not update.effective_message or not update.effective_user:
         return
+        
+    # Only allow the admin (MARKET_ALERT_CHAT_ID) to use the /news command
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+        return
+        
     await update.effective_message.reply_text("Fetching tech news...")
 
     articles = await asyncio.to_thread(scrape_inshorts, 10, False)
@@ -207,8 +213,14 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle Post/Skip button press from /news preview."""
     query = update.callback_query
-    if not query:
+    if not query or not update.effective_user:
         return
+        
+    # Only allow the admin (MARKET_ALERT_CHAT_ID) to click the buttons
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission to do this.", show_alert=True)
+        return
+        
     await query.answer()
 
     if query.data == "news_post":
