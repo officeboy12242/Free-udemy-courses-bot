@@ -249,48 +249,38 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 # ─── Formatting ──────────────────────────────────────────────────────────────
 
-FOOTER = "\n⚡ Powered by @CoursesDrivee"
-
-
-def format_hdh_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
+def format_hdh_message(movie_title: str, data: dict[str, Any]) -> str:
     qualities = data.get("qualities", [])
     if not qualities:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found on 4KHDHub."
+        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
 
-    lines = []
-    if movie_title:
-        lines.append(f"🎬 <b>{movie_title}</b>\n")
-    lines.append("📥 <b>Download Links (4KHDHub)</b>\n")
+    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (4KHDHub)</b>\n"]
     for q in qualities:
         lines.append(f"📼 <b>{q['quality']}</b>")
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in q["links"]]
         lines.append("  " + " | ".join(parts))
         lines.append("")
-    if footer:
-        lines.append(FOOTER)
+    lines.append("\n⚡ Powered by @CoursesDrivee")
     return "\n".join(lines)
 
 
-def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
+def format_md_message(movie_title: str, data: dict[str, Any]) -> str:
     links = data.get("links", [])
     if not links:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found on MoviesDrive."
+        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
 
-    lines = []
-    if movie_title:
-        lines.append(f"🎬 <b>{movie_title}</b>\n")
-    lines.append("📥 <b>Download Links (MoviesDrive)</b>\n")
-
-    grouped: dict[str, list] = {}
+    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (MoviesDrive)</b>\n"]
+    
+    # Group links by label (e.g. "480p[430.36 MB]")
+    grouped = {}
     for l in links:
         grouped.setdefault(l["label"], []).append(l)
-
+        
     for label, group_links in grouped.items():
         lines.append(f"📼 <b>{label}</b>")
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
         lines.append("  " + " | ".join(parts))
         lines.append("")
-
-    if footer:
-        lines.append(FOOTER)
+        
+    lines.append("\n⚡ Powered by @CoursesDrivee")
     return "\n".join(lines)

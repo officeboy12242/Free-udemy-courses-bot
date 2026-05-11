@@ -432,13 +432,18 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     parts = [f"🎬 <b>{movie['title']}</b>\n"]
 
+    # Helper to strip footer from formatted messages
+    FOOTER = "\n⚡ Powered by @CoursesDrivee"
+
+    hdh_links_text = format_hdh_message("", hdh_detail).replace("🎬 <b></b>\n\n", "").replace(FOOTER, "")
     if hdh_detail.get("qualities"):
         parts.append("━━ <b>4KHDHub (4K/HDR)</b> ━━")
-        parts.append(format_hdh_message("", hdh_detail, footer=False))
+        parts.append(hdh_links_text)
 
+    md_links_text = format_md_message("", md_detail).replace("🎬 <b></b>\n\n", "").replace(FOOTER, "")
     if md_detail.get("links"):
         parts.append("━━ <b>MoviesDrive (480p–4K)</b> ━━")
-        parts.append(format_md_message("", md_detail, footer=False))
+        parts.append(md_links_text)
 
     if not hdh_detail.get("qualities") and not md_detail.get("links"):
         parts.append("❌ No download links found on either site.")
