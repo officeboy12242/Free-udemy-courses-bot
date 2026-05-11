@@ -44,9 +44,8 @@ from news_service import (
     mark_news_posted,
 )
 from movie_service import (
-    scrape_latest_movies,
-    scrape_movie_download_links,
-    format_movie_links_message,
+    hdh_latest_movies, hdh_movie_links, format_hdh_message,
+    md_latest_movies, md_movie_links, format_md_message,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -188,63 +187,112 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch latest movies and show them as inline buttons."""
+    """Show site picker: 4KHDHub or MoviesDrive."""
     if not update.effective_message or not update.effective_user:
         return
-        
-    # Only allow admin
     if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
         await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
         return
-        
-    msg = await update.effective_message.reply_text("Fetching latest movies from 4KHDHub...")
-    
-    movies = await asyncio.to_thread(scrape_latest_movies, 5)
-    if not movies:
-        await msg.edit_text("❌ Failed to fetch movies or no movies found.")
-        return
-        
-    keyboard = []
-    for i, m in enumerate(movies):
-        # We pass the index as callback data to keep it short
-        keyboard.append([InlineKeyboardButton(m["title"], callback_data=f"movie_{i}")])
-        
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    context.user_data["latest_movies"] = movies
-    
-    await msg.edit_text(
-        "🍿 <b>Latest Hindi Movies</b>\n\nSelect a movie to get download links:",
-        reply_markup=reply_markup,
-        parse_mode="HTML"
+
+    keyboard = [
+        [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)", callback_data="msite_hdh")],
+        [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)", callback_data="msite_md")],
+    ]
+    await update.effective_message.reply_text(
+        "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
     )
 
+
 async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle movie button press to fetch download links."""
+    """Handle all movie-related inline button presses."""
     query = update.callback_query
     if not query or not update.effective_user:
         return
-        
     if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
         await query.answer("⛔ You do not have permission.", show_alert=True)
         return
-        
-    await query.answer("Fetching download links...")
-    
-    try:
-        idx = int(query.data.split("_")[1])
-        movies = context.user_data.get("latest_movies", [])
-        if not movies or idx >= len(movies):
-            await query.message.reply_text("❌ Session expired. Please run /movies again.")
+
+    data = query.data
+
+    # ── Site picker ──────────────────────────────────────────────────────────
+    if data in ("msite_hdh", "msite_md"):
+        await query.answer("Fetching latest movies…")
+        source = "hdh" if data == "msite_hdh" else "md"
+        fetch_fn = hdh_latest_movies if source == "hdh" else md_latest_movies
+        movies = await asyncio.to_thread(fetch_fn, 5)
+        if not movies:
+            await query.edit_message_text("❌ Failed to fetch movies. Try again later.")
             return
-            
+
+        context.user_data[f"movies_{source}"] = movies
+        keyboard = []
+        for i, m in enumerate(movies):
+            title = m["title"][:55] + "…" if len(m["title"]) > 55 else m["title"]
+            keyboard.append([InlineKeyboardButton(title, callback_data=f"mpick_{source}_{i}")])
+        keyboard.append([InlineKeyboardButton("« Back", callback_data="mback_sites")])
+
+        site_label = "4KHDHub" if source == "hdh" else "MoviesDrive"
+        await query.edit_message_text(
+            f"🍿 <b>Latest Movies — {site_label}</b>\n\nTap a movie for download links:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+
+    # ── Back to site picker ──────────────────────────────────────────────────
+    elif data == "mback_sites":
+        keyboard = [
+            [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)", callback_data="msite_hdh")],
+            [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)", callback_data="msite_md")],
+        ]
+        await query.edit_message_text(
+            "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+
+    # ── Movie selected ────────────────────────────────────────────────────────
+    elif data.startswith("mpick_"):
+        parts = data.split("_")          # mpick_hdh_0
+        source = parts[1]
+        idx = int(parts[2])
+        movies = context.user_data.get(f"movies_{source}", [])
+        if not movies or idx >= len(movies):
+            await query.answer("Session expired — run /movies again.", show_alert=True)
+            return
+
+        await query.answer("Fetching links…")
         movie = movies[idx]
-        qualities = await asyncio.to_thread(scrape_movie_download_links, movie["url"])
-        
-        text = format_movie_links_message(movie["title"], qualities)
-        await query.message.reply_html(text, disable_web_page_preview=True)
-    except Exception as e:
-        log.error("Movie callback error: %s", e)
-        await query.message.reply_text("❌ An error occurred while fetching links.")
+
+        if source == "hdh":
+            detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
+            text = format_hdh_message(movie["title"], detail)
+        else:
+            detail = await asyncio.to_thread(md_movie_links, movie["url"])
+            text = format_md_message(movie["title"], detail)
+
+        poster_url = detail.get("poster") or movie.get("poster", "")
+        back_cb = f"msite_{source}"
+
+        # Send poster first, then links as a separate message
+        if poster_url:
+            try:
+                await query.message.reply_photo(
+                    photo=poster_url,
+                    caption=f"🎬 <b>{movie['title']}</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass  # Poster failed — still send links below
+
+        await query.message.reply_html(
+            text,
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back to list", callback_data=back_cb)]]
+            ),
+        )
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
