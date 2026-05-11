@@ -657,7 +657,7 @@ def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = Tru
                         lines.append(f"   🔗 <a href='{l['url']}'>{l['name']}</a>")
         else:
             parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
-            lines.append("   " + " · ".join(parts))
+            lines.append("   🔗 " + " · ".join(parts))
 
         lines.append("")
 
