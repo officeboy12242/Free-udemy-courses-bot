@@ -388,27 +388,65 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Session expired — search again.", show_alert=True)
         return
 
-    await query.answer("Fetching links…")
+    await query.answer("Fetching links from both sites…")
+
+    # Find matching movie from the OTHER site stored in same search results
+    other_source = "md" if source == "hdh" else "hdh"
+    movie_title_lower = movie["title"].lower()[:30]
+    other_movie = None
+    for k, v in results.items():
+        if k.startswith(other_source + "_") and movie_title_lower in v["title"].lower():
+            other_movie = v
+            break
+
+    # Fetch from both sites concurrently
+    async def fetch_hdh(url):
+        return await asyncio.to_thread(hdh_movie_links, url)
+
+    async def fetch_md(url):
+        return await asyncio.to_thread(md_movie_links, url)
+
+    async def _empty_hdh():
+        return {"poster": "", "qualities": []}
+
+    async def _empty_md():
+        return {"poster": "", "links": []}
 
     if source == "hdh":
-        detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
-        text = format_hdh_message(movie["title"], detail)
+        hdh_detail, md_detail = await asyncio.gather(
+            fetch_hdh(movie["url"]),
+            fetch_md(other_movie["url"]) if other_movie else _empty_md(),
+        )
     else:
-        detail = await asyncio.to_thread(md_movie_links, movie["url"])
-        text = format_md_message(movie["title"], detail)
+        md_detail, hdh_detail = await asyncio.gather(
+            fetch_md(movie["url"]),
+            fetch_hdh(other_movie["url"]) if other_movie else _empty_hdh(),
+        )
 
-    poster_url = detail.get("poster") or movie.get("poster", "")
+    # Build combined message
+    poster_url = (
+        hdh_detail.get("poster") or md_detail.get("poster")
+        or movie.get("poster", "")
+        or (other_movie.get("poster", "") if other_movie else "")
+    )
 
-    if poster_url and len(text) <= 1024:
-        try:
-            await query.message.reply_photo(
-                photo=poster_url,
-                caption=text,
-                parse_mode="HTML",
-            )
-            return
-        except Exception:
-            pass
+    parts = [f"🎬 <b>{movie['title']}</b>\n"]
+
+    hdh_links_text = format_hdh_message("", hdh_detail).replace("🎬 <b></b>\n\n", "")
+    if hdh_detail.get("qualities"):
+        parts.append("━━ <b>4KHDHub (4K/HDR)</b> ━━")
+        parts.append(hdh_links_text)
+
+    md_links_text = format_md_message("", md_detail).replace("🎬 <b></b>\n\n", "")
+    if md_detail.get("links"):
+        parts.append("━━ <b>MoviesDrive (480p–4K)</b> ━━")
+        parts.append(md_links_text)
+
+    if not hdh_detail.get("qualities") and not md_detail.get("links"):
+        parts.append("❌ No download links found on either site.")
+
+    parts.append("\n⚡ Powered by @CoursesDrivee")
+    combined_text = "\n".join(parts)
 
     if poster_url:
         try:
@@ -416,7 +454,7 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-    await query.message.reply_html(text, disable_web_page_preview=True)
+    await query.message.reply_html(combined_text, disable_web_page_preview=True)
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
