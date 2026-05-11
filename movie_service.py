@@ -29,7 +29,7 @@ HDH_BASE = "https://4khdhub.link"
 HDH_CATEGORY = f"{HDH_BASE}/category/hindi-movies/"
 
 
-def hdh_latest_movies(limit: int = 5) -> list[dict[str, str]]:
+def hdh_latest_movies(limit: int = 10) -> list[dict[str, str]]:
     """Scrape the latest movies from 4KHDHub Hindi category."""
     try:
         resp = requests.get(HDH_CATEGORY, headers=HEADERS, timeout=15)
@@ -98,7 +98,7 @@ def hdh_movie_links(movie_url: str) -> dict[str, Any]:
 MD_BASE = "https://new2.moviesdrives.my"
 
 
-def md_latest_movies(limit: int = 5) -> list[dict[str, str]]:
+def md_latest_movies(limit: int = 10) -> list[dict[str, str]]:
     """Scrape the latest movies from MoviesDrive home page."""
     try:
         resp = requests.get(MD_BASE + "/", headers=HEADERS, timeout=15)
@@ -184,6 +184,67 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
     except Exception as e:
         log.error("MoviesDrive movie page failed (%s): %s", movie_url, e)
         return {"poster": "", "links": []}
+
+
+# ─── Search ──────────────────────────────────────────────────────────────────
+
+def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search 4KHDHub using the ?s= query parameter."""
+    try:
+        resp = requests.get(
+            f"{HDH_BASE}/",
+            params={"s": query},
+            headers=HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        movies = []
+        for card in soup.select(".movie-card"):
+            title_el = card.select_one(".movie-card-title")
+            title = title_el.text.strip() if title_el else "Unknown"
+            poster_el = card.select_one("img")
+            poster = poster_el.get("src", "") if poster_el else ""
+            link = card.get("href") or ""
+            if not link.startswith("http"):
+                link = HDH_BASE + link
+            if link:
+                movies.append({"title": title, "url": link, "poster": poster, "source": "hdh"})
+            if len(movies) >= limit:
+                break
+        return movies
+    except Exception as e:
+        log.error("4KHDHub search failed for '%s': %s", query, e)
+        return []
+
+
+def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search MoviesDrive via the /search.php JSON API."""
+    try:
+        resp = requests.get(
+            "https://new2.moviesdrives.my/search.php",
+            params={"query": query, "page": 1},
+            headers=HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        movies = []
+        for hit in data.get("hits", []):
+            doc = hit.get("document", {})
+            title = doc.get("post_title", "Unknown")
+            permalink = doc.get("permalink", "")
+            poster = doc.get("post_thumbnail", "")
+            if not permalink:
+                continue
+            url = "https://new2.moviesdrives.my" + permalink if not permalink.startswith("http") else permalink
+            movies.append({"title": title, "url": url, "poster": poster, "source": "md"})
+            if len(movies) >= limit:
+                break
+        return movies
+    except Exception as e:
+        log.error("MoviesDrive search failed for '%s': %s", query, e)
+        return []
 
 
 # ─── Formatting ──────────────────────────────────────────────────────────────

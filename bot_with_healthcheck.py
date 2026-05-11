@@ -46,6 +46,7 @@ from news_service import (
 from movie_service import (
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
     md_latest_movies, md_movie_links, format_md_message,
+    hdh_search, md_search,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -93,7 +94,8 @@ Here's what I can do:
 
 <b>Commands:</b>
 /start — this menu
-/movies — get latest 4K Hindi movies
+/movies — browse latest movies (4KHDHub &amp; MoviesDrive)
+/search &lt;title&gt; — search both sites for any movie
 /news — preview latest tech news (Post / Skip)
 /market — live market snapshot + dip status
 /testdip — sample dip alert (not real data)
@@ -306,6 +308,117 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search both movie sites. Usage: /search <title>"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+        return
+
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.effective_message.reply_text(
+            "Usage: <code>/search movie name</code>\nExample: <code>/search Project Hail Mary</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    msg = await update.effective_message.reply_text(f"🔍 Searching both sites for <b>{query}</b>…", parse_mode="HTML")
+
+    # Search both sites concurrently
+    hdh_results, md_results = await asyncio.gather(
+        asyncio.to_thread(hdh_search, query, 8),
+        asyncio.to_thread(md_search, query, 8),
+    )
+
+    if not hdh_results and not md_results:
+        await msg.edit_text(f"❌ No results found for <b>{query}</b> on either site.", parse_mode="HTML")
+        return
+
+    # Store all results in user_data
+    all_results = {f"hdh_{i}": m for i, m in enumerate(hdh_results)}
+    all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
+    context.user_data["search_results"] = all_results
+
+    keyboard = []
+    if hdh_results:
+        keyboard.append([InlineKeyboardButton("━━ 4KHDHub ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(hdh_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"🎬 {title}", callback_data=f"msres_hdh_{i}")])
+
+    if md_results:
+        keyboard.append([InlineKeyboardButton("━━ MoviesDrive ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(md_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"🎥 {title}", callback_data=f"msres_md_{i}")])
+
+    total = len(hdh_results) + len(md_results)
+    await msg.edit_text(
+        f"🔍 <b>{total} results for \"{query}\"</b>\n\nTap a movie for download links:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+
+async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle search result button presses."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission.", show_alert=True)
+        return
+
+    data = query.data
+    if data == "msearch_noop":
+        await query.answer()
+        return
+
+    # msres_hdh_0 or msres_md_2
+    parts = data.split("_")   # ["msres", "hdh", "0"]
+    source = parts[1]
+    idx = int(parts[2])
+    key = f"{source}_{idx}"
+    results = context.user_data.get("search_results", {})
+    movie = results.get(key)
+
+    if not movie:
+        await query.answer("Session expired — search again.", show_alert=True)
+        return
+
+    await query.answer("Fetching links…")
+
+    if source == "hdh":
+        detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
+        text = format_hdh_message(movie["title"], detail)
+    else:
+        detail = await asyncio.to_thread(md_movie_links, movie["url"])
+        text = format_md_message(movie["title"], detail)
+
+    poster_url = detail.get("poster") or movie.get("poster", "")
+
+    if poster_url and len(text) <= 1024:
+        try:
+            await query.message.reply_photo(
+                photo=poster_url,
+                caption=text,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+
+    if poster_url:
+        try:
+            await query.message.reply_photo(photo=poster_url)
+        except Exception:
+            pass
+
+    await query.message.reply_html(text, disable_web_page_preview=True)
+
+
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Preview latest tech news; offer Post/Skip buttons."""
     if not update.effective_message or not update.effective_user:
@@ -387,9 +500,11 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("movies", cmd_movies))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
     app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^m(site|back|pick)_"))
+    app.add_handler(CallbackQueryHandler(search_result_callback, pattern=r"^msres_|^msearch_noop$"))
     return app
 
 
