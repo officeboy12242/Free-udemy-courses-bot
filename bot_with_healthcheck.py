@@ -378,7 +378,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
-    app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^movie_"))
+    app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^m(site|back|pick)_"))
     return app
 
 
