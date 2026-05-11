@@ -218,26 +218,25 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = await update.effective_message.reply_text("🔍 Testing connectivity to movie sites…")
 
-    import requests as _req
+    from movie_service import SCRAPER_API_KEY, _get as movie_get
     tests = [
-        ("4KHDHub",    "https://4khdhub.link/category/hindi-movies/",   True),
-        ("MoviesDrive","https://new2.moviesdrives.my/",                  False),
+        ("4KHDHub",    "https://4khdhub.link/category/hindi-movies/"),
+        ("MoviesDrive","https://new2.moviesdrives.my/"),
     ]
 
-    lines = ["<b>Movie Site Connectivity Test</b>\n"]
-    for label, url, no_verify in tests:
+    mode = f"ScraperAPI (key set ✅)" if SCRAPER_API_KEY else "Direct (no proxy ⚠️ — may be blocked on cloud)"
+    lines = [f"<b>Movie Site Connectivity Test</b>", f"Mode: <i>{mode}</i>\n"]
+
+    for label, url in tests:
         try:
-            hdrs = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-                "Accept": "text/html,*/*;q=0.8",
-            }
-            r = await asyncio.to_thread(
-                lambda u=url, v=no_verify, h=hdrs: _req.get(u, headers=h, verify=not v, timeout=15)
-            )
+            r = await asyncio.to_thread(movie_get, url, 1, timeout=20)
             icon = "✅" if r.status_code == 200 else "⚠️"
-            lines.append(f"{icon} <b>{label}</b>: HTTP {r.status_code} ({len(r.content)} bytes)")
+            lines.append(f"{icon} <b>{label}</b>: HTTP {r.status_code} ({len(r.content):,} bytes)")
         except Exception as e:
             lines.append(f"❌ <b>{label}</b>: {type(e).__name__}: {str(e)[:120]}")
+
+    if not SCRAPER_API_KEY:
+        lines.append("\n💡 Set <code>SCRAPER_API_KEY</code> in env to bypass Cloudflare on cloud hosts.\nFree at scraperapi.com (5,000 req/month)")
 
     await msg.edit_text("\n".join(lines), parse_mode="HTML")
 

@@ -6,6 +6,7 @@ Movie scraper — supports two sources:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import urllib.parse
@@ -17,6 +18,11 @@ import urllib3
 from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
+
+# If set, all movie requests are routed through ScraperAPI (bypasses Cloudflare on cloud hosts)
+# Sign up free at https://www.scraperapi.com  — 5,000 req/month free
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+SCRAPER_API_URL = "http://api.scraperapi.com"
 
 # Full browser-like headers to avoid 403 blocks
 HEADERS = {
@@ -56,18 +62,48 @@ def _session_for(host: str) -> requests.Session:
 
 
 def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
-    """GET with browser headers, persistent session (cookies), SSL bypass for known hosts."""
+    """GET with browser headers, persistent session (cookies), SSL bypass for known hosts.
+
+    When SCRAPER_API_KEY is set (recommended for cloud deployments), all requests
+    are routed through ScraperAPI which bypasses Cloudflare / geo-blocks automatically.
+    """
+    # ── ScraperAPI mode ──────────────────────────────────────────────────────
+    if SCRAPER_API_KEY:
+        api_url = SCRAPER_API_URL
+        params = {"api_key": SCRAPER_API_KEY, "url": url, "render": "false"}
+        # remove any timeout kwarg and re-apply a generous default
+        kwargs.setdefault("timeout", 30)
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.get(api_url, params=params, **kwargs)
+                if resp.status_code in (403, 429, 500, 503) and attempt < retries:
+                    log.warning("ScraperAPI %s → HTTP %s (attempt %d), retrying…",
+                                url, resp.status_code, attempt + 1)
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                if resp.status_code not in (200, 301, 302):
+                    log.warning("ScraperAPI %s → HTTP %s", url, resp.status_code)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                log.warning("ScraperAPI %s → %s: %s (attempt %d)",
+                            url, type(exc).__name__, exc, attempt + 1)
+                if attempt < retries:
+                    time.sleep(2 * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+
+    # ── Direct mode (local / non-blocked network) ────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
     verify = host not in _NO_VERIFY_HOSTS
     session = _session_for(host)
 
-    # Suppress InsecureRequestWarning for hosts we intentionally skip
     ctx = warnings.catch_warnings()
     ctx.__enter__()
     if not verify:
         warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
 
-    last_exc: Exception | None = None
+    last_exc = None
     for attempt in range(retries + 1):
         try:
             resp = session.get(url, verify=verify, **kwargs)
