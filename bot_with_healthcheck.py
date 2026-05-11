@@ -52,8 +52,9 @@ from movie_service import (
 # ─── Load env ────────────────────────────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+BOT_TOKEN         = os.getenv("BOT_TOKEN")
+CHANNEL_ID        = os.getenv("CHANNEL_ID")
+MOVIES_CHANNEL_ID = os.getenv("MOVIES_CHANNEL_ID", CHANNEL_ID)
 PORT = int(os.getenv("PORT", 10000))  # Render uses PORT env variable
 # Set in .env to enable GET /api/test-alert?secret=... (sends sample dip text to MARKET_ALERT_CHAT_ID)
 TEST_ALERT_SECRET = os.getenv("TEST_ALERT_SECRET", "").strip()
@@ -207,6 +208,40 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: test raw connectivity to movie sites and report HTTP status."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ Admin only.")
+        return
+
+    msg = await update.effective_message.reply_text("🔍 Testing connectivity to movie sites…")
+
+    import requests as _req
+    tests = [
+        ("4KHDHub",    "https://4khdhub.link/category/hindi-movies/",   True),
+        ("MoviesDrive","https://new2.moviesdrives.my/",                  False),
+    ]
+
+    lines = ["<b>Movie Site Connectivity Test</b>\n"]
+    for label, url, no_verify in tests:
+        try:
+            hdrs = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                "Accept": "text/html,*/*;q=0.8",
+            }
+            r = await asyncio.to_thread(
+                lambda u=url, v=no_verify, h=hdrs: _req.get(u, headers=h, verify=not v, timeout=15)
+            )
+            icon = "✅" if r.status_code == 200 else "⚠️"
+            lines.append(f"{icon} <b>{label}</b>: HTTP {r.status_code} ({len(r.content)} bytes)")
+        except Exception as e:
+            lines.append(f"❌ <b>{label}</b>: {type(e).__name__}: {str(e)[:120]}")
+
+    await msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all movie-related inline button presses."""
     query = update.callback_query
@@ -218,29 +253,72 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     data = query.data
 
-    # ── Site picker ──────────────────────────────────────────────────────────
-    if data in ("msite_hdh", "msite_md"):
-        await query.answer("Fetching latest movies…")
-        source = "hdh" if data == "msite_hdh" else "md"
+    async def _edit_or_reply(text: str, **kwargs) -> None:
+        """Edit text messages in-place; send a new message for photo/sticker messages."""
+        if query.message and query.message.photo:
+            await query.message.reply_text(text, **kwargs)
+        else:
+            try:
+                await query.edit_message_text(text, **kwargs)
+            except Exception:
+                await query.message.reply_text(text, **kwargs)
+
+    # ── Site picker / page navigation ────────────────────────────────────────
+    if data.startswith("msite_") or data.startswith("mpage_"):
+        # msite_hdh → page 1 for hdh
+        # mpage_hdh_3 → page 3 for hdh
+        if data.startswith("msite_"):
+            source = data[len("msite_"):]
+            page = 1
+        else:
+            _, source, p = data.split("_", 2)
+            page = int(p)
+
+        await query.answer(f"Loading page {page}…")
         fetch_fn = hdh_latest_movies if source == "hdh" else md_latest_movies
-        movies = await asyncio.to_thread(fetch_fn, 5)
+        movies = await asyncio.to_thread(fetch_fn, page)
+
         if not movies:
-            await query.edit_message_text("❌ Failed to fetch movies. Try again later.")
+            await _edit_or_reply(
+                "❌ No more movies found." if page > 1 else "❌ Failed to fetch movies. Try again later."
+            )
             return
 
-        context.user_data[f"movies_{source}"] = movies
+        # Store this page's movies keyed by global index offset so mpick_ indices don't collide
+        offset = (page - 1) * 10
+        stored: dict = context.user_data.setdefault(f"movies_{source}", {})
+        for i, m in enumerate(movies):
+            stored[offset + i] = m
+
         keyboard = []
         for i, m in enumerate(movies):
             title = m["title"][:55] + "…" if len(m["title"]) > 55 else m["title"]
-            keyboard.append([InlineKeyboardButton(title, callback_data=f"mpick_{source}_{i}")])
-        keyboard.append([InlineKeyboardButton("« Back", callback_data="mback_sites")])
+            keyboard.append([InlineKeyboardButton(title, callback_data=f"mpick_{source}_{offset + i}")])
+
+        # Prev / Next row
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("« Prev", callback_data=f"mpage_{source}_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"Page {page}", callback_data="mnoop"))
+        if len(movies) == 10:
+            nav.append(InlineKeyboardButton("Next »", callback_data=f"mpage_{source}_{page + 1}"))
+        keyboard.append(nav)
+        keyboard.append([InlineKeyboardButton(
+            "📢 Post to Channel", callback_data=f"mpost_list_{source}_{page}"
+        )])
+        keyboard.append([InlineKeyboardButton("« Back to sources", callback_data="mback_sites")])
 
         site_label = "4KHDHub" if source == "hdh" else "MoviesDrive"
-        await query.edit_message_text(
-            f"🍿 <b>Latest Movies — {site_label}</b>\n\nTap a movie for download links:",
+        await _edit_or_reply(
+            f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML",
         )
+
+    # ── noop for page-number button ──────────────────────────────────────────
+    elif data == "mnoop":
+        await query.answer()
+        return
 
     # ── Back to site picker ──────────────────────────────────────────────────
     elif data == "mback_sites":
@@ -248,7 +326,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)", callback_data="msite_hdh")],
             [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)", callback_data="msite_md")],
         ]
-        await query.edit_message_text(
+        await _edit_or_reply(
             "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML",
@@ -259,13 +337,13 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parts = data.split("_")          # mpick_hdh_0
         source = parts[1]
         idx = int(parts[2])
-        movies = context.user_data.get(f"movies_{source}", [])
-        if not movies or idx >= len(movies):
+        movies = context.user_data.get(f"movies_{source}", {})
+        movie = movies.get(idx) if isinstance(movies, dict) else (movies[idx] if idx < len(movies) else None)
+        if not movie:
             await query.answer("Session expired — run /movies again.", show_alert=True)
             return
 
         await query.answer("Fetching links…")
-        movie = movies[idx]
 
         if source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
@@ -275,22 +353,25 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text = format_md_message(movie["title"], detail)
 
         poster_url = detail.get("poster") or movie.get("poster", "")
-        back_cb = f"msite_{source}"
+        page = idx // 10 + 1
+        back_cb = f"msite_{source}" if page == 1 else f"mpage_{source}_{page}"
+        action_row = [
+            InlineKeyboardButton("📢 Post to Channel", callback_data=f"mpost_single_{source}_{idx}"),
+            InlineKeyboardButton("« Back", callback_data=back_cb),
+        ]
 
         # Send poster with text as caption if possible
-        if poster_url and len(text) <= 1024:  # Telegram caption limit is 1024 chars
+        if poster_url and len(text) <= 1024:
             try:
                 await query.message.reply_photo(
                     photo=poster_url,
                     caption=text,
                     parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("« Back to list", callback_data=back_cb)]]
-                    ),
+                    reply_markup=InlineKeyboardMarkup([action_row]),
                 )
                 return
             except Exception:
-                pass  # Poster failed or caption issue — fallback to text only
+                pass
 
         # Fallback: send poster without caption, then text message
         if poster_url:
@@ -302,41 +383,110 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_html(
             text,
             disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("« Back to list", callback_data=back_cb)]]
-            ),
+            reply_markup=InlineKeyboardMarkup([action_row]),
         )
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search both movie sites. Usage: /search <title>"""
+    """Search movie sites. Usage: /search <title>"""
     if not update.effective_message or not update.effective_user:
         return
     if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
         await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
         return
 
-    query = " ".join(context.args or []).strip()
-    if not query:
+    search_query = " ".join(context.args or []).strip()
+    if not search_query:
         await update.effective_message.reply_text(
             "Usage: <code>/search movie name</code>\nExample: <code>/search Project Hail Mary</code>",
             parse_mode="HTML",
         )
         return
 
-    msg = await update.effective_message.reply_text(f"🔍 Searching both sites for <b>{query}</b>…", parse_mode="HTML")
-
-    # Search both sites concurrently
-    hdh_results, md_results = await asyncio.gather(
-        asyncio.to_thread(hdh_search, query, 8),
-        asyncio.to_thread(md_search, query, 8),
+    # Store query and show source picker
+    context.user_data["pending_search"] = search_query
+    keyboard = [
+        [InlineKeyboardButton("🎬 4KHDHub", callback_data="msrc_hdh"),
+         InlineKeyboardButton("🎥 MoviesDrive", callback_data="msrc_md")],
+        [InlineKeyboardButton("🔍 Both Sites", callback_data="msrc_both")],
+    ]
+    await update.effective_message.reply_html(
+        f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-    if not hdh_results and not md_results:
-        await msg.edit_text(f"❌ No results found for <b>{query}</b> on either site.", parse_mode="HTML")
+
+async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle source picker for /search command."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission.", show_alert=True)
         return
 
-    # Store all results in user_data
+    source = query.data[len("msrc_"):]    # "hdh", "md", "both", or "back"
+
+    async def _src_edit(text: str, **kwargs) -> None:
+        """Edit text messages in-place; send a new message for photo/sticker messages."""
+        if query.message and query.message.photo:
+            await query.message.reply_text(text, **kwargs)
+        else:
+            try:
+                await query.edit_message_text(text, **kwargs)
+            except Exception:
+                await query.message.reply_text(text, **kwargs)
+
+    # "« Change source" — redisplay the picker
+    if source == "back":
+        search_query = context.user_data.get("pending_search", "")
+        if not search_query:
+            await query.answer("Session expired — run /search again.", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton("🎬 4KHDHub", callback_data="msrc_hdh"),
+             InlineKeyboardButton("🎥 MoviesDrive", callback_data="msrc_md")],
+            [InlineKeyboardButton("🔍 Both Sites", callback_data="msrc_both")],
+        ]
+        await _src_edit(
+            f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return
+
+    search_query = context.user_data.get("pending_search", "")
+    if not search_query:
+        await query.answer("Session expired — run /search again.", show_alert=True)
+        return
+
+    source_label = {"hdh": "4KHDHub", "md": "MoviesDrive", "both": "Both Sites"}.get(source, source)
+    await _src_edit(
+        f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
+        parse_mode="HTML",
+    )
+
+    # Fetch from selected source(s)
+    if source == "hdh":
+        hdh_results = await asyncio.to_thread(hdh_search, search_query, 10)
+        md_results = []
+    elif source == "md":
+        hdh_results = []
+        md_results = await asyncio.to_thread(md_search, search_query, 10)
+    else:
+        hdh_results, md_results = await asyncio.gather(
+            asyncio.to_thread(hdh_search, search_query, 8),
+            asyncio.to_thread(md_search, search_query, 8),
+        )
+
+    if not hdh_results and not md_results:
+        await _src_edit(
+            f"❌ No results found for <b>{search_query}</b> on {source_label}.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Store results in user_data
     all_results = {f"hdh_{i}": m for i, m in enumerate(hdh_results)}
     all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
     context.user_data["search_results"] = all_results
@@ -354,9 +504,14 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🎥 {title}", callback_data=f"msres_md_{i}")])
 
+    # Post to channel + back
+    keyboard.append([InlineKeyboardButton("📢 Post to Channel", callback_data="mpost_search")])
+    keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
+
     total = len(hdh_results) + len(md_results)
-    await msg.edit_text(
-        f"🔍 <b>{total} results for \"{query}\"</b>\n\nTap a movie for download links:",
+    await _src_edit(
+        f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
+        f"  <i>({source_label})</i>\n\nTap a movie for download links:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
@@ -392,12 +547,24 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     # Find matching movie from the OTHER site stored in same search results
     other_source = "md" if source == "hdh" else "hdh"
-    movie_title_lower = movie["title"].lower()[:30]
+    # Extract first significant words (up to 4) for cross-site matching
+    import re as _re
+    def _title_words(t: str) -> set:
+        return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
+
+    movie_words = _title_words(movie["title"])
     other_movie = None
+    best_overlap = 0
     for k, v in results.items():
-        if k.startswith(other_source + "_") and movie_title_lower in v["title"].lower():
+        if not k.startswith(other_source + "_"):
+            continue
+        overlap = len(movie_words & _title_words(v["title"]))
+        if overlap > best_overlap:
+            best_overlap = overlap
             other_movie = v
-            break
+    # Require at least 2 words to match
+    if best_overlap < 2:
+        other_movie = None
 
     # Fetch from both sites concurrently
     async def fetch_hdh(url):
@@ -432,24 +599,36 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     parts = [f"🎬 <b>{movie['title']}</b>\n"]
 
-    # Helper to strip footer from formatted messages
-    FOOTER = "\n⚡ Powered by @CoursesDrivee"
-
-    hdh_links_text = format_hdh_message("", hdh_detail).replace("🎬 <b></b>\n\n", "").replace(FOOTER, "")
-    if hdh_detail.get("qualities"):
+    hdh_links_text = format_hdh_message("", hdh_detail, footer=False)
+    if hdh_links_text:
         parts.append("━━ <b>4KHDHub (4K/HDR)</b> ━━")
         parts.append(hdh_links_text)
 
-    md_links_text = format_md_message("", md_detail).replace("🎬 <b></b>\n\n", "").replace(FOOTER, "")
-    if md_detail.get("links"):
+    md_links_text = format_md_message("", md_detail, footer=False)
+    if md_links_text:
         parts.append("━━ <b>MoviesDrive (480p–4K)</b> ━━")
         parts.append(md_links_text)
 
-    if not hdh_detail.get("qualities") and not md_detail.get("links"):
+    if not hdh_links_text and not md_links_text:
         parts.append("❌ No download links found on either site.")
 
     parts.append("\n⚡ Powered by @CoursesDrivee")
     combined_text = "\n".join(parts)
+
+    # Store the pair so post_to_channel_callback can post from both sources
+    context.user_data[f"search_pair_{source}_{idx}"] = {
+        "primary": movie,
+        "primary_source": source,
+        "other": other_movie,
+        "other_source": other_source,
+    }
+
+    post_cb = f"mpost_combined_{source}_{idx}"
+    back_cb = f"msrc_back"
+    action_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Post to Channel", callback_data=post_cb)],
+        [InlineKeyboardButton("« Back to results", callback_data=back_cb)],
+    ])
 
     if poster_url:
         try:
@@ -457,7 +636,152 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-    await query.message.reply_html(combined_text, disable_web_page_preview=True)
+    await query.message.reply_html(
+        combined_text,
+        disable_web_page_preview=True,
+        reply_markup=action_kb,
+    )
+
+
+async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) -> str:
+    """Fetch full download links for one movie and post poster + links to channel.
+    Returns a status string for logging."""
+    try:
+        if source == "hdh":
+            detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
+            text = format_hdh_message(movie["title"], detail)
+        else:
+            detail = await asyncio.to_thread(md_movie_links, movie["url"])
+            text = format_md_message(movie["title"], detail)
+
+        if not text:
+            text = f"🎬 <b>{movie['title']}</b>\n\n❌ No download links found."
+
+        poster_url = detail.get("poster") or movie.get("poster", "")
+
+        if poster_url:
+            try:
+                await bot.send_photo(
+                    chat_id=channel,
+                    photo=poster_url,
+                    caption=text if len(text) <= 1024 else None,
+                    parse_mode="HTML",
+                )
+                if len(text) > 1024:
+                    await bot.send_message(
+                        chat_id=channel, text=text,
+                        parse_mode="HTML", disable_web_page_preview=True,
+                    )
+            except Exception:
+                await bot.send_message(
+                    chat_id=channel, text=text,
+                    parse_mode="HTML", disable_web_page_preview=True,
+                )
+        else:
+            await bot.send_message(
+                chat_id=channel, text=text,
+                parse_mode="HTML", disable_web_page_preview=True,
+            )
+        return f"✅ {movie['title'][:50]}"
+    except Exception as e:
+        return f"❌ {movie['title'][:40]}: {e}"
+
+
+async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch full download links for each movie result and post them to the channel."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission.", show_alert=True)
+        return
+
+    await query.answer()
+
+    data = query.data
+    channel = MOVIES_CHANNEL_ID
+    if not channel:
+        await query.message.reply_text("❌ MOVIES_CHANNEL_ID not configured in .env")
+        return
+
+    # ── Collect movies to post ────────────────────────────────────────────
+    movies_to_post: list[tuple[dict, str]] = []   # (movie_dict, source)
+
+    if data.startswith("mpost_single_"):
+        # mpost_single_hdh_5 — one movie from /movies listing
+        _, _, source, idx_str = data.split("_", 3)
+        idx = int(idx_str)
+        stored: dict = context.user_data.get(f"movies_{source}", {})
+        movie = stored.get(idx)
+        if not movie:
+            await query.message.reply_text("❌ Session expired — browse the movie first.")
+            return
+        movies_to_post = [(movie, source)]
+
+    elif data.startswith("mpost_combined_"):
+        # mpost_combined_hdh_0 — combined result from /search (post from both sites)
+        _, _, source, idx_str = data.split("_", 3)
+        idx = int(idx_str)
+        pair: dict = context.user_data.get(f"search_pair_{source}_{idx}", {})
+        if not pair:
+            # fallback: post only the primary movie
+            results: dict = context.user_data.get("search_results", {})
+            movie = results.get(f"{source}_{idx}")
+            if not movie:
+                await query.message.reply_text("❌ Session expired — search again.")
+                return
+            movies_to_post = [(movie, source)]
+        else:
+            primary = pair.get("primary")
+            other   = pair.get("other")
+            if primary:
+                movies_to_post.append((primary, pair["primary_source"]))
+            if other:
+                movies_to_post.append((other, pair["other_source"]))
+
+    elif data.startswith("mpost_list_"):
+        _, _, source, page_str = data.split("_", 3)
+        page = int(page_str)
+        offset = (page - 1) * 10
+        stored: dict = context.user_data.get(f"movies_{source}", {})
+        movies_to_post = [
+            (stored[offset + i], source)
+            for i in range(10) if (offset + i) in stored
+        ]
+        if not movies_to_post:
+            await query.message.reply_text("❌ No movies in session — browse first.")
+            return
+
+    elif data == "mpost_search":
+        results: dict = context.user_data.get("search_results", {})
+        if not results:
+            await query.message.reply_text("❌ No search results in session.")
+            return
+        for k, m in sorted(results.items(), key=lambda x: x[0]):
+            src = "hdh" if k.startswith("hdh_") else "md"
+            movies_to_post.append((m, src))
+
+    if not movies_to_post:
+        return
+
+    total = len(movies_to_post)
+    status_msg = await query.message.reply_text(
+        f"⏳ Posting {total} movie{'s' if total > 1 else ''} to channel…"
+    )
+
+    # ── Post each movie sequentially with a small gap ─────────────────────
+    results_log = []
+    for movie, source in movies_to_post:
+        status = await _post_movie_to_channel(context.bot, channel, movie, source)
+        results_log.append(status)
+        await asyncio.sleep(1)   # avoid Telegram flood limits
+
+    done = sum(1 for s in results_log if s.startswith("✅"))
+    fail = total - done
+    summary = f"✅ Posted {done}/{total} to channel."
+    if fail:
+        summary += f"\n⚠️ {fail} failed — check logs."
+    await status_msg.edit_text(summary)
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -541,11 +865,14 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("movies", cmd_movies))
+    app.add_handler(CommandHandler("movietest", cmd_movietest))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
-    app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^m(site|back|pick)_"))
-    app.add_handler(CallbackQueryHandler(search_result_callback, pattern=r"^msres_|^msearch_noop$"))
+    app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^m(site|back|pick|page)_|^mnoop$"))
+    app.add_handler(CallbackQueryHandler(search_source_callback,   pattern=r"^msrc_"))
+    app.add_handler(CallbackQueryHandler(search_result_callback,   pattern=r"^msres_|^msearch_noop$"))
+    app.add_handler(CallbackQueryHandler(post_to_channel_callback, pattern=r"^mpost_"))
     return app
 
 

@@ -7,20 +7,88 @@ from __future__ import annotations
 
 import logging
 import re
+import time
+import urllib.parse
+import warnings
 from typing import Any
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
 
+# Full browser-like headers to avoid 403 blocks
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
+
+# Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
+_NO_VERIFY_HOSTS = {"4khdhub.link"}
+
+# Per-host persistent sessions so cookies are carried across requests
+_sessions: dict[str, requests.Session] = {}
+
+
+def _session_for(host: str) -> requests.Session:
+    if host not in _sessions:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _sessions[host] = s
+    return _sessions[host]
+
+
+def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
+    """GET with browser headers, persistent session (cookies), SSL bypass for known hosts."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    verify = host not in _NO_VERIFY_HOSTS
+    session = _session_for(host)
+
+    # Suppress InsecureRequestWarning for hosts we intentionally skip
+    ctx = warnings.catch_warnings()
+    ctx.__enter__()
+    if not verify:
+        warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            resp = session.get(url, verify=verify, **kwargs)
+            if resp.status_code in (403, 429, 503) and attempt < retries:
+                log.warning("_get %s → HTTP %s (attempt %d), retrying…", url, resp.status_code, attempt + 1)
+                time.sleep(1.5 * (attempt + 1))
+                _sessions.pop(host, None)
+                session = _session_for(host)
+                continue
+            if resp.status_code not in (200, 301, 302):
+                log.warning("_get %s → HTTP %s", url, resp.status_code)
+            ctx.__exit__(None, None, None)
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            log.warning("_get %s → %s: %s (attempt %d)", url, type(exc).__name__, exc, attempt + 1)
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+
+    ctx.__exit__(None, None, None)
+    raise last_exc  # type: ignore[misc]
 
 
 # ─── 4KHDHub ────────────────────────────────────────────────────────────────
@@ -29,10 +97,17 @@ HDH_BASE = "https://4khdhub.link"
 HDH_CATEGORY = f"{HDH_BASE}/category/hindi-movies/"
 
 
-def hdh_latest_movies(limit: int = 10) -> list[dict[str, str]]:
-    """Scrape the latest movies from 4KHDHub Hindi category."""
+HDH_PAGE_SIZE = 10
+
+
+def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
+    """Scrape page N of the 4KHDHub Hindi category (10 per page)."""
     try:
-        resp = requests.get(HDH_CATEGORY, headers=HEADERS, timeout=15)
+        url = HDH_CATEGORY if page == 1 else f"{HDH_BASE}/category/hindi-movies/page/{page}/"
+        # Prime the session with the homepage first (gets cookies, sets Referer)
+        session = _session_for("4khdhub.link")
+        session.headers["Referer"] = HDH_BASE + "/"
+        resp = _get(url, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         movies = []
@@ -46,7 +121,7 @@ def hdh_latest_movies(limit: int = 10) -> list[dict[str, str]]:
                 link = HDH_BASE + link
             if link:
                 movies.append({"title": title, "url": link, "poster": poster or ""})
-            if len(movies) >= limit:
+            if len(movies) >= HDH_PAGE_SIZE:
                 break
         return movies
     except Exception as e:
@@ -57,7 +132,9 @@ def hdh_latest_movies(limit: int = 10) -> list[dict[str, str]]:
 def hdh_movie_links(movie_url: str) -> dict[str, Any]:
     """Return poster + list of quality/link blocks for a 4KHDHub movie page."""
     try:
-        resp = requests.get(movie_url, headers=HEADERS, timeout=15)
+        session = _session_for("4khdhub.link")
+        session.headers["Referer"] = HDH_CATEGORY
+        resp = _get(movie_url, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -98,10 +175,14 @@ def hdh_movie_links(movie_url: str) -> dict[str, Any]:
 MD_BASE = "https://new2.moviesdrives.my"
 
 
-def md_latest_movies(limit: int = 10) -> list[dict[str, str]]:
-    """Scrape the latest movies from MoviesDrive home page."""
+MD_PAGE_SIZE = 10
+
+
+def md_latest_movies(page: int = 1) -> list[dict[str, str]]:
+    """Scrape page N of MoviesDrive (10 per page)."""
     try:
-        resp = requests.get(MD_BASE + "/", headers=HEADERS, timeout=15)
+        url = MD_BASE + "/" if page == 1 else f"{MD_BASE}/page/{page}/"
+        resp = _get(url, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         movies = []
@@ -118,7 +199,7 @@ def md_latest_movies(limit: int = 10) -> list[dict[str, str]]:
                 link = MD_BASE + link
             if title and link:
                 movies.append({"title": title, "url": link, "poster": poster})
-            if len(movies) >= limit:
+            if len(movies) >= MD_PAGE_SIZE:
                 break
         return movies
     except Exception as e:
@@ -126,10 +207,134 @@ def md_latest_movies(limit: int = 10) -> list[dict[str, str]]:
         return []
 
 
-def md_movie_links(movie_url: str) -> dict[str, Any]:
-    """Return poster + list of quality/link rows for a MoviesDrive movie page."""
+_INFO_KEYS = {
+    "imdb":     ["imdb rating", "imdb"],
+    "genre":    ["genre"],
+    "director": ["director"],
+    "stars":    ["stars", "cast"],
+    "language": ["language"],
+    "quality":  ["quality"],
+    "format":   ["format"],
+    "writer":   ["writer"],
+}
+
+
+def _scrape_md_info(content) -> dict[str, str]:
+    """Extract movie metadata (IMDB, genre, etc.) from a MoviesDrive content block.
+
+    Two layouts on the site:
+      A) <strong>🌟iMDB Rating: 7.6/10</strong>   → value is INSIDE <strong>
+      B) <strong>🗣Language:</strong> Hindi/English → value is TEXT AFTER <strong>
+    """
+    info: dict[str, str] = {}
+    _EMOJI_RE = re.compile(r"^[\U00010000-\U0010ffff\u2600-\u26FF\u2700-\u27BF\u00A9\u00AE\u203C-\u2BFF]+")
+
+    for strong in content.find_all("strong"):
+        raw_label = strong.get_text(strip=True)
+        key_text = raw_label.lower()
+        # Strip leading emoji for cleaner comparison
+        clean_key = _EMOJI_RE.sub("", key_text).strip()
+
+        matched_field = None
+        for field, keywords in _INFO_KEYS.items():
+            if field in info:
+                continue
+            if any(kw in clean_key for kw in keywords):
+                matched_field = field
+                break
+        if not matched_field:
+            continue
+
+        # Try to get value after ":" inside the strong text (layout A)
+        if ":" in raw_label:
+            after_colon = raw_label.split(":", 1)[1].strip()
+            if after_colon:
+                info[matched_field] = after_colon
+                continue
+
+        # Fallback: value is in sibling text nodes after the <strong> (layout B)
+        parent = strong.parent
+        if parent:
+            parent_text = parent.get_text(" ", strip=True)
+            label_clean = raw_label.strip()
+            # Remove the label from the beginning
+            if parent_text.startswith(label_clean):
+                value = parent_text[len(label_clean):].strip().lstrip(":").strip()
+            else:
+                value = parent_text.replace(label_clean, "").strip().lstrip(":").strip()
+            value = _EMOJI_RE.sub("", value).strip()
+            if value:
+                info[matched_field] = value
+
+    return info
+
+
+_DOWNLOAD_PATTERNS = (
+    "hubcloud", "gdflix", "mdrive.lol", "gofile", "gdtot",
+    "driveseed", "filedrive", "hub.foo",
+    "workers.dev",   # moviesdrives-com.workers.dev CDN proxy links
+)
+
+# Non-download hrefs that should be excluded even if they match _DOWNLOAD_PATTERNS
+_EXCLUDE_PATTERNS = (
+    "new2.moviesdrives.my",
+    "moviesdrives.my/tag/", "moviesdrives.my/category/", "moviesdrives.my/page/",
+    "moviesdrive.one", "t.me/",
+    "/tag/", "/category/",
+)
+
+
+def _is_download_link(href: str) -> bool:
+    href_lower = href.lower()
+    if any(x in href_lower for x in _EXCLUDE_PATTERNS):
+        return False
+    return any(p in href_lower for p in _DOWNLOAD_PATTERNS)
+
+
+def _provider_name(href: str) -> str:
+    href_lower = href.lower()
+    if "hubcloud" in href_lower:
+        return "HubCloud"
+    if "gdflix" in href_lower:
+        return "GDFlix"
+    if "gofile" in href_lower:
+        return "GoFile"
+    if "workers.dev" in href_lower:
+        return "MoviesDrive CDN"
+    return "Download"
+
+
+def _expand_mdrive(href: str, label: str, link_text: str) -> list[dict[str, str]]:
+    """Fetch a mdrive.lol archive page and return its inner download links."""
     try:
-        resp = requests.get(movie_url, headers=HEADERS, timeout=15)
+        inner_resp = _get(href, timeout=10)
+        inner_soup = BeautifulSoup(inner_resp.text, "html.parser")
+        found = []
+        for inner_a in inner_soup.select(".entry-content a[href], article a[href], main a[href]"):
+            inner_href = inner_a.get("href", "")
+            if inner_href and _is_download_link(inner_href) and "mdrive.lol" not in inner_href:
+                provider = _provider_name(inner_href)
+                found.append({
+                    "label": label,
+                    "name": f"{link_text} ({provider})",
+                    "url": inner_href,
+                })
+        return found
+    except Exception as e:
+        log.error("Failed to fetch inner mdrive link %s: %s", href, e)
+        return [{"label": label, "name": link_text, "url": href}]
+
+
+def md_movie_links(movie_url: str) -> dict[str, Any]:
+    """Return poster + list of quality/link rows for a MoviesDrive movie page.
+
+    Handles two page layouts:
+    1. <h5><a href="...">label</a></h5>  — link inside the heading
+    2. <h5>label</h5> … <p><a href="...">…</a></p> — link in next sibling
+    Also resolves mdrive.lol intermediary pages to real HubCloud/GDFlix links.
+    """
+    try:
+        resp = _get(movie_url, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -143,47 +348,64 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
             if og:
                 poster = og.get("content", "")
 
-        # Links are <h5> tags containing <a href="...">
+        content = (
+            soup.select_one(".entry-content")
+            or soup.select_one("article")
+            or soup.select_one("main")
+            or soup
+        )
+
         links: list[dict[str, str]] = []
-        h5_tags = soup.select("main h5, article h5, .entry-content h5")
-        i = 0
-        while i < len(h5_tags):
-            a_tag = h5_tags[i].find("a")
-            if a_tag:
-                label = re.sub(r"\s+", " ", h5_tags[i].text.strip())
-                href = a_tag.get("href", "")
-                link_text = re.sub(r"\s+", " ", a_tag.text.strip())
-                if href and link_text:
+        current_label = "Download"
+
+        for elem in content.descendants:
+            # Skip non-tag nodes and deeply nested elements we handle via parent
+            if not hasattr(elem, "name"):
+                continue
+
+            # h5 heading — update label and capture ALL inline <a> links
+            if elem.name == "h5":
+                current_label = re.sub(r"\s+", " ", elem.get_text(" ", strip=True))
+                for a_tag in elem.find_all("a", href=True):
+                    href = a_tag.get("href", "")
+                    link_text = re.sub(r"\s+", " ", a_tag.get_text(strip=True)) or current_label
+                    if href and _is_download_link(href):
+                        if "mdrive.lol" in href:
+                            links.extend(_expand_mdrive(href, current_label, link_text))
+                        else:
+                            links.append({
+                                "label": current_label,
+                                "name": f"{link_text} ({_provider_name(href)})",
+                                "url": href,
+                            })
+                continue
+
+            # <a> tags that are NOT inside an h5 (handled above already)
+            if elem.name == "a":
+                # Skip if this <a> is a child of an h5 (already processed)
+                if elem.find_parent("h5"):
+                    continue
+                href = elem.get("href", "")
+                if href and _is_download_link(href):
+                    link_text = re.sub(r"\s+", " ", elem.get_text(strip=True)) or current_label
                     if "mdrive.lol" in href:
-                        # Fetch inner links
-                        try:
-                            inner_resp = requests.get(href, headers=HEADERS, timeout=10)
-                            inner_soup = BeautifulSoup(inner_resp.text, "html.parser")
-                            # Inner links are usually in <p> tags with images like hubcloud or gdflix
-                            for inner_a in inner_soup.select(".entry-content p a"):
-                                inner_href = inner_a.get("href", "")
-                                if inner_href and ("hubcloud" in inner_href or "gdflix" in inner_href):
-                                    provider = "HubCloud" if "hubcloud" in inner_href else "GDFlix"
-                                    links.append({"label": label, "name": f"{link_text} ({provider})", "url": inner_href})
-                        except Exception as e:
-                            log.error("Failed to fetch inner mdrive link %s: %s", href, e)
-                            links.append({"label": label, "name": link_text, "url": href})
+                        links.extend(_expand_mdrive(href, current_label, link_text))
                     else:
-                        links.append({"label": label, "name": link_text, "url": href})
-            i += 1
+                        links.append({
+                            "label": current_label,
+                            "name": f"{link_text} ({_provider_name(href)})",
+                            "url": href,
+                        })
 
         # Remove duplicates preserving order
-        seen = set()
-        unique_links = []
-        for l in links:
-            if l["url"] not in seen:
-                seen.add(l["url"])
-                unique_links.append(l)
+        seen: set[str] = set()
+        unique_links = [l for l in links if not (l["url"] in seen or seen.add(l["url"]))]  # type: ignore[func-returns-value]
 
-        return {"poster": poster, "links": unique_links}
+        info = _scrape_md_info(content)
+        return {"poster": poster, "links": unique_links, "info": info}
     except Exception as e:
         log.error("MoviesDrive movie page failed (%s): %s", movie_url, e)
-        return {"poster": "", "links": []}
+        return {"poster": "", "links": [], "info": {}}
 
 
 # ─── Search ──────────────────────────────────────────────────────────────────
@@ -191,12 +413,9 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
 def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
     """Search 4KHDHub using the ?s= query parameter."""
     try:
-        resp = requests.get(
-            f"{HDH_BASE}/",
-            params={"s": query},
-            headers=HEADERS,
-            timeout=15,
-        )
+        session = _session_for("4khdhub.link")
+        session.headers["Referer"] = HDH_BASE + "/"
+        resp = _get(f"{HDH_BASE}/", params={"s": query}, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         movies = []
@@ -219,12 +438,12 @@ def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 
 def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
-    """Search MoviesDrive via the /search.php JSON API."""
+    """Search MoviesDrive via the /search.php JSON API (GET ?q=<query>&page=<page>)."""
     try:
-        resp = requests.get(
+        # The frontend JS uses GET with ?q= and ?page= params
+        resp = _get(
             "https://new2.moviesdrives.my/search.php",
-            params={"query": query, "page": 1},
-            headers=HEADERS,
+            params={"q": query, "page": 1},
             timeout=15,
         )
         resp.raise_for_status()
@@ -247,40 +466,126 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         return []
 
 
+# ─── Formatting helpers ──────────────────────────────────────────────────────
+
+def _base_name(link: dict) -> str:
+    n = link["name"]
+    if " (" in n and n.endswith(")"):
+        return n[:n.rfind(" (")].strip()
+    return n.strip()
+
+
+def _is_true_series(plinks: list) -> bool:
+    if len(plinks) <= 1:
+        return False
+    return len({_base_name(l) for l in plinks}) == 1
+
+
+def _info_block(info: dict[str, str]) -> list[str]:
+    """Build a compact metadata block from scraped info dict."""
+    lines = []
+    if info.get("imdb"):
+        raw = info["imdb"].replace("iMDB Rating:", "").replace("IMDB Rating:", "").strip().lstrip(":").strip()
+        lines.append(f"⭐ <b>IMDb:</b> {raw}")
+    if info.get("genre"):
+        lines.append(f"🎭 <b>Genre:</b> {info['genre']}")
+    if info.get("language"):
+        lines.append(f"🗣 <b>Language:</b> {info['language']}")
+    if info.get("quality"):
+        lines.append(f"📺 <b>Quality:</b> {info['quality']}")
+    if info.get("director"):
+        lines.append(f"🎬 <b>Director:</b> {info['director']}")
+    if info.get("stars"):
+        stars = info["stars"]
+        # Trim to first 3 cast members
+        cast = [s.strip() for s in stars.split(",")][:3]
+        lines.append(f"🌟 <b>Cast:</b> {', '.join(cast)}" + (" …" if len(stars.split(",")) > 3 else ""))
+    return lines
+
+
 # ─── Formatting ──────────────────────────────────────────────────────────────
 
-def format_hdh_message(movie_title: str, data: dict[str, Any]) -> str:
+def format_hdh_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
     qualities = data.get("qualities", [])
     if not qualities:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
+        return ""
 
-    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (4KHDHub)</b>\n"]
+    lines = []
+    if movie_title:
+        lines.append(f"🎬 <b>{movie_title}</b>")
+    lines.append("━" * 32)
+
+    # Info block (HDH pages don't usually have structured metadata, skip if empty)
+    info = data.get("info", {})
+    info_lines = _info_block(info)
+    if info_lines:
+        lines.extend(info_lines)
+        lines.append("━" * 32)
+
+    lines.append("\n📥 <b>Download Links</b>  <i>(4KHDHub)</i>\n")
     for q in qualities:
-        lines.append(f"📼 <b>{q['quality']}</b>")
+        lines.append(f"📦 <b>{q['quality']}</b>")
         parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in q["links"]]
-        lines.append("  " + " | ".join(parts))
+        lines.append("   " + " · ".join(parts))
         lines.append("")
-    lines.append("\n⚡ Powered by @CoursesDrivee")
+    if footer:
+        lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
     return "\n".join(lines)
 
 
-def format_md_message(movie_title: str, data: dict[str, Any]) -> str:
+def format_md_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
     links = data.get("links", [])
     if not links:
-        return f"🎬 <b>{movie_title}</b>\n\n❌ No download links found."
+        return ""
 
-    lines = [f"🎬 <b>{movie_title}</b>\n", "📥 <b>Download Links (MoviesDrive)</b>\n"]
-    
-    # Group links by label (e.g. "480p[430.36 MB]")
-    grouped = {}
+    lines = []
+    if movie_title:
+        lines.append(f"🎬 <b>{movie_title}</b>")
+    lines.append("━" * 32)
+
+    # Info block
+    info = data.get("info", {})
+    info_lines = _info_block(info)
+    if info_lines:
+        lines.extend(info_lines)
+        lines.append("━" * 32)
+
+    lines.append("\n📥 <b>Download Links</b>  <i>(MoviesDrive)</i>\n")
+
+    # Group by quality label
+    by_label: dict[str, list] = {}
     for l in links:
-        grouped.setdefault(l["label"], []).append(l)
-        
-    for label, group_links in grouped.items():
-        lines.append(f"📼 <b>{label}</b>")
-        parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
-        lines.append("  " + " | ".join(parts))
+        by_label.setdefault(l["label"], []).append(l)
+
+    for label, group_links in by_label.items():
+        lines.append(f"📦 <b>{label}</b>")
+
+        by_provider: dict[str, list] = {}
+        for l in group_links:
+            prov = _provider_name(l["url"])
+            by_provider.setdefault(prov, []).append(l)
+
+        any_true_series = any(_is_true_series(v) for v in by_provider.values())
+
+        if any_true_series:
+            for prov, plinks in by_provider.items():
+                if _is_true_series(plinks):
+                    ep_parts = " · ".join(
+                        f"<a href='{l['url']}'>Ep{i + 1}</a>"
+                        for i, l in enumerate(plinks)
+                    )
+                    lines.append(f"   🔗 <b>{prov}</b>: {ep_parts}")
+                else:
+                    for l in plinks:
+                        lines.append(f"   🔗 <a href='{l['url']}'>{l['name']}</a>")
+        else:
+            parts = [f"<a href='{l['url']}'>{l['name']}</a>" for l in group_links]
+            lines.append("   " + " · ".join(parts))
+
         lines.append("")
-        
-    lines.append("\n⚡ Powered by @CoursesDrivee")
+
+    if footer:
+        lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
     return "\n".join(lines)
