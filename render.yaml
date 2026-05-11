@@ -33,5 +33,7 @@ services:
         value: "https://movies4u.ee"
       - key: VEGA_BASE_URL
         value: "https://vegamovies.global"
+      - key: SDMP_BASE_URL
+        value: "https://sd1.sdmoviespoint.trade"
     healthCheckPath: /health
     autoDeploy: true

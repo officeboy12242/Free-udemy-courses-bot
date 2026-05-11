@@ -1,9 +1,10 @@
 """
 Movie scraper — supports multiple sources:
-  - 4KHDHub     (https://4khdhub.link/category/hindi-movies/)
-  - MoviesDrive (https://new2.moviesdrives.my/)
-  - Movies4U    (https://movies4u.ee/)
-  - Vegamovies  (https://vegamovies.global/)
+  - 4KHDHub         (https://4khdhub.link/category/hindi-movies/)
+  - MoviesDrive     (https://new2.moviesdrives.my/)
+  - Movies4U        (https://movies4u.ee/)
+  - Vegamovies      (https://vegamovies.global/)
+  - SDMoviesPoint   (https://sd1.sdmoviespoint.trade/)
 """
 from __future__ import annotations
 
@@ -1193,6 +1194,253 @@ def format_vega_message(movie_title: str, data: dict, footer: bool = True) -> st
             size    = lk.get("size", "")
             label   = f"{quality}  [{size}]" if size else quality
             lines.append(f"\n📦 <b>{label}</b>")
+            lines.append(f"   🔗 <a href='{url_}'>Download</a>")
+        lines.append("")
+
+    if footer:
+        lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SDMoviesPoint  (https://sd1.sdmoviespoint.trade/)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SDMP_BASE = os.getenv("SDMP_BASE_URL", "https://sd1.sdmoviespoint.trade")
+
+
+def _sdmp_build_url(id_val: str, filename: str) -> str:
+    """Build download URL from form id + filename hidden inputs.
+
+    id examples:
+      "sdshare.cfd/s"       → https://sdshare.cfd/s/<filename>
+      "new3.sdshare.cfd/s"  → https://new3.sdshare.cfd/s/<filename>
+      "51.159.212.34"       → http://51.159.212.34/<filename>
+    """
+    if not id_val or not filename:
+        return ""
+    is_ip = bool(re.match(r"^\d+\.\d+\.\d+\.\d+", id_val))
+    proto = "http" if is_ip else "https"
+    return f"{proto}://{id_val}/{filename}"
+
+
+def _scrape_sdmp_info(content: BeautifulSoup) -> dict[str, str]:
+    """Extract metadata from an SDMoviesPoint movie page.
+
+    The info block is a <p> with alternating <strong>Label:</strong> text <br/>.
+    """
+    info: dict[str, str] = {}
+    info_p = None
+    for p in content.find_all("p"):
+        if p.find("strong") and "full name" in p.get_text().lower():
+            info_p = p
+            break
+    if not info_p:
+        return info
+
+    current_label = ""
+    for child in info_p.children:
+        cname = getattr(child, "name", None)
+        if cname is None:
+            # NavigableString — value for the current label
+            val = str(child).strip()
+            if val and current_label:
+                lk = current_label.lower()
+                if "genre" in lk:
+                    info["genre"] = val
+                elif "language" in lk:
+                    info["language"] = val
+                elif "cast" in lk:
+                    info["stars"] = val
+                elif "imdb rating" in lk:
+                    info["imdb"] = val.split("/")[0].strip()
+                elif "release date" in lk:
+                    info["year"] = val[:4]
+        elif cname == "strong":
+            current_label = child.get_text(strip=True).rstrip(":")
+        elif cname == "br":
+            current_label = ""
+    return info
+
+
+def _sdmp_poster_map(soup: BeautifulSoup) -> dict[str, str]:
+    """Build alt-text → poster-URL map from TMDB img tags on the page."""
+    m: dict[str, str] = {}
+    for img in soup.find_all("img", src=True):
+        src = img.get("src", "")
+        alt = img.get("alt", "").strip()
+        if "tmdb" in src and alt:
+            m[alt] = src
+    return m
+
+
+def _sdmp_find_poster(title: str, poster_map: dict[str, str]) -> str:
+    for alt, src in poster_map.items():
+        if title.startswith(alt) or alt.startswith(title[:50]):
+            return src
+    return ""
+
+
+def _sdmp_parse_listing(soup: BeautifulSoup, limit: int) -> list[dict]:
+    """Extract movie entries from a parsed SDMoviesPoint listing page."""
+    poster_map = _sdmp_poster_map(soup)
+    base_host  = SDMP_BASE.split("//")[-1].split("/")[0]
+    movies: list[dict] = []
+    for h3 in soup.find_all("h3"):
+        if len(movies) >= limit:
+            break
+        a = h3.find("a", href=True)
+        if not a or base_host not in a.get("href", ""):
+            continue
+        title = a.get_text(strip=True)
+        href  = a["href"]
+        if title and href:
+            movies.append({"title": title, "url": href,
+                           "poster": _sdmp_find_poster(title, poster_map)})
+    return movies
+
+
+def sdmp_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
+    """Fetch latest movies from SDMoviesPoint with WordPress /page/N/ pagination."""
+    url = SDMP_BASE + "/" if page == 1 else f"{SDMP_BASE}/page/{page}/"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("sdmp_latest_movies page=%d failed: %s", page, exc)
+        return []
+    return _sdmp_parse_listing(soup, limit)
+
+
+def sdmp_search(query: str, limit: int = 10) -> list[dict]:
+    """Search SDMoviesPoint using the WordPress ?s= parameter."""
+    url = f"{SDMP_BASE}/?s={urllib.parse.quote(query)}"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("sdmp_search '%s' failed: %s", query, exc)
+        return []
+    return _sdmp_parse_listing(soup, limit)
+
+
+def sdmp_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape download links from an SDMoviesPoint movie or series page.
+
+    Two layouts:
+    - **Movie**:  .dlarea → .dlarea-card per quality → form per server.
+    - **Series**: .dlarea → flat <form> elements, one per episode.
+
+    Download URL: ``https://{form[id]}/{form[filename]}``
+
+    Returns::
+        {
+          "poster": str,
+          "links":  [{"label": str, "size": str, "url": str}],
+          "info":   {imdb, genre, language, stars, year},
+          "is_series": bool,
+        }
+    """
+    try:
+        resp = _get(movie_url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("sdmp_movie_links %s failed: %s", movie_url, exc)
+        return {"poster": "", "links": [], "info": {}, "is_series": False}
+
+    og = soup.find("meta", property="og:image")
+    poster = og.get("content", "") if og else ""
+
+    content   = soup.select_one(".entry-content, article") or soup
+    info      = _scrape_sdmp_info(content)
+    dlarea    = content.select_one(".dlarea")
+    links:    list[dict] = []
+    is_series = False
+
+    if dlarea:
+        cards = dlarea.select(".dlarea-card")
+        if cards:
+            # ── Movie layout ──────────────────────────────────────────────
+            for card in cards:
+                quality_el = card.select_one(".dlarea-card-title")
+                quality    = quality_el.get_text(strip=True) if quality_el else ""
+                for form in card.find_all("form"):
+                    fid   = form.find("input", {"name": "id"})
+                    fname = form.find("input", {"name": "filename"})
+                    chip  = form.select_one(".dlarea-chip")
+                    chip_txt = chip.get_text(" ", strip=True) if chip else ""
+                    size_m   = re.search(r"(\d[\d.]*\s*(?:MB|GB))", chip_txt, re.I)
+                    size     = size_m.group(1) if size_m else ""
+                    dl_url   = _sdmp_build_url(
+                        fid.get("value", "") if fid else "",
+                        fname.get("value", "") if fname else "",
+                    )
+                    if dl_url:
+                        links.append({"label": quality, "size": size, "url": dl_url})
+        else:
+            # ── Series layout: flat forms, one per episode ────────────────
+            is_series = True
+            for form in dlarea.find_all("form"):
+                fid   = form.find("input", {"name": "id"})
+                fname = form.find("input", {"name": "filename"})
+                chip  = form.select_one(".dlarea-chip")
+                if not chip:
+                    continue
+                chip_txt = chip.get_text(" ", strip=True)
+                size_m   = re.search(r"(\d[\d.]*\s*(?:MB|GB))", chip_txt, re.I)
+                size     = size_m.group(1) if size_m else ""
+                label    = re.sub(r"\d[\d.]*\s*(?:MB|GB)", "", chip_txt, flags=re.I).strip()
+                dl_url   = _sdmp_build_url(
+                    fid.get("value", "") if fid else "",
+                    fname.get("value", "") if fname else "",
+                )
+                if dl_url:
+                    links.append({"label": label, "size": size, "url": dl_url})
+
+    return {"poster": poster, "links": links, "info": info, "is_series": is_series}
+
+
+def format_sdmp_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format an SDMoviesPoint result as HTML for Telegram."""
+    links     = data.get("links", [])
+    info      = data.get("info", {})
+    is_series = data.get("is_series", False)
+
+    def _info_block() -> str:
+        parts: list[str] = []
+        if info.get("imdb"):     parts.append(f"⭐ <b>IMDb:</b> {info['imdb']}")
+        if info.get("genre"):    parts.append(f"🎭 <b>Genre:</b> {info['genre'][:70]}")
+        if info.get("language"): parts.append(f"🗣 <b>Language:</b> {info['language'][:50]}")
+        if info.get("year"):     parts.append(f"📅 <b>Year:</b> {info['year']}")
+        stars = info.get("stars", "")
+        if stars:
+            cast_list = [x.strip() for x in stars.split(",")][:3]
+            parts.append(f"🎬 <b>Cast:</b> {', '.join(cast_list)}")
+        return "\n".join(parts)
+
+    lines: list[str] = []
+    if movie_title:
+        icon = "📺" if is_series else "🎞"
+        lines.append(f"{icon} <b>{movie_title}</b>")
+
+    ib = _info_block()
+    if ib:
+        lines.append("━" * 32)
+        lines.append(ib)
+
+    if links:
+        lines.append("━" * 32)
+        hdr = "📥 <b>Episode Download Links</b>" if is_series else "📥 <b>Download Links (SDMoviesPoint)</b>"
+        lines.append(hdr)
+        for lk in links:
+            label = lk.get("label", "")
+            size  = lk.get("size", "")
+            url_  = lk.get("url", "")
+            if not label:
+                continue  # skip unlabelled fallback IP links
+            badge = f"  [{size}]" if size else ""
+            lines.append(f"\n📦 <b>{label}{badge}</b>")
             lines.append(f"   🔗 <a href='{url_}'>Download</a>")
         lines.append("")
 
