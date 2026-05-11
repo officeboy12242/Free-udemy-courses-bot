@@ -67,7 +67,7 @@ def tracked_symbols() -> list[tuple[str, str]]:
 def ensure_market_tables():
     con = sqlite3.connect(DB_FILE)
     try:
-        # New schema: multiple alerts per day allowed (up to MAX_ALERTS_PER_DAY)
+        # New schema: multiple alerts per day allowed
         con.execute("""
             CREATE TABLE IF NOT EXISTS market_dip_alerts (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +82,13 @@ def ensure_market_tables():
             con.execute("ALTER TABLE market_dip_alerts ADD COLUMN alerted_at TEXT")
         except Exception:
             pass
-        # Remove old unique primary key constraint by recreating if needed (best effort)
+            
+        # Clean up old alerts from previous days to keep DB small
+        today = _today_ist()
+        deleted = con.execute("DELETE FROM market_dip_alerts WHERE alert_date != ?", (today,)).rowcount
+        if deleted > 0:
+            log.info("Cleaned up %d old market alerts from previous days.", deleted)
+            
         con.commit()
     finally:
         con.close()
