@@ -66,14 +66,22 @@ def tracked_symbols() -> list[tuple[str, str]]:
 def ensure_market_tables():
     con = sqlite3.connect(DB_FILE)
     try:
+        # New schema: multiple alerts per day allowed (up to MAX_ALERTS_PER_DAY)
         con.execute("""
             CREATE TABLE IF NOT EXISTS market_dip_alerts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol     TEXT NOT NULL,
                 alert_date TEXT NOT NULL,
                 pct_change REAL,
-                PRIMARY KEY (symbol, alert_date)
+                alerted_at TEXT
             )
         """)
+        # Migrate old single-row-per-day schema if alerted_at column is missing
+        try:
+            con.execute("ALTER TABLE market_dip_alerts ADD COLUMN alerted_at TEXT")
+        except Exception:
+            pass
+        # Remove old unique primary key constraint by recreating if needed (best effort)
         con.commit()
     finally:
         con.close()
@@ -88,14 +96,44 @@ def _today_ist() -> str:
         return datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def already_alerted(symbol: str, alert_date: str) -> bool:
+MAX_ALERTS_PER_DAY = int(os.getenv("MAX_ALERTS_PER_DAY", "3"))
+# Minimum minutes between two alerts for the same asset on the same day
+MIN_ALERT_GAP_MINUTES = int(os.getenv("MIN_ALERT_GAP_MINUTES", "120"))
+
+
+def alert_count_today(symbol: str, alert_date: str) -> int:
+    """Return how many alerts have been sent for this symbol today."""
     con = sqlite3.connect(DB_FILE)
     try:
         row = con.execute(
-            "SELECT 1 FROM market_dip_alerts WHERE symbol = ? AND alert_date = ?",
+            "SELECT COUNT(*) FROM market_dip_alerts WHERE symbol = ? AND alert_date = ?",
             (symbol, alert_date),
         ).fetchone()
-        return row is not None
+        return row[0] if row else 0
+    finally:
+        con.close()
+
+
+def already_alerted(symbol: str, alert_date: str) -> bool:
+    """True when the daily alert cap has been reached for this symbol."""
+    return alert_count_today(symbol, alert_date) >= MAX_ALERTS_PER_DAY
+
+
+def minutes_since_last_alert(symbol: str, alert_date: str) -> float:
+    """Minutes elapsed since the most recent alert for this symbol today."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            """SELECT alerted_at FROM market_dip_alerts
+               WHERE symbol = ? AND alert_date = ?
+               ORDER BY alerted_at DESC LIMIT 1""",
+            (symbol, alert_date),
+        ).fetchone()
+        if not row:
+            return float("inf")
+        last = datetime.fromisoformat(row[0])
+        now = datetime.now(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
+        return (now - last).total_seconds() / 60
     finally:
         con.close()
 
@@ -103,10 +141,11 @@ def already_alerted(symbol: str, alert_date: str) -> bool:
 def record_alert(symbol: str, alert_date: str, pct_change: float):
     con = sqlite3.connect(DB_FILE)
     try:
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
         con.execute(
-            """INSERT OR REPLACE INTO market_dip_alerts (symbol, alert_date, pct_change)
-               VALUES (?, ?, ?)""",
-            (symbol, alert_date, pct_change),
+            """INSERT INTO market_dip_alerts (symbol, alert_date, pct_change, alerted_at)
+               VALUES (?, ?, ?, ?)""",
+            (symbol, alert_date, pct_change, now_ist),
         )
         con.commit()
     finally:
@@ -338,11 +377,19 @@ async def run_market_monitor(bot, alert_chat_id: str | None = None):
                 sym = s["symbol"]
                 if already_alerted(sym, day):
                     continue
+                gap = minutes_since_last_alert(sym, day)
+                if gap < MIN_ALERT_GAP_MINUTES:
+                    log.debug(
+                        "Dip alert skipped for %s — %.0f min since last alert (min gap %d min)",
+                        s["name"], gap, MIN_ALERT_GAP_MINUTES,
+                    )
+                    continue
+                count = alert_count_today(sym, day)
                 text = format_dip_alert(s["name"], pct, threshold)
                 try:
                     await bot.send_message(chat_id=chat, text=text)
                     record_alert(sym, day, pct)
-                    log.info("Dip alert sent: %s %.2f%%", s["name"], pct)
+                    log.info("Dip alert %d/%d sent: %s %.2f%%", count + 1, MAX_ALERTS_PER_DAY, s["name"], pct)
                 except TelegramError as e:
                     log.error(
                         "Telegram dip alert FAILED for %s → chat=%s | error: %s | "
