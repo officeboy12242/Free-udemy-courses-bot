@@ -6,6 +6,7 @@ Movie scraper — supports multiple sources:
   - Movies4U        (https://movies4u.ee/)
   - Vegamovies      (https://vegamovies.global/)
   - SDMoviesPoint   (https://sd1.sdmoviespoint.trade/)
+  - BollyFlix       (https://new.bollyflix.gd/)
 """
 from __future__ import annotations
 
@@ -1451,6 +1452,356 @@ def format_sdmp_message(movie_title: str, data: dict, footer: bool = True) -> st
 
     if footer:
         lines.append("━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BollyFlix  (https://new.bollyflix.gd/)
+#  Post pages: <a class="dl"> → fastdlserver / linksmod; maxbutton → fxlinks (episodes).
+#  We expand linksmod → direct host links; fxlinks → per-episode fastdlserver gates.
+# ══════════════════════════════════════════════════════════════════════════════
+
+BOLLY_BASE = os.getenv("BOLLYFLIX_BASE_URL", "https://new.bollyflix.gd").rstrip("/")
+_BOLLY_LINKSMOD_CAP = 12   # max linksmod pages to expand per post (avoids burst I/O)
+_BOLLY_FXLINKS_CAP = 10    # max fxlinks/elinks pages to expand per post
+
+
+def _bolly_section_signal(text: str) -> bool:
+    t = text.strip()
+    if len(t) < 6 or len(t) > 220:
+        return False
+    if set(t) <= {".", "…", "-", " ", "|", "_"}:
+        return False
+    tl = t.lower()
+    if re.search(r"episode\s*\d", tl):
+        return True
+    if re.search(r"season\s*\d", tl) and any(x in tl for x in ("480p", "720p", "1080p", "2160p", "web")):
+        return True
+    if any(x in tl for x in ("480p", "720p", "1080p", "2160p", "hevc", "web-dl", "webdl")):
+        return True
+    if "mb/e" in tl or "gb]" in tl:
+        return True
+    if tl.startswith("season ") and "[" in tl:
+        return True
+    return False
+
+
+def _bolly_scrape_info(content: BeautifulSoup) -> dict[str, str]:
+    info: dict[str, str] = {}
+    for h2 in content.find_all("h2"):
+        ht = h2.get_text(strip=True).lower()
+        if "details" not in ht:
+            continue
+        ul = h2.find_next_sibling("ul")
+        if not ul:
+            continue
+        for li in ul.find_all("li"):
+            strong = li.find("strong")
+            if not strong:
+                continue
+            label = strong.get_text(strip=True).rstrip(":").lower()
+            full = li.get_text(" ", strip=True)
+            val = full.replace(strong.get_text(strip=True), "", 1).strip(" :")
+            if "full name" in label:
+                info["title"] = val
+            elif "language" in label:
+                info["language"] = val
+            elif "released year" in label or "year" == label:
+                info["year"] = val[:4] if val else val
+            elif "genre" in label:
+                info["genre"] = val
+            elif "cast" in label:
+                info["stars"] = val
+            elif "quality" in label:
+                info["quality"] = val
+            elif "size" in label:
+                info["size"] = val
+            elif "source" in label:
+                info["source"] = val
+    return info
+
+
+def _bolly_expand_linksmod(page_url: str) -> list[tuple[str, str]]:
+    """Fetch a linksmod unlock page and return (short_name, direct_url) pairs."""
+    try:
+        resp = _get(page_url, timeout=28)
+        sp = BeautifulSoup(resp.text, "html.parser")
+        well = sp.select_one(".view-well") or sp.select_one(".view-links")
+        if not well:
+            return []
+        out: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for a in well.find_all("a", href=True):
+            u = a["href"].strip()
+            if not u.startswith("http"):
+                continue
+            ul = u.lower()
+            if "linksmod" in ul:
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            host = urlparse(u).netloc.lower().replace("www.", "")
+            short = host.split(".")[0].title() if host else "Host"
+            out.append((short, u))
+        return out
+    except Exception as exc:
+        log.debug("bolly linksmod %s: %s", page_url, exc)
+        return []
+
+
+def _bolly_expand_fxlinks(page_url: str, section: str) -> list[dict[str, str]]:
+    """fxlinks /elinks/ page lists episodes as h3 > a → fastdlserver."""
+    try:
+        resp = _get(page_url, timeout=30)
+        sp = BeautifulSoup(resp.text, "html.parser")
+        main = sp.select_one(".entry-content, article, main") or sp
+        rows: list[dict[str, str]] = []
+        for h3 in main.find_all("h3"):
+            a = h3.find("a", href=True)
+            if not a:
+                continue
+            href = a["href"].strip()
+            if "fastdlserver" not in href.lower():
+                continue
+            ep = a.get_text(strip=True) or "Episode"
+            label = f"{section} — {ep}" if section else ep
+            rows.append({
+                "label": label[:200],
+                "name": "FastDL / G‑Drive gate",
+                "url": href,
+            })
+        return rows
+    except Exception as exc:
+        log.debug("bolly fxlinks %s: %s", page_url, exc)
+        return []
+
+
+def _bolly_collect_candidates(content: BeautifulSoup) -> list[dict[str, str]]:
+    """Scan post body in order: quality headings update `section`, dl/maxbutton → rows."""
+    section = "Download"
+    out: list[dict[str, str]] = []
+    for el in content.find_all(["h2", "h3", "h4", "h5", "pre", "a"]):
+        if el.name != "a":
+            txt = el.get_text(" ", strip=True)
+            if txt and _bolly_section_signal(txt):
+                section = txt[:200]
+            continue
+        href = (el.get("href") or "").strip()
+        if not href.startswith("http"):
+            continue
+        host = urlparse(href).netloc.lower()
+        if "bollyflix" in host and "bollyflixcdn" not in href:
+            continue
+        classes = " ".join(el.get("class") or [])
+        if "maxbutton" not in classes and "dl" not in classes:
+            continue
+        kind = "other"
+        hlow = href.lower()
+        if "linksmod." in hlow:
+            kind = "linksmod"
+        elif "fxlinks.rest" in hlow or "/elinks/" in hlow:
+            kind = "fxlinks"
+        elif "fastdlserver" in hlow:
+            kind = "fastdl"
+        out.append({
+            "section": section,
+            "href": href,
+            "text": el.get_text(strip=True) or "Link",
+            "kind": kind,
+        })
+    return out
+
+
+def _bolly_parse_article_list(soup: BeautifulSoup, limit: int) -> list[dict[str, str]]:
+    movies: list[dict[str, str]] = []
+    for art in soup.select("article.latestPost, article.excerpt, article"):
+        if len(movies) >= limit:
+            break
+        h2a = art.select_one("h2.title a, h2.front-view-title a, header h2 a")
+        if not h2a or not h2a.get("href"):
+            continue
+        title = h2a.get_text(strip=True)
+        link = h2a["href"].strip()
+        img = art.select_one("img")
+        poster = ""
+        if img:
+            poster = (img.get("src") or img.get("data-src") or "").strip()
+        if poster.startswith("//"):
+            poster = "https:" + poster
+        if title and link:
+            movies.append({"title": title, "url": link, "poster": poster, "source": "bolly"})
+    return movies
+
+
+def bollyflix_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]]:
+    """Latest posts from BollyFlix homepage."""
+    url = f"{BOLLY_BASE}/" if page == 1 else f"{BOLLY_BASE}/page/{page}/"
+    try:
+        resp = _get(url, timeout=28)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("bollyflix_latest_movies page=%s: %s", page, exc)
+        return []
+    return _bolly_parse_article_list(soup, limit)
+
+
+def bollyflix_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """WordPress search on BollyFlix."""
+    q = urllib.parse.quote_plus(query)
+    url = f"{BOLLY_BASE}/?s={q}"
+    try:
+        resp = _get(url, timeout=28)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("bollyflix_search %r: %s", query, exc)
+        return []
+    return _bolly_parse_article_list(soup, limit)
+
+
+def bollyflix_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape BollyFlix post: expand linksmod to file-host URLs; fxlinks to per-episode fastdl."""
+    empty: dict[str, Any] = {"poster": "", "links": [], "info": {}, "is_series": False}
+    try:
+        resp = _get(movie_url, timeout=35)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("bollyflix_movie_links %s: %s", movie_url, exc)
+        return empty
+
+    og = soup.find("meta", property="og:image")
+    poster = og.get("content", "") if og else ""
+
+    content = soup.select_one(".post-single-content .entry-content, .entry-content, article") or soup
+    info = _bolly_scrape_info(content)
+    raw = _bolly_collect_candidates(content)
+
+    lm_jobs: list[str] = []
+    fx_jobs: list[tuple[str, str]] = []
+    seen_lm: set[str] = set()
+    seen_fx: set[str] = set()
+    for row in raw:
+        if row["kind"] == "linksmod" and row["href"] not in seen_lm and len(lm_jobs) < _BOLLY_LINKSMOD_CAP:
+            seen_lm.add(row["href"])
+            lm_jobs.append(row["href"])
+        elif row["kind"] == "fxlinks" and row["href"] not in seen_fx and len(fx_jobs) < _BOLLY_FXLINKS_CAP:
+            seen_fx.add(row["href"])
+            fx_jobs.append((row["href"], row["section"]))
+
+    lm_map: dict[str, list[tuple[str, str]]] = {}
+    fx_map: dict[str, list[dict[str, str]]] = {}
+    if lm_jobs or fx_jobs:
+        with ThreadPoolExecutor(max_workers=min(6, max(1, len(lm_jobs) + len(fx_jobs)))) as pool:
+            fmap: dict[Any, tuple[str, str, str]] = {}
+            for h in lm_jobs:
+                fut = pool.submit(_bolly_expand_linksmod, h)
+                fmap[fut] = ("lm", h, "")
+            for h, sec in fx_jobs:
+                fut = pool.submit(_bolly_expand_fxlinks, h, sec)
+                fmap[fut] = ("fx", h, sec)
+            for fut in as_completed(fmap):
+                kind, h, sec = fmap[fut]
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    log.debug("bolly expand %s %s: %s", kind, h[:60], exc)
+                    res = [] if kind == "lm" else []
+                if kind == "lm":
+                    lm_map[h] = res
+                else:
+                    fx_map[h] = res
+
+    seen_url: set[str] = set()
+    links: list[dict[str, str]] = []
+
+    def _add(label: str, name: str, url: str) -> None:
+        if not url or url in seen_url:
+            return
+        seen_url.add(url)
+        links.append({"label": label[:200], "name": name[:80], "url": url})
+
+    expanded_fx = False
+    for row in raw:
+        sec = row["section"]
+        href = row["href"]
+        txt = row["text"]
+        kind = row["kind"]
+        if kind == "linksmod":
+            pairs = lm_map.get(href)
+            if pairs:
+                for host_short, u in pairs:
+                    _add(sec, host_short, u)
+            else:
+                _add(sec, txt or "LinksMod", href)
+        elif kind == "fxlinks":
+            ep_rows = fx_map.get(href, [])
+            if ep_rows:
+                expanded_fx = True
+                for er in ep_rows:
+                    _add(er["label"], er["name"], er["url"])
+            else:
+                _add(sec, "FXLinks (episodes)", href)
+        else:
+            _add(sec, txt, href)
+
+    body_low = (content.get_text(" ", strip=True) or "").lower()
+    is_series = expanded_fx or ("series details" in body_low) or any(
+        "episode" in lk.get("label", "").lower() for lk in links
+    )
+
+    return {"poster": poster, "links": links, "info": info, "is_series": is_series}
+
+
+def format_bollyflix_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
+    """Format BollyFlix scrape result as Telegram HTML."""
+    links = data.get("links", [])
+    info = data.get("info", {})
+    is_series = data.get("is_series", False)
+
+    lines: list[str] = []
+    disp = movie_title or info.get("title", "")
+    if disp:
+        icon = "📺" if is_series else "🎬"
+        lines.append(f"{icon} <b>{disp}</b>")
+
+    ibits: list[str] = []
+    if info.get("quality"):
+        ibits.append(f"📐 <b>Quality:</b> {info['quality'][:80]}")
+    if info.get("language"):
+        ibits.append(f"🗣 <b>Language:</b> {info['language'][:60]}")
+    if info.get("year"):
+        ibits.append(f"📅 <b>Year:</b> {info['year']}")
+    if info.get("genre"):
+        ibits.append(f"🎭 <b>Genre:</b> {info['genre'][:80]}")
+    if ibits:
+        lines.append("━" * 32)
+        lines.extend(ibits)
+
+    if not links:
+        if lines:
+            lines.append("\n❌ No download links parsed.")
+        return "\n".join(lines) if lines else ""
+
+    lines.append("━" * 32)
+    hdr = "📥 <b>Episode / mirror links</b>" if is_series else "📥 <b>Download links (BollyFlix)</b>"
+    lines.append(hdr)
+    lines.append(
+        "<i>Linksmod entries are expanded to direct hosts where possible. "
+        "FastDL opens a browser gate (JS) for G‑Drive / GdFlix.</i>\n"
+    )
+
+    by_label: dict[str, list] = {}
+    for lk in links:
+        by_label.setdefault(lk.get("label", "Download"), []).append(lk)
+
+    for label, group in by_label.items():
+        lines.append(f"\n📦 <b>{label}</b>")
+        parts = [f"<a href='{x['url']}'>{x.get('name', 'Link')}</a>" for x in group]
+        lines.append("   🔗 " + " · ".join(parts))
+
+    if footer:
+        lines.append("\n" + "━" * 32)
         lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
     return "\n".join(lines)
 

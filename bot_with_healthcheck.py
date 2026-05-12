@@ -50,7 +50,9 @@ from movie_service import (
     m4u_latest_movies, m4u_movie_links, format_m4u_message,
     vega_latest_movies, vega_movie_links, format_vega_message,
     sdmp_latest_movies, sdmp_movie_links, format_sdmp_message,
+    bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
+    bollyflix_search,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -83,6 +85,94 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+# Telegram hard limit for sendMessage text (HTML entities count toward limit).
+TG_HTML_CHUNK_SAFE = 4050
+
+
+def _split_long_html_line(line: str, limit: int) -> list[str]:
+    """Break one logical line that exceeds limit (e.g. many <a> joined by ' · ')."""
+    if len(line) <= limit:
+        return [line]
+    sep = " · "
+    if sep in line:
+        raw_parts = line.split(sep)
+        out: list[str] = []
+        buf = raw_parts[0]
+        if len(buf) > limit:
+            while len(buf) > limit:
+                out.append(buf[:limit])
+                buf = buf[limit:]
+        for p in raw_parts[1:]:
+            extra = sep + p
+            if len(buf) + len(extra) <= limit:
+                buf += extra
+            else:
+                if buf:
+                    out.append(buf)
+                buf = p
+                while len(buf) > limit:
+                    out.append(buf[:limit])
+                    buf = buf[limit:]
+        if buf:
+            out.append(buf)
+        return out if out else [line[:limit]]
+    out: list[str] = []
+    rest = line
+    while len(rest) > limit:
+        out.append(rest[:limit])
+        rest = rest[limit:]
+    if rest:
+        out.append(rest)
+    return out
+
+
+def split_html_for_telegram(text: str, limit: int = TG_HTML_CHUNK_SAFE) -> list[str]:
+    """Split HTML into segments each under Telegram's 4096-char message limit."""
+    if not text:
+        return [""]
+    lines: list[str] = []
+    for line in text.split("\n"):
+        lines.extend(_split_long_html_line(line, limit))
+    chunks: list[str] = []
+    buf: list[str] = []
+    for sl in lines:
+        if len(sl) > limit:
+            if buf:
+                chunks.append("\n".join(buf))
+                buf = []
+            chunks.extend(_split_long_html_line(sl, limit))
+            continue
+        cand = "\n".join(buf + [sl])
+        if len(cand) <= limit:
+            buf.append(sl)
+        else:
+            if buf:
+                chunks.append("\n".join(buf))
+            buf = [sl]
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+async def reply_html_chunked(
+    message,
+    text: str,
+    *,
+    reply_markup=None,
+    disable_web_page_preview: bool = True,
+) -> None:
+    """Like reply_html; splits long bodies. Inline keyboard attaches to the first chunk."""
+    chunks = split_html_for_telegram(text or "")
+    for i, chunk in enumerate(chunks):
+        kw: dict = {
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if i == 0 and reply_markup is not None:
+            kw["reply_markup"] = reply_markup
+        await message.reply_text(**kw)
 
 
 # ─── /start welcome ───────────────────────────────────────────────────────────
@@ -208,6 +298,7 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
         [InlineKeyboardButton("🌟 Vegamovies (480p–4K)",     callback_data="msite_vega")],
         [InlineKeyboardButton("📀 SDMoviesPoint (HD+4K)",    callback_data="msite_sdmp")],
+        [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
     ]
     await update.effective_message.reply_text(
         "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
@@ -226,13 +317,14 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = await update.effective_message.reply_text("🔍 Testing connectivity to movie sites…")
 
-    from movie_service import SCRAPER_API_KEY, _get as movie_get
+    from movie_service import SCRAPER_API_KEY, BOLLY_BASE, _get as movie_get
     tests = [
         ("HDHub4u",        "https://new1.hdhub4u.limo/"),
         ("4KHDHub",        "https://4khdhub.link/category/hindi-movies/"),
         ("MoviesDrive",    "https://new2.moviesdrives.my/"),
         ("Vegamovies",     "https://vegamovies.global/"),
         ("SDMoviesPoint",  "https://sd1.sdmoviespoint.trade/"),
+        ("BollyFlix",      f"{BOLLY_BASE}/"),
     ]
 
     mode = f"ScraperAPI (key set ✅)" if SCRAPER_API_KEY else "Direct (no proxy ⚠️ — may be blocked on cloud)"
@@ -285,11 +377,13 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             page = int(p)
 
         await query.answer(f"Loading page {page}…")
+
         fetch_fn = (hdhub_latest_movies  if source == "hdhub"
                     else hdh_latest_movies   if source == "hdh"
                     else md_latest_movies    if source == "md"
                     else vega_latest_movies  if source == "vega"
                     else sdmp_latest_movies  if source == "sdmp"
+                    else bollyflix_latest_movies if source == "bolly"
                     else m4u_latest_movies)
         movies = await asyncio.to_thread(fetch_fn, page)
 
@@ -324,7 +418,8 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard.append([InlineKeyboardButton("« Back to sources", callback_data="mback_sites")])
 
         site_label = {"hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
-                      "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint"}.get(source, source)
+                      "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
+                      "bolly": "BollyFlix"}.get(source, source)
         await _edit_or_reply(
             f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -338,6 +433,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Back to site picker ──────────────────────────────────────────────────
     elif data == "mback_sites":
+        await query.answer()
         keyboard = [
             [InlineKeyboardButton("⭐ HDHub4u (4K/HDR – Best)",  callback_data="msite_hdhub")],
             [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",        callback_data="msite_hdh")],
@@ -345,6 +441,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
             [InlineKeyboardButton("🌟 Vegamovies (480p–4K)",     callback_data="msite_vega")],
             [InlineKeyboardButton("📀 SDMoviesPoint (HD+4K)",    callback_data="msite_sdmp")],
+            [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
         ]
         await _edit_or_reply(
             "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
@@ -380,6 +477,9 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         elif source == "sdmp":
             detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
             text = format_sdmp_message(movie["title"], detail)
+        elif source == "bolly":
+            detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
+            text = format_bollyflix_message(movie["title"], detail)
         else:
             detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
             text = format_m4u_message(movie["title"], detail)
@@ -412,7 +512,8 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
 
-        await query.message.reply_html(
+        await reply_html_chunked(
+            query.message,
             text,
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup([action_row]),
@@ -444,6 +545,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
          InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
         [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
          InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
+        [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly")],
         [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
     ]
     await update.effective_message.reply_html(
@@ -486,6 +588,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
              InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
             [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
              InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
+            [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly")],
             [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
         ]
         await _src_edit(
@@ -502,7 +605,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     source_label = {
         "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
-        "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint", "both": "All Sites",
+        "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
+        "bolly": "BollyFlix", "both": "All Sites",
     }.get(source, source)
     await _src_edit(
         f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
@@ -516,6 +620,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     m4u_results:   list = []
     vega_results:  list = []
     sdmp_results:  list = []
+    bolly_results: list = []
 
     if source == "hdhub":
         hdhub_results = await asyncio.to_thread(hdhub_search, search_query, 10)
@@ -529,17 +634,24 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         vega_results = await asyncio.to_thread(vega_search, search_query, 10)
     elif source == "sdmp":
         sdmp_results = await asyncio.to_thread(sdmp_search, search_query, 10)
+    elif source == "bolly":
+        bolly_results = await asyncio.to_thread(bollyflix_search, search_query, 10)
     else:  # all sites
-        hdhub_results, hdh_results, md_results, m4u_results, vega_results, sdmp_results = await asyncio.gather(
+        (
+            hdhub_results, hdh_results, md_results, m4u_results,
+            vega_results, sdmp_results, bolly_results,
+        ) = await asyncio.gather(
             asyncio.to_thread(hdhub_search, search_query, 4),
             asyncio.to_thread(hdh_search,   search_query, 3),
             asyncio.to_thread(md_search,    search_query, 3),
             asyncio.to_thread(m4u_search,   search_query, 3),
             asyncio.to_thread(vega_search,  search_query, 3),
             asyncio.to_thread(sdmp_search,  search_query, 3),
+            asyncio.to_thread(bollyflix_search, search_query, 3),
         )
 
-    if not hdhub_results and not hdh_results and not md_results and not m4u_results and not vega_results and not sdmp_results:
+    if (not hdhub_results and not hdh_results and not md_results and not m4u_results
+            and not vega_results and not sdmp_results and not bolly_results):
         await _src_edit(
             f"❌ No results found for <b>{search_query}</b> on {source_label}.",
             parse_mode="HTML",
@@ -553,6 +665,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     all_results.update({f"m4u_{i}": m for i, m in enumerate(m4u_results)})
     all_results.update({f"vega_{i}": m for i, m in enumerate(vega_results)})
     all_results.update({f"sdmp_{i}": m for i, m in enumerate(sdmp_results)})
+    all_results.update({f"bolly_{i}": m for i, m in enumerate(bolly_results)})
     context.user_data["search_results"] = all_results
 
     keyboard = []
@@ -592,11 +705,20 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"📀 {title}", callback_data=f"msres_sdmp_{i}")])
 
+    if bolly_results:
+        keyboard.append([InlineKeyboardButton("━━ BollyFlix ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(bolly_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"🎞 {title}", callback_data=f"msres_bolly_{i}")])
+
     # Post to channel + back
     keyboard.append([InlineKeyboardButton("📢 Post to Channel", callback_data="mpost_search")])
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
 
-    total = len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results) + len(vega_results) + len(sdmp_results)
+    total = (
+        len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results)
+        + len(vega_results) + len(sdmp_results) + len(bolly_results)
+    )
     await _src_edit(
         f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
         f"  <i>({source_label})</i>\n\nTap a movie for download links:",
@@ -638,7 +760,7 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("m4u", "vega", "sdmp", "hdhub"):
+    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly"):
         if source == "hdhub":
             detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
             text = format_hdhub_message(movie["title"], detail)
@@ -648,6 +770,9 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         elif source == "sdmp":
             detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
             text = format_sdmp_message(movie["title"], detail)
+        elif source == "bolly":
+            detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
+            text = format_bollyflix_message(movie["title"], detail)
         else:
             detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
             text = format_m4u_message(movie["title"], detail)
@@ -666,7 +791,8 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await query.message.reply_photo(photo=poster_url)
             except Exception:
                 pass
-        await query.message.reply_html(
+        await reply_html_chunked(
+            query.message,
             text or "❌ No download links found.",
             disable_web_page_preview=True,
             reply_markup=action_kb,
@@ -757,7 +883,8 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-    await query.message.reply_html(
+    await reply_html_chunked(
+        query.message,
         combined_text,
         disable_web_page_preview=True,
         reply_markup=action_kb,
@@ -783,6 +910,9 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         elif source == "sdmp":
             detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
             text = format_sdmp_message(movie["title"], detail)
+        elif source == "bolly":
+            detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
+            text = format_bollyflix_message(movie["title"], detail)
         else:  # m4u
             detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
             text = format_m4u_message(movie["title"], detail)
@@ -794,27 +924,38 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
 
         if poster_url:
             try:
-                await bot.send_photo(
-                    chat_id=channel,
-                    photo=poster_url,
-                    caption=text if len(text) <= 1024 else None,
-                    parse_mode="HTML",
-                )
-                if len(text) > 1024:
-                    await bot.send_message(
-                        chat_id=channel, text=text,
-                        parse_mode="HTML", disable_web_page_preview=True,
+                if len(text) <= 1024:
+                    await bot.send_photo(
+                        chat_id=channel,
+                        photo=poster_url,
+                        caption=text,
+                        parse_mode="HTML",
                     )
+                else:
+                    await bot.send_photo(chat_id=channel, photo=poster_url)
+                    for chunk in split_html_for_telegram(text):
+                        await bot.send_message(
+                            chat_id=channel,
+                            text=chunk,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
             except Exception:
-                await bot.send_message(
-                    chat_id=channel, text=text,
-                    parse_mode="HTML", disable_web_page_preview=True,
-                )
+                for chunk in split_html_for_telegram(text):
+                    await bot.send_message(
+                        chat_id=channel,
+                        text=chunk,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
         else:
-            await bot.send_message(
-                chat_id=channel, text=text,
-                parse_mode="HTML", disable_web_page_preview=True,
-            )
+            for chunk in split_html_for_telegram(text):
+                await bot.send_message(
+                    chat_id=channel,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
         return f"✅ {movie['title'][:50]}"
     except Exception as e:
         return f"❌ {movie['title'][:40]}: {e}"
@@ -902,6 +1043,8 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
                 src = "vega"
             elif k.startswith("sdmp_"):
                 src = "sdmp"
+            elif k.startswith("bolly_"):
+                src = "bolly"
             else:
                 src = "m4u"
             movies_to_post.append((m, src))

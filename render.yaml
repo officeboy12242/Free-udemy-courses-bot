@@ -37,5 +37,7 @@ services:
         value: "https://vegamovies.global"
       - key: SDMP_BASE_URL
         value: "https://sd1.sdmoviespoint.trade"
+      - key: BOLLYFLIX_BASE_URL
+        value: "https://new.bollyflix.gd"
     healthCheckPath: /health
     autoDeploy: true
