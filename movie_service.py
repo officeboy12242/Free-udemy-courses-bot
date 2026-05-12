@@ -1504,37 +1504,39 @@ def _decode_gw_o(o_val: str) -> str | None:
 def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
     """
     Resolve a gadgetsweb.xyz ad-gate URL to its final direct download links.
-    Returns a list of {"label": str, "url": str} dicts.
-    On failure returns [].
+    Returns a list of {"label": str, "url": str} dicts.  On failure returns [].
+
+    Optimisation for cloud deployments (Render etc.):
+    Instead of following the gadgetsweb → 302 → cryptoinsights redirect, we
+    extract the 'id' query param and call cryptoinsights.site directly, cutting
+    one network hop and skipping gadgetsweb's IP-based blocking entirely.
+    All HTTP calls go through _get() so ScraperAPI is used when configured.
     """
     try:
-        sess = requests.Session()
-        sess.headers.update(HEADERS)
-        sess.headers.update({"Referer": "https://new1.hdhub4u.limo/"})
-
-        # Step 1: gadgetsweb → 302 → cryptoinsights/?id=...
-        r1 = sess.get(gw_url, timeout=15, allow_redirects=False)
-        loc = r1.headers.get("Location", "")
-        if not loc:
+        # Extract the 'id' param from the gadgetsweb URL
+        parsed = urlparse(gw_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        gw_id = qs.get("id", [None])[0]
+        if not gw_id:
             return []
 
-        # Step 2: GET cryptoinsights page → extract 'o' value from JS
-        r2 = sess.get(loc, timeout=15)
+        # Step 1: Go directly to cryptoinsights with the same id (skip gadgetsweb hop)
+        crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
+        r2 = _get(crypto_url, timeout=20)
         m = re.search(r"s\('o','([^']+)'", r2.text)
         if not m:
             return []
 
-        # Step 3: Decode to get final URL (hblinks.org or any other site)
+        # Step 2: Decode locally — no network needed
         final_url = _decode_gw_o(m.group(1))
         if not final_url:
             return []
 
-        # Step 4a: hblinks.org → scrape all direct HubCloud/HubDrive/GoFile links
+        # Step 3a: hblinks.org → scrape HubCloud/HubDrive/GoFile links
         if "hblinks.org" in final_url:
-            r3 = sess.get(final_url, timeout=15)
+            r3 = _get(final_url, timeout=20)
             soup = BeautifulSoup(r3.text, "html.parser")
 
-            # Use page title as quality hint (e.g. "Lukkhe.S01.480p – HUBLinks")
             page_title = soup.title.string if soup.title else ""
             q_hint = ""
             q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
@@ -1564,8 +1566,7 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
                 links.append({"label": txt, "url": href})
             return links
 
-        # Step 4b: Any other resolved URL (e.g. 4khdhub.link, another CDN page)
-        # Return it as a single labelled link so users can browse it directly
+        # Step 3b: Any other resolved URL — return as direct link
         domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
         return [{"label": f"🌐 {domain_hint} Pack", "url": final_url}]
     except Exception as exc:
