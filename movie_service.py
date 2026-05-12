@@ -9,13 +9,17 @@ Movie scraper — supports multiple sources:
 """
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import re
 import time
 import urllib.parse
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -1452,6 +1456,156 @@ def format_sdmp_message(movie_title: str, data: dict, footer: bool = True) -> st
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Gadgetsweb / Cryptoinsights resolver
+#  Chain: gadgetsweb → cryptoinsights (extract 'o') → atob→atob→rot13→atob→JSON
+#         → atob → hblinks.org → final HubCloud/HubDrive/GoFile links
+# ══════════════════════════════════════════════════════════════════════════════
+
+_GW_AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site"}
+
+def _rot13(s: str) -> str:
+    out = []
+    for c in s:
+        if "a" <= c <= "z":
+            out.append(chr((ord(c) - 97 + 13) % 26 + 97))
+        elif "A" <= c <= "Z":
+            out.append(chr((ord(c) - 65 + 13) % 26 + 65))
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _sb64(s: str) -> bytes:
+    """Base64 decode with auto-padding."""
+    s = s.strip()
+    pad = 4 - len(s) % 4
+    if pad < 4:
+        s += "=" * pad
+    return base64.b64decode(s)
+
+
+def _decode_gw_o(o_val: str) -> str | None:
+    """
+    Decode the 'o' localStorage value set by cryptoinsights.site:
+    atob → atob → ROT13 → atob → JSON.parse → decode "o" field → final URL
+    """
+    try:
+        d1 = _sb64(o_val).decode()
+        d2 = _sb64(d1).decode("latin-1")
+        d3 = _rot13(d2)
+        d4 = _sb64(d3).decode()
+        data = json.loads(d4)
+        final_b64 = data.get("o", "")
+        return _sb64(final_b64).decode() if final_b64 else None
+    except Exception:
+        return None
+
+
+def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
+    """
+    Resolve a gadgetsweb.xyz ad-gate URL to its final direct download links.
+    Returns a list of {"label": str, "url": str} dicts.
+    On failure returns [].
+    """
+    try:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        sess.headers.update({"Referer": "https://new1.hdhub4u.limo/"})
+
+        # Step 1: gadgetsweb → 302 → cryptoinsights/?id=...
+        r1 = sess.get(gw_url, timeout=15, allow_redirects=False)
+        loc = r1.headers.get("Location", "")
+        if not loc:
+            return []
+
+        # Step 2: GET cryptoinsights page → extract 'o' value from JS
+        r2 = sess.get(loc, timeout=15)
+        m = re.search(r"s\('o','([^']+)'", r2.text)
+        if not m:
+            return []
+
+        # Step 3: Decode to get hblinks.org URL
+        hb_url = _decode_gw_o(m.group(1))
+        if not hb_url or "hblinks.org" not in hb_url:
+            return []
+
+        # Step 4: GET hblinks page → extract final links
+        r3 = sess.get(hb_url, timeout=15)
+        soup = BeautifulSoup(r3.text, "html.parser")
+
+        # Use page title as quality hint (e.g. "Lukkhe.S01.480p – HUBLinks")
+        page_title = soup.title.string if soup.title else ""
+        q_hint = ""
+        q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
+        if q_m:
+            q_hint = q_m.group(1)
+
+        links: list[dict] = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not href.startswith("http") or "hblinks" in href:
+                continue
+            txt = a.get_text(strip=True)
+            if not txt:
+                domain = urlparse(href).netloc
+                if "hubcloud" in domain:
+                    txt = "HubCloud"
+                elif "hubdrive" in domain:
+                    txt = "HubDrive"
+                elif "gofile" in domain:
+                    txt = "GoFile"
+                else:
+                    txt = domain.split(".")[0].capitalize()
+            if q_hint:
+                txt = f"{q_hint} – {txt}"
+            links.append({"label": txt, "url": href})
+        return links
+    except Exception as exc:
+        log.debug("_resolve_gadgetsweb %s failed: %s", gw_url, exc)
+        return []
+
+
+def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
+    """
+    For a list of links, replace any gadgetsweb URLs with their resolved direct links.
+    Non-gadgetsweb links are passed through unchanged.
+    Runs multiple gadgetsweb resolves in parallel (up to 4 threads).
+    """
+    gw_indices = [i for i, lk in enumerate(raw_links)
+                  if urlparse(lk["url"]).netloc in _GW_AD_DOMAINS]
+
+    if not gw_indices:
+        return raw_links
+
+    resolved: dict[int, list[dict]] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_resolve_gadgetsweb, raw_links[i]["url"]): i
+                   for i in gw_indices}
+        for fut in as_completed(futures, timeout=30):
+            i = futures[fut]
+            try:
+                resolved[i] = fut.result()
+            except Exception:
+                resolved[i] = []
+
+    result: list[dict] = []
+    for i, lk in enumerate(raw_links):
+        if i in resolved:
+            direct = resolved[i]
+            if direct:
+                result.extend(direct)
+            else:
+                # Keep original if resolve failed, update label
+                result.append({
+                    "label": lk["label"] or orig_label,
+                    "url":   lk["url"],
+                })
+        else:
+            result.append(lk)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HDHub4u  (https://new1.hdhub4u.limo/)  — primary source
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1594,11 +1748,9 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
     episodes: list[dict] = []
 
     _EP_PAT = re.compile(r"EP(?:i?SODE)?\s*\d+", re.I)
-    _AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site"}
 
     def _is_ad_url(href: str) -> bool:
-        from urllib.parse import urlparse
-        return urlparse(href).netloc in _AD_DOMAINS
+        return urlparse(href).netloc in _GW_AD_DOMAINS
 
     # ── Flat pack/quality links (between DL and Single Episode markers) ────────
     end_pack = ep_sec if ep_sec > 0 else len(all_h)
@@ -1631,8 +1783,8 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                 if lbl.lower() in ("watch", "watch online", "player-2", "player 2"):
                     wt_links.append({"label": "\U0001f4fa Watch Online", "url": href})
                 elif _is_ad_url(href):
-                    # Keep ad-gated links but flag them
-                    dl_links.append({"label": "\U0001f4e5 Download", "url": href})
+                    # Keep gadgetsweb links — _expand_gw_links will resolve them later
+                    dl_links.append({"label": lbl or "\U0001f4e5 Download", "url": href})
                 else:
                     dl_links.append({"label": lbl, "url": href})
             # Combine: direct downloads first, then watch links
@@ -1642,12 +1794,13 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                 episodes.append(ep_entry)
     else:
         # ── Normal pack/quality layout (Lukkhe ZIP packs, single movies) ──────
+        # Include gadgetsweb links here — _expand_gw_links will resolve them later
         for h in all_h[dl_idx + 1: end_pack]:
             a = h.find("a", href=True)
             if a:
                 href  = a.get("href", "")
                 label = a.get_text(strip=True)
-                if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS and not _is_ad_url(href):
+                if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS:
                     links.append({"label": label, "url": href})
 
     # ── Series: detect and parse episode sections (Lukkhe-style div.Z1hOCe) ───
@@ -1685,6 +1838,16 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                         current_ep["qualities"][quality] = existing + ql
             if current_ep and current_ep["qualities"]:
                 episodes.append(current_ep)
+
+    # ── Resolve gadgetsweb ad-gate links to real HubCloud/HubDrive/GoFile URLs ─
+    # For flat-episode series, expand gadgetsweb 📥 Download links per episode
+    if flat_has_episodes and episodes:
+        for ep_entry in episodes:
+            for quality, ql in ep_entry["qualities"].items():
+                ep_entry["qualities"][quality] = _expand_gw_links(ql, ep_entry["ep"])
+    elif links:
+        # For movies / Lukkhe-style packs: expand any gadgetsweb pack links
+        links = _expand_gw_links(links)
 
     return {
         "poster":    poster,
