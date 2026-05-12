@@ -1524,42 +1524,50 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         if not m:
             return []
 
-        # Step 3: Decode to get hblinks.org URL
-        hb_url = _decode_gw_o(m.group(1))
-        if not hb_url or "hblinks.org" not in hb_url:
+        # Step 3: Decode to get final URL (hblinks.org or any other site)
+        final_url = _decode_gw_o(m.group(1))
+        if not final_url:
             return []
 
-        # Step 4: GET hblinks page → extract final links
-        r3 = sess.get(hb_url, timeout=15)
-        soup = BeautifulSoup(r3.text, "html.parser")
+        # Step 4a: hblinks.org → scrape all direct HubCloud/HubDrive/GoFile links
+        if "hblinks.org" in final_url:
+            r3 = sess.get(final_url, timeout=15)
+            soup = BeautifulSoup(r3.text, "html.parser")
 
-        # Use page title as quality hint (e.g. "Lukkhe.S01.480p – HUBLinks")
-        page_title = soup.title.string if soup.title else ""
-        q_hint = ""
-        q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
-        if q_m:
-            q_hint = q_m.group(1)
+            # Use page title as quality hint (e.g. "Lukkhe.S01.480p – HUBLinks")
+            page_title = soup.title.string if soup.title else ""
+            q_hint = ""
+            q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
+            if q_m:
+                q_hint = q_m.group(1)
 
-        links: list[dict] = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if not href.startswith("http") or "hblinks" in href:
-                continue
-            txt = a.get_text(strip=True)
-            if not txt:
-                domain = urlparse(href).netloc
-                if "hubcloud" in domain:
-                    txt = "HubCloud"
-                elif "hubdrive" in domain:
-                    txt = "HubDrive"
-                elif "gofile" in domain:
-                    txt = "GoFile"
-                else:
-                    txt = domain.split(".")[0].capitalize()
-            if q_hint:
-                txt = f"{q_hint} – {txt}"
-            links.append({"label": txt, "url": href})
-        return links
+            links: list[dict] = []
+            seen_hrefs: set[str] = set()
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if not href.startswith("http") or "hblinks" in href or href in seen_hrefs:
+                    continue
+                seen_hrefs.add(href)
+                txt = a.get_text(strip=True)
+                if not txt:
+                    domain = urlparse(href).netloc
+                    if "hubcloud" in domain:
+                        txt = "HubCloud"
+                    elif "hubdrive" in domain:
+                        txt = "HubDrive"
+                    elif "gofile" in domain:
+                        txt = "GoFile"
+                    else:
+                        txt = domain.split(".")[0].capitalize()
+                if q_hint:
+                    txt = f"{q_hint} – {txt}"
+                links.append({"label": txt, "url": href})
+            return links
+
+        # Step 4b: Any other resolved URL (e.g. 4khdhub.link, another CDN page)
+        # Return it as a single labelled link so users can browse it directly
+        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
+        return [{"label": f"🌐 {domain_hint} Pack", "url": final_url}]
     except Exception as exc:
         log.debug("_resolve_gadgetsweb %s failed: %s", gw_url, exc)
         return []
