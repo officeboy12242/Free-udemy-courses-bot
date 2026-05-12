@@ -283,6 +283,78 @@ async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cmd_updateapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Update ScraperAPI key directly from Telegram."""
+    if not update.effective_message or not update.effective_user:
+        return
+    
+    # Only allow the bot owner (admin)
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+    if ADMIN_ID == 0 or update.effective_user.id != ADMIN_ID:
+        await update.effective_message.reply_html(
+            "❌ <b>Unauthorized</b>\n\n"
+            "You are not authorized to use this command.\n"
+            "Only the bot admin can update the API key."
+        )
+        return
+    
+    # Check if user provided a new key
+    if not context.args:
+        await update.effective_message.reply_html(
+            "📝 <b>Usage:</b>\n\n"
+            "<code>/updateapi &lt;new_scraper_api_key&gt;</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/updateapi abc123def456xyz789</code>\n\n"
+            "<b>Current key:</b>\n"
+            f"<code>{os.getenv('SCRAPER_API_KEY', 'NOT SET')[:20]}...</code>"
+        )
+        return
+    
+    new_key = " ".join(context.args).strip()
+    
+    if len(new_key) < 10:
+        await update.effective_message.reply_html(
+            "❌ <b>Invalid key</b>\n\n"
+            "The API key seems too short. Please verify and try again."
+        )
+        return
+    
+    try:
+        # Update .env file
+        env_path = Path(".env")
+        env_content = env_path.read_text(encoding="utf-8")
+        
+        # Replace or add SCRAPER_API_KEY
+        if "SCRAPER_API_KEY=" in env_content:
+            env_content = re.sub(
+                r"SCRAPER_API_KEY=.*",
+                f"SCRAPER_API_KEY={new_key}",
+                env_content
+            )
+        else:
+            env_content += f"\nSCRAPER_API_KEY={new_key}"
+        
+        env_path.write_text(env_content, encoding="utf-8")
+        
+        # Reload environment
+        load_dotenv(override=True)
+        os.environ["SCRAPER_API_KEY"] = new_key
+        
+        await update.effective_message.reply_html(
+            "✅ <b>API Key Updated!</b>\n\n"
+            "The ScraperAPI key has been updated in <code>.env</code>.\n"
+            f"<b>New key (masked):</b> <code>{new_key[:10]}...{new_key[-4:]}</code>\n\n"
+            "<i>The new key will be used immediately for movie scraping.</i>"
+        )
+        log.info(f"ScraperAPI key updated by user {update.effective_user.id}")
+    except Exception as e:
+        await update.effective_message.reply_html(
+            f"❌ <b>Error updating key</b>\n\n"
+            f"<code>{html.escape(str(e))}</code>"
+        )
+        log.error(f"Failed to update API key: {e}")
+
+
 async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show site picker: 4KHDHub or MoviesDrive."""
     if not update.effective_message or not update.effective_user:
@@ -1151,6 +1223,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("testdip", cmd_testdip))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
+    app.add_handler(CommandHandler("updateapi", cmd_updateapi))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("movietest", cmd_movietest))
