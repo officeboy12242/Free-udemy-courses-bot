@@ -2196,7 +2196,7 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
 
 HDHUB_BASE        = os.getenv("HDHUB_BASE_URL", "https://new1.hdhub4u.limo")
 _HDHUB_SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search"
-_HDHUB_SKIP_LABELS = {"watch", "player-2", "player 2", "stream"}
+_HDHUB_SKIP_LABELS = {"stream"}
 
 
 def _hdhub_clean_poster(src: str) -> str:
@@ -2394,7 +2394,7 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                 lbl  = a.get_text(strip=True)
                 href = a["href"]
                 if lbl.lower() in ("watch", "watch online", "player-2", "player 2"):
-                    wt_links.append({"label": "\U0001f4fa Watch Online", "url": href})
+                    wt_links.append({"label": "\U0001f4fa Watch Now", "url": href})
                 elif _is_ad_url(href):
                     # Keep gadgetsweb links — _expand_gw_links will resolve them later
                     dl_links.append({"label": lbl or "\U0001f4e5 Download", "url": href})
@@ -2409,11 +2409,12 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
         # ── Normal pack/quality layout (Lukkhe ZIP packs, single movies) ──────
         # Include gadgetsweb links here — _expand_gw_links will resolve them later
         for h in all_h[dl_idx + 1: end_pack]:
-            a = h.find("a", href=True)
-            if a:
+            for a in h.find_all("a", href=True):
                 href  = a.get("href", "")
                 label = a.get_text(strip=True)
                 if href.startswith("http") and label.lower() not in _HDHUB_SKIP_LABELS:
+                    if label.lower() in ("watch", "watch online", "player-2", "player 2"):
+                        label = "\U0001f4fa Watch Now"
                     links.append({"label": label, "url": href})
 
     # ── Series: detect and parse episode sections (Lukkhe-style div.Z1hOCe) ───
@@ -2444,8 +2445,11 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
                     ql: list[dict] = []
                     for a in ext_a:
                         lbl = a.get_text(strip=True)
-                        if lbl.lower() not in _HDHUB_SKIP_LABELS and lbl.lower() != "watch":
-                            ql.append({"label": lbl, "url": a["href"]})
+                        href = a["href"]
+                        if lbl.lower() in ("watch", "watch online", "player-2", "player 2"):
+                            ql.append({"label": "📺 Watch Now", "url": href})
+                        elif lbl.lower() not in _HDHUB_SKIP_LABELS:
+                            ql.append({"label": lbl, "url": href})
                     if ql:
                         existing = current_ep["qualities"].get(quality, [])
                         current_ep["qualities"][quality] = existing + ql
