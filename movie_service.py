@@ -135,23 +135,31 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
 
     # ── cloudscraper mode (free Cloudflare bypass) ────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
-    verify = host not in _NO_VERIFY_HOSTS
-    session = _session_for(host)
+    no_verify = host in _NO_VERIFY_HOSTS
+
+    # cloudscraper doesn't support verify=False properly; use plain requests
+    # for hosts with known SSL issues (they don't need Cloudflare bypass anyway)
+    if no_verify:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+    else:
+        session = _session_for(host)
 
     ctx = warnings.catch_warnings()
     ctx.__enter__()
-    if not verify:
+    if no_verify:
         warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
 
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            resp = session.get(url, verify=verify, **kwargs)
+            resp = session.get(url, verify=not no_verify, **kwargs)
             if resp.status_code in (403, 429, 503) and attempt < retries:
                 log.warning("_get %s → HTTP %s (attempt %d), retrying…", url, resp.status_code, attempt + 1)
                 time.sleep(1.5 * (attempt + 1))
-                _sessions.pop(host, None)
-                session = _session_for(host)
+                if not no_verify:
+                    _sessions.pop(host, None)
+                    session = _session_for(host)
                 continue
             if resp.status_code not in (200, 301, 302):
                 log.warning("_get %s → HTTP %s", url, resp.status_code)
