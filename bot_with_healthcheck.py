@@ -66,6 +66,8 @@ PORT = int(os.getenv("PORT", 10000))  # Render uses PORT env variable
 TEST_ALERT_SECRET = os.getenv("TEST_ALERT_SECRET", "").strip()
 # News auto-post times (IST, 24h). Default: 10:00 and 22:00
 NEWS_POST_HOURS = [int(h) for h in os.getenv("NEWS_POST_HOURS", "10,22").split(",")]
+# HDHub: gadgetsweb resolves run sequentially in Playwright — allow a long budget (seconds).
+HDHUB_FETCH_TIMEOUT_SEC = float(os.getenv("HDHUB_FETCH_TIMEOUT_SEC", "900"))
 
 # ─── Obfuscated API Configuration ────────────────────────────────────────────
 # Encoded endpoint for security - decodes at runtime
@@ -422,6 +424,14 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await msg.edit_text("\n".join(lines), parse_mode="HTML")
 
 
+async def _fetch_hdhub_detail(movie_url: str):
+    """Run hdhub_movie_links in a thread; generous timeout for Playwright gadgetsweb chain."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(hdhub_movie_links, movie_url),
+        timeout=HDHUB_FETCH_TIMEOUT_SEC,
+    )
+
+
 async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all movie-related inline button presses."""
     query = update.callback_query
@@ -541,7 +551,14 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("Fetching links…")
 
         if source == "hdhub":
-            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            try:
+                detail = await _fetch_hdhub_detail(movie["url"])
+            except asyncio.TimeoutError:
+                await query.message.reply_html(
+                    "<b>Timed out</b> fetching HDHub links (large series can take several minutes). "
+                    "Try again or set <code>HDHUB_FETCH_TIMEOUT_SEC</code> higher.",
+                )
+                return
             text = format_hdhub_message(movie["title"], detail)
         elif source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
@@ -840,7 +857,11 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if source in ("m4u", "vega", "sdmp", "hdhub", "bolly"):
         if source == "hdhub":
-            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            try:
+                detail = await _fetch_hdhub_detail(movie["url"])
+            except asyncio.TimeoutError:
+                await query.message.reply_html("<b>Timed out</b> fetching HDHub links. Try again later.")
+                return
             text = format_hdhub_message(movie["title"], detail)
         elif source == "vega":
             detail = await asyncio.to_thread(vega_movie_links, movie["url"])
@@ -974,7 +995,10 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
     Returns a status string for logging."""
     try:
         if source == "hdhub":
-            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+            try:
+                detail = await _fetch_hdhub_detail(movie["url"])
+            except asyncio.TimeoutError:
+                return "timeout: HDHub fetch exceeded HDHUB_FETCH_TIMEOUT_SEC"
             text = format_hdhub_message(movie["title"], detail)
         elif source == "hdh":
             detail = await asyncio.to_thread(hdh_movie_links, movie["url"])

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import warnings
@@ -34,6 +35,9 @@ except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
 log = logging.getLogger(__name__)
+
+# Serialize gadgetsweb Playwright resolves — parallel Chromium jobs often fail or return empty.
+_PLAYWRIGHT_GW_LOCK = threading.Lock()
 
 # If set, all movie requests are routed through ScraperAPI (bypasses Cloudflare on cloud hosts)
 # Sign up free at https://www.scraperapi.com  — 5,000 req/month free
@@ -1960,111 +1964,125 @@ def _check_for_final_link(page) -> str | None:
     return None
 
 
+def _gw_hblinks_href_from_ctas(page) -> str | None:
+    """Mediator sites expose the real archive link on #verify_btn / .get-link href."""
+    for sel in ("#verify_btn", "a.get-link"):
+        try:
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            href = (el.get_attribute("href") or "").strip()
+            if href.startswith("http") and "hblinks" in href.lower():
+                return href
+        except Exception:
+            continue
+    return None
+
+
+def _gw_countdown_visible(page) -> bool:
+    """True when the mediator countdown overlay is shown (not .hidden)."""
+    try:
+        return bool(page.evaluate("""() => {
+          const cd = document.querySelector('#countdown');
+          if (cd && !cd.classList.contains('hidden')) return true;
+          const el = document.querySelector('#timer');
+          return !!(el && el.offsetParent !== null && /\\d/.test((el.textContent||'').trim()));
+        }"""))
+    except Exception:
+        return False
+
+
 def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
-    """Navigate gadgetsweb URL in a real browser and automatically bypass any
-    intermediate mediator/redirect pages to reach the final download links.
+    """Navigate gadgetsweb URL in a real browser; click through mediator pages;
+    extract hblinks.org URL from CTA buttons; scrape final HubDrive/HubCloud links.
 
-    This is generic and future-proof: it doesn't depend on specific element IDs
-    or domain names. It detects mediator pages by looking for 'continue/verify'
-    buttons, handles countdowns/timers, and keeps trying until it reaches a
-    known file host (hblinks, hubcloud, etc.).
-
-    Returns list of {"label": str, "url": str} for file-host links found.
+    Runs under a global lock so parallel episode resolves don't spawn competing
+    Chromium instances (that commonly yielded empty results and gadgetsweb URLs).
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return []
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
+        with _PLAYWRIGHT_GW_LOCK:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
 
-            page.goto(gw_url, wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(3000)
+                page.goto(gw_url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(2500)
 
-            final_url = None
+                try:
+                    page.wait_for_selector("#verify_btn, a.get-link", timeout=12000)
+                except Exception:
+                    pass
 
-            # Adaptive loop: keep clicking through mediator pages (max 60s total)
-            for overall_attempt in range(6):
-                current_host = urlparse(page.url).netloc.lower()
+                final_url: str | None = None
 
-                # Check if we already landed on a final destination
-                if any(kw in current_host for kw in _FINAL_HOST_KEYWORDS):
-                    final_url = page.url
-                    break
-
-                # Scan page for a link pointing to a final host
-                found = _check_for_final_link(page)
-                if found:
-                    final_url = found
-                    break
-
-                # Find and click mediator button
-                btn = _find_mediator_button(page)
-                if not btn:
-                    # No button found; wait a bit and try once more
-                    page.wait_for_timeout(3000)
-                    btn = _find_mediator_button(page)
-                    if not btn:
+                for _round in range(4):
+                    cur_host = urlparse(page.url).netloc.lower()
+                    if any(kw in cur_host for kw in _FINAL_HOST_KEYWORDS):
+                        final_url = page.url
                         break
 
-                btn.click()
-                page.wait_for_timeout(2000)
-
-                # After click: check if a countdown/timer appeared
-                # Generic detection: look for any visible element with timer-like content
-                has_countdown = page.evaluate('''() => {
-                    const selectors = ['#countdown', '[class*="countdown"]', '[class*="timer"]',
-                                       '[id*="countdown"]', '[id*="timer"]', '.loader'];
-                    for (const sel of selectors) {
-                        const el = document.querySelector(sel);
-                        if (el && el.offsetParent !== null) return true;
-                    }
-                    return false;
-                }''')
-
-                if has_countdown:
-                    # Wait for countdown (up to 15s — covers most 5-10s timers)
-                    page.wait_for_timeout(15000)
-
-                    # After countdown, check if button now has a final link
-                    found = _check_for_final_link(page)
+                    found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
                     if found:
                         final_url = found
                         break
 
-                    # Check if the same button's href updated
-                    btn = _find_mediator_button(page)
-                    if btn:
-                        href = btn.get_attribute("href") or ""
-                        if href.startswith("http"):
-                            host = urlparse(href).netloc.lower()
-                            if any(kw in host for kw in _FINAL_HOST_KEYWORDS) or "hblinks" in host:
-                                final_url = href
-                                break
-                else:
-                    # No countdown — maybe ad popup opened; wait and retry
+                    btn = (
+                        page.query_selector("#verify_btn")
+                        or page.query_selector("a.get-link")
+                        or _find_mediator_button(page)
+                    )
+                    if btn and btn.is_visible():
+                        try:
+                            btn.click(timeout=5000)
+                        except Exception:
+                            pass
                     page.wait_for_timeout(2000)
 
-            browser.close()
+                    if _gw_countdown_visible(page):
+                        page.wait_for_timeout(13000)
+
+                    found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
+                    if found:
+                        final_url = found
+                        break
+
+                # Poll — href updates asynchronously after countdown
+                if not final_url:
+                    for _ in range(50):
+                        found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
+                        if found:
+                            final_url = found
+                            break
+                        cur_host = urlparse(page.url).netloc.lower()
+                        if "hblinks" in cur_host:
+                            final_url = page.url
+                            break
+                        page.wait_for_timeout(400)
+
+                browser.close()
 
             if not final_url:
                 return []
 
-            # If it's an hblinks page, fetch and scrape it via HTTP
             if "hblinks" in urlparse(final_url).netloc.lower():
                 try:
-                    r = requests.get(
-                        final_url, timeout=20, verify=False,
-                        headers=HEADERS,
-                    )
-                    return _scrape_hblinks_page(r.text)
+                    hn = (urlparse(final_url).hostname or "").lower()
+                    verify_h = hn not in _NO_VERIFY_HOSTS and "hblinks.org" not in hn
+                    with warnings.catch_warnings():
+                        if not verify_h:
+                            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+                        r = requests.get(final_url, timeout=25, verify=verify_h, headers=HEADERS)
+                    links = _scrape_hblinks_page(r.text)
+                    if links:
+                        return links
                 except Exception as exc:
                     log.debug("_resolve_gadgetsweb_playwright hblinks fetch failed: %s", exc)
-                    return [{"label": "HBLinks Page", "url": final_url}]
+                return [{"label": "HBLinks Page", "url": final_url}]
 
-            # Direct file-host link
             domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
             return [{"label": f"{domain_hint} Download", "url": final_url}]
 
@@ -2209,7 +2227,7 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_resolve_gadgetsweb, raw_links[i]["url"]): i
                    for i in gw_indices}
-        for fut in as_completed(futures, timeout=90):
+        for fut in as_completed(futures):
             i = futures[fut]
             try:
                 resolved[i] = fut.result()
