@@ -149,9 +149,11 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
     raise last_exc  # type: ignore[misc]
 
 
-def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 5000) -> str | None:
+def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str | None:
     """Fetch a page using Playwright headless Chromium for full JS rendering.
 
+    Uses 'domcontentloaded' instead of 'networkidle' because ad-heavy sites
+    never reach network-idle state. The wait_ms pause lets JS inject dynamic content.
     Returns the rendered HTML string, or None if Playwright is unavailable or fails.
     """
     if not _PLAYWRIGHT_AVAILABLE:
@@ -161,7 +163,7 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 5000) -> str 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(wait_ms)
             html = page.content()
             browser.close()
