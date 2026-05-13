@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import requests
 import urllib3
+import cloudscraper
 from bs4 import BeautifulSoup
 
 try:
@@ -64,29 +65,46 @@ HEADERS = {
 # Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
 _NO_VERIFY_HOSTS = {"4khdhub.link", "cryptoinsights.site", "hblinks.org"}
 
-# Per-host persistent sessions so cookies are carried across requests
-_sessions: dict[str, requests.Session] = {}
+# Per-host persistent cloudscraper sessions (handles Cloudflare JS challenges)
+_sessions: dict[str, cloudscraper.CloudScraper] = {}
 
 
-def _session_for(host: str) -> requests.Session:
+def _session_for(host: str) -> cloudscraper.CloudScraper:
     if host not in _sessions:
-        s = requests.Session()
+        s = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+        )
         s.headers.update(HEADERS)
         _sessions[host] = s
     return _sessions[host]
 
 
-def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
-    """GET with browser headers, persistent session (cookies), SSL bypass for known hosts.
+class _PlaywrightResponse:
+    """Minimal response wrapper so Playwright-rendered HTML can be returned
+    from _get() with the same interface as requests.Response."""
 
-    When SCRAPER_API_KEY is set (recommended for cloud deployments), all requests
-    are routed through ScraperAPI which bypasses Cloudflare / geo-blocks automatically.
+    def __init__(self, text: str, url: str):
+        self.text = text
+        self.content = text.encode("utf-8")
+        self.status_code = 200
+        self.url = url
+        self.headers = {}
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
+
+
+def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
+    """GET with Cloudflare bypass via cloudscraper + Playwright fallback.
+
+    Priority:
+    1. ScraperAPI (if SCRAPER_API_KEY is set — paid, fastest)
+    2. cloudscraper (free, handles most Cloudflare JS challenges)
+    3. Playwright headless (free, handles Turnstile/Bot-Fight-Mode)
     """
-    # ── ScraperAPI mode ──────────────────────────────────────────────────────
+    # ── ScraperAPI mode (optional premium path) ───────────────────────────────
     if SCRAPER_API_KEY:
-        # If the caller passed query params (e.g. search functions), bake them
-        # into the URL first — ScraperAPI uses its own `params` dict so we
-        # cannot pass two separate `params` kwargs to requests.get().
         caller_params = kwargs.pop("params", None)
         if caller_params:
             encoded = urllib.parse.urlencode(caller_params)
@@ -115,7 +133,7 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                     time.sleep(2 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    # ── Direct mode (local / non-blocked network) ────────────────────────────
+    # ── cloudscraper mode (free Cloudflare bypass) ────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
     verify = host not in _NO_VERIFY_HOSTS
     session = _session_for(host)
@@ -138,6 +156,14 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
             if resp.status_code not in (200, 301, 302):
                 log.warning("_get %s → HTTP %s", url, resp.status_code)
             ctx.__exit__(None, None, None)
+
+            # If still blocked after retries, try Playwright as last resort
+            if resp.status_code in (403, 503) and _PLAYWRIGHT_AVAILABLE:
+                log.info("_get %s → cloudscraper blocked (%d), falling back to Playwright",
+                         url, resp.status_code)
+                rendered = _get_rendered_html(url, timeout=25, wait_ms=5000)
+                if rendered:
+                    return _PlaywrightResponse(rendered, url)  # type: ignore[return-value]
             return resp
         except Exception as exc:
             last_exc = exc
@@ -146,6 +172,14 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                 time.sleep(1.5 * (attempt + 1))
 
     ctx.__exit__(None, None, None)
+
+    # Final fallback: Playwright for network errors too (e.g. SSL failures)
+    if _PLAYWRIGHT_AVAILABLE:
+        log.info("_get %s → all attempts failed, trying Playwright", url)
+        rendered = _get_rendered_html(url, timeout=25, wait_ms=5000)
+        if rendered:
+            return _PlaywrightResponse(rendered, url)  # type: ignore[return-value]
+
     raise last_exc  # type: ignore[misc]
 
 
