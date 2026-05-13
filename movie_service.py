@@ -196,7 +196,8 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(wait_ms)
             html = page.content()
