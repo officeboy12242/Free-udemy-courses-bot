@@ -320,31 +320,37 @@ async def cmd_updateapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     try:
-        # Update .env file
-        env_path = Path(".env")
-        env_content = env_path.read_text(encoding="utf-8")
-        
-        # Replace or add SCRAPER_API_KEY
-        if "SCRAPER_API_KEY=" in env_content:
-            env_content = re.sub(
-                r"SCRAPER_API_KEY=.*",
-                f"SCRAPER_API_KEY={new_key}",
-                env_content
-            )
-        else:
-            env_content += f"\nSCRAPER_API_KEY={new_key}"
-        
-        env_path.write_text(env_content, encoding="utf-8")
-        
-        # Reload environment
-        load_dotenv(override=True)
+        # Update the live process environment (works on Render + local)
         os.environ["SCRAPER_API_KEY"] = new_key
-        
+
+        # Also persist to .env file if it exists (local dev convenience)
+        env_path = Path(".env")
+        persisted = False
+        try:
+            if env_path.exists():
+                env_content = env_path.read_text(encoding="utf-8")
+                if "SCRAPER_API_KEY=" in env_content:
+                    env_content = re.sub(
+                        r"SCRAPER_API_KEY=.*",
+                        f"SCRAPER_API_KEY={new_key}",
+                        env_content
+                    )
+                else:
+                    env_content += f"\nSCRAPER_API_KEY={new_key}"
+                env_path.write_text(env_content, encoding="utf-8")
+                persisted = True
+        except Exception:
+            pass  # File write is optional; os.environ update is what matters
+
+        persist_note = (
+            "Saved to <code>.env</code> (persists across restarts)."
+            if persisted
+            else "Active for this session (will reset on next deploy)."
+        )
         await update.effective_message.reply_html(
             "✅ <b>API Key Updated!</b>\n\n"
-            "The ScraperAPI key has been updated in <code>.env</code>.\n"
             f"<b>New key (masked):</b> <code>{new_key[:10]}...{new_key[-4:]}</code>\n\n"
-            "<i>The new key will be used immediately for movie scraping.</i>"
+            f"<i>{persist_note}</i>"
         )
         log.info(f"ScraperAPI key updated by user {update.effective_user.id}")
     except Exception as e:
