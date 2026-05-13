@@ -2021,12 +2021,14 @@ def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
 
                 for _round in range(4):
                     cur_host = urlparse(page.url).netloc.lower()
+                    print(f"[_resolve_gadgetsweb_playwright] Round {_round}, url={page.url}")
                     if any(kw in cur_host for kw in _FINAL_HOST_KEYWORDS):
                         final_url = page.url
                         break
 
                     found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
                     if found:
+                        print(f"[_resolve_gadgetsweb_playwright] Found final link before click: {found}")
                         final_url = found
                         break
 
@@ -2036,25 +2038,35 @@ def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
                         or _find_mediator_button(page)
                     )
                     if btn and btn.is_visible():
+                        print(f"[_resolve_gadgetsweb_playwright] Found button, clicking...")
                         try:
                             btn.click(timeout=5000)
-                        except Exception:
+                        except Exception as e:
+                            print(f"[_resolve_gadgetsweb_playwright] Click error: {e}")
                             pass
+                    else:
+                        print(f"[_resolve_gadgetsweb_playwright] No button found!")
                     page.wait_for_timeout(2000)
 
                     if _gw_countdown_visible(page):
+                        print(f"[_resolve_gadgetsweb_playwright] Countdown visible, waiting 13s...")
                         page.wait_for_timeout(13000)
+                    else:
+                        print(f"[_resolve_gadgetsweb_playwright] Countdown NOT visible.")
 
                     found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
                     if found:
+                        print(f"[_resolve_gadgetsweb_playwright] Found final link after click/wait: {found}")
                         final_url = found
                         break
 
                 # Poll — href updates asynchronously after countdown
                 if not final_url:
+                    print(f"[_resolve_gadgetsweb_playwright] Polling for final link...")
                     for _ in range(50):
                         found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
                         if found:
+                            print(f"[_resolve_gadgetsweb_playwright] Found final link during poll: {found}")
                             final_url = found
                             break
                         cur_host = urlparse(page.url).netloc.lower()
@@ -2063,6 +2075,7 @@ def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
                             break
                         page.wait_for_timeout(400)
 
+                print(f"[_resolve_gadgetsweb_playwright] Final URL: {final_url}")
                 browser.close()
 
             if not final_url:
@@ -2183,8 +2196,12 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
         r2_text = None
         try:
-            r2 = _get(crypto_url, timeout=20)
-            r2_text = r2.text
+            # We don't use _get here because cryptoinsights.site has broken SSL
+            # and cloudscraper/requests both fail on it locally.
+            # However, if ScraperAPI is enabled, it works.
+            if SCRAPER_API_KEY:
+                r2 = _get(crypto_url, timeout=20)
+                r2_text = r2.text
         except Exception:
             pass
 
