@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 import urllib.parse
 import warnings
@@ -25,7 +24,6 @@ from urllib.parse import urlparse
 
 import requests
 import urllib3
-import cloudscraper
 from bs4 import BeautifulSoup
 
 try:
@@ -35,9 +33,6 @@ except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
 log = logging.getLogger(__name__)
-
-# Serialize gadgetsweb Playwright resolves — parallel Chromium jobs often fail or return empty.
-_PLAYWRIGHT_GW_LOCK = threading.Lock()
 
 # If set, all movie requests are routed through ScraperAPI (bypasses Cloudflare on cloud hosts)
 # Sign up free at https://www.scraperapi.com  — 5,000 req/month free
@@ -69,46 +64,29 @@ HEADERS = {
 # Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
 _NO_VERIFY_HOSTS = {"4khdhub.link", "cryptoinsights.site", "hblinks.org"}
 
-# Per-host persistent cloudscraper sessions (handles Cloudflare JS challenges)
-_sessions: dict[str, cloudscraper.CloudScraper] = {}
+# Per-host persistent sessions so cookies are carried across requests
+_sessions: dict[str, requests.Session] = {}
 
 
-def _session_for(host: str) -> cloudscraper.CloudScraper:
+def _session_for(host: str) -> requests.Session:
     if host not in _sessions:
-        s = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "desktop": True},
-        )
+        s = requests.Session()
         s.headers.update(HEADERS)
         _sessions[host] = s
     return _sessions[host]
 
 
-class _PlaywrightResponse:
-    """Minimal response wrapper so Playwright-rendered HTML can be returned
-    from _get() with the same interface as requests.Response."""
-
-    def __init__(self, text: str, url: str):
-        self.text = text
-        self.content = text.encode("utf-8")
-        self.status_code = 200
-        self.url = url
-        self.headers = {}
-
-    def json(self):
-        import json as _json
-        return _json.loads(self.text)
-
-
 def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
-    """GET with Cloudflare bypass via cloudscraper + Playwright fallback.
+    """GET with browser headers, persistent session (cookies), SSL bypass for known hosts.
 
-    Priority:
-    1. ScraperAPI (if SCRAPER_API_KEY is set — paid, fastest)
-    2. cloudscraper (free, handles most Cloudflare JS challenges)
-    3. Playwright headless (free, handles Turnstile/Bot-Fight-Mode)
+    When SCRAPER_API_KEY is set (recommended for cloud deployments), all requests
+    are routed through ScraperAPI which bypasses Cloudflare / geo-blocks automatically.
     """
-    # ── ScraperAPI mode (optional premium path) ───────────────────────────────
+    # ── ScraperAPI mode ──────────────────────────────────────────────────────
     if SCRAPER_API_KEY:
+        # If the caller passed query params (e.g. search functions), bake them
+        # into the URL first — ScraperAPI uses its own `params` dict so we
+        # cannot pass two separate `params` kwargs to requests.get().
         caller_params = kwargs.pop("params", None)
         if caller_params:
             encoded = urllib.parse.urlencode(caller_params)
@@ -137,45 +115,29 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                     time.sleep(2 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    # ── cloudscraper mode (free Cloudflare bypass) ────────────────────────────
+    # ── Direct mode (local / non-blocked network) ────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
-    no_verify = host in _NO_VERIFY_HOSTS
-
-    # cloudscraper doesn't support verify=False properly; use plain requests
-    # for hosts with known SSL issues (they don't need Cloudflare bypass anyway)
-    if no_verify:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-    else:
-        session = _session_for(host)
+    verify = host not in _NO_VERIFY_HOSTS
+    session = _session_for(host)
 
     ctx = warnings.catch_warnings()
     ctx.__enter__()
-    if no_verify:
+    if not verify:
         warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
 
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            resp = session.get(url, verify=not no_verify, **kwargs)
+            resp = session.get(url, verify=verify, **kwargs)
             if resp.status_code in (403, 429, 503) and attempt < retries:
                 log.warning("_get %s → HTTP %s (attempt %d), retrying…", url, resp.status_code, attempt + 1)
                 time.sleep(1.5 * (attempt + 1))
-                if not no_verify:
-                    _sessions.pop(host, None)
-                    session = _session_for(host)
+                _sessions.pop(host, None)
+                session = _session_for(host)
                 continue
             if resp.status_code not in (200, 301, 302):
                 log.warning("_get %s → HTTP %s", url, resp.status_code)
             ctx.__exit__(None, None, None)
-
-            # If still blocked after retries, try Playwright as last resort
-            if resp.status_code in (403, 503) and _PLAYWRIGHT_AVAILABLE:
-                log.info("_get %s → cloudscraper blocked (%d), falling back to Playwright",
-                         url, resp.status_code)
-                rendered = _get_rendered_html(url, timeout=25, wait_ms=5000)
-                if rendered:
-                    return _PlaywrightResponse(rendered, url)  # type: ignore[return-value]
             return resp
         except Exception as exc:
             last_exc = exc
@@ -184,14 +146,6 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                 time.sleep(1.5 * (attempt + 1))
 
     ctx.__exit__(None, None, None)
-
-    # Final fallback: Playwright for network errors too (e.g. SSL failures)
-    if _PLAYWRIGHT_AVAILABLE:
-        log.info("_get %s → all attempts failed, trying Playwright", url)
-        rendered = _get_rendered_html(url, timeout=25, wait_ms=5000)
-        if rendered:
-            return _PlaywrightResponse(rendered, url)  # type: ignore[return-value]
-
     raise last_exc  # type: ignore[misc]
 
 
@@ -208,8 +162,7 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
+            page = browser.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(wait_ms)
             html = page.content()
@@ -1964,138 +1917,111 @@ def _check_for_final_link(page) -> str | None:
     return None
 
 
-def _gw_hblinks_href_from_ctas(page) -> str | None:
-    """Mediator sites expose the real archive link on #verify_btn / .get-link href."""
-    for sel in ("#verify_btn", "a.get-link"):
-        try:
-            el = page.query_selector(sel)
-            if not el:
-                continue
-            href = (el.get_attribute("href") or "").strip()
-            if href.startswith("http") and "hblinks" in href.lower():
-                return href
-        except Exception:
-            continue
-    return None
-
-
-def _gw_countdown_visible(page) -> bool:
-    """True when the mediator countdown overlay is shown (not .hidden)."""
-    try:
-        return bool(page.evaluate("""() => {
-          const cd = document.querySelector('#countdown');
-          if (cd && !cd.classList.contains('hidden')) return true;
-          const el = document.querySelector('#timer');
-          return !!(el && el.offsetParent !== null && /\\d/.test((el.textContent||'').trim()));
-        }"""))
-    except Exception:
-        return False
-
-
 def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
-    """Navigate gadgetsweb URL in a real browser; click through mediator pages;
-    extract hblinks.org URL from CTA buttons; scrape final HubDrive/HubCloud links.
+    """Navigate gadgetsweb URL in a real browser and automatically bypass any
+    intermediate mediator/redirect pages to reach the final download links.
 
-    Runs under a global lock so parallel episode resolves don't spawn competing
-    Chromium instances (that commonly yielded empty results and gadgetsweb URLs).
+    This is generic and future-proof: it doesn't depend on specific element IDs
+    or domain names. It detects mediator pages by looking for 'continue/verify'
+    buttons, handles countdowns/timers, and keeps trying until it reaches a
+    known file host (hblinks, hubcloud, etc.).
+
+    Returns list of {"label": str, "url": str} for file-host links found.
     """
     if not _PLAYWRIGHT_AVAILABLE:
         return []
 
     try:
-        with _PLAYWRIGHT_GW_LOCK:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(ignore_https_errors=True)
-                page = context.new_page()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
 
-                page.goto(gw_url, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(2500)
+            page.goto(gw_url, wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(3000)
 
-                try:
-                    page.wait_for_selector("#verify_btn, a.get-link", timeout=12000)
-                except Exception:
-                    pass
+            final_url = None
 
-                final_url: str | None = None
+            # Adaptive loop: keep clicking through mediator pages (max 60s total)
+            for overall_attempt in range(6):
+                current_host = urlparse(page.url).netloc.lower()
 
-                for _round in range(4):
-                    cur_host = urlparse(page.url).netloc.lower()
-                    print(f"[_resolve_gadgetsweb_playwright] Round {_round}, url={page.url}")
-                    if any(kw in cur_host for kw in _FINAL_HOST_KEYWORDS):
-                        final_url = page.url
+                # Check if we already landed on a final destination
+                if any(kw in current_host for kw in _FINAL_HOST_KEYWORDS):
+                    final_url = page.url
+                    break
+
+                # Scan page for a link pointing to a final host
+                found = _check_for_final_link(page)
+                if found:
+                    final_url = found
+                    break
+
+                # Find and click mediator button
+                btn = _find_mediator_button(page)
+                if not btn:
+                    # No button found; wait a bit and try once more
+                    page.wait_for_timeout(3000)
+                    btn = _find_mediator_button(page)
+                    if not btn:
                         break
 
-                    found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
+                btn.click()
+                page.wait_for_timeout(2000)
+
+                # After click: check if a countdown/timer appeared
+                # Generic detection: look for any visible element with timer-like content
+                has_countdown = page.evaluate('''() => {
+                    const selectors = ['#countdown', '[class*="countdown"]', '[class*="timer"]',
+                                       '[id*="countdown"]', '[id*="timer"]', '.loader'];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetParent !== null) return true;
+                    }
+                    return false;
+                }''')
+
+                if has_countdown:
+                    # Wait for countdown (up to 15s — covers most 5-10s timers)
+                    page.wait_for_timeout(15000)
+
+                    # After countdown, check if button now has a final link
+                    found = _check_for_final_link(page)
                     if found:
-                        print(f"[_resolve_gadgetsweb_playwright] Found final link before click: {found}")
                         final_url = found
                         break
 
-                    btn = (
-                        page.query_selector("#verify_btn")
-                        or page.query_selector("a.get-link")
-                        or _find_mediator_button(page)
-                    )
-                    if btn and btn.is_visible():
-                        print(f"[_resolve_gadgetsweb_playwright] Found button, clicking...")
-                        try:
-                            btn.click(timeout=5000)
-                        except Exception as e:
-                            print(f"[_resolve_gadgetsweb_playwright] Click error: {e}")
-                            pass
-                    else:
-                        print(f"[_resolve_gadgetsweb_playwright] No button found!")
+                    # Check if the same button's href updated
+                    btn = _find_mediator_button(page)
+                    if btn:
+                        href = btn.get_attribute("href") or ""
+                        if href.startswith("http"):
+                            host = urlparse(href).netloc.lower()
+                            if any(kw in host for kw in _FINAL_HOST_KEYWORDS) or "hblinks" in host:
+                                final_url = href
+                                break
+                else:
+                    # No countdown — maybe ad popup opened; wait and retry
                     page.wait_for_timeout(2000)
 
-                    if _gw_countdown_visible(page):
-                        print(f"[_resolve_gadgetsweb_playwright] Countdown visible, waiting 13s...")
-                        page.wait_for_timeout(13000)
-                    else:
-                        print(f"[_resolve_gadgetsweb_playwright] Countdown NOT visible.")
-
-                    found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
-                    if found:
-                        print(f"[_resolve_gadgetsweb_playwright] Found final link after click/wait: {found}")
-                        final_url = found
-                        break
-
-                # Poll — href updates asynchronously after countdown
-                if not final_url:
-                    print(f"[_resolve_gadgetsweb_playwright] Polling for final link...")
-                    for _ in range(50):
-                        found = _gw_hblinks_href_from_ctas(page) or _check_for_final_link(page)
-                        if found:
-                            print(f"[_resolve_gadgetsweb_playwright] Found final link during poll: {found}")
-                            final_url = found
-                            break
-                        cur_host = urlparse(page.url).netloc.lower()
-                        if "hblinks" in cur_host:
-                            final_url = page.url
-                            break
-                        page.wait_for_timeout(400)
-
-                print(f"[_resolve_gadgetsweb_playwright] Final URL: {final_url}")
-                browser.close()
+            browser.close()
 
             if not final_url:
                 return []
 
+            # If it's an hblinks page, fetch and scrape it via HTTP
             if "hblinks" in urlparse(final_url).netloc.lower():
                 try:
-                    hn = (urlparse(final_url).hostname or "").lower()
-                    verify_h = hn not in _NO_VERIFY_HOSTS and "hblinks.org" not in hn
-                    with warnings.catch_warnings():
-                        if not verify_h:
-                            warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
-                        r = requests.get(final_url, timeout=25, verify=verify_h, headers=HEADERS)
-                    links = _scrape_hblinks_page(r.text)
-                    if links:
-                        return links
+                    r = requests.get(
+                        final_url, timeout=20, verify=False,
+                        headers=HEADERS,
+                    )
+                    return _scrape_hblinks_page(r.text)
                 except Exception as exc:
                     log.debug("_resolve_gadgetsweb_playwright hblinks fetch failed: %s", exc)
-                return [{"label": "HBLinks Page", "url": final_url}]
+                    return [{"label": "HBLinks Page", "url": final_url}]
 
+            # Direct file-host link
             domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
             return [{"label": f"{domain_hint} Download", "url": final_url}]
 
@@ -2196,12 +2122,8 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
         r2_text = None
         try:
-            # We don't use _get here because cryptoinsights.site has broken SSL
-            # and cloudscraper/requests both fail on it locally.
-            # However, if ScraperAPI is enabled, it works.
-            if SCRAPER_API_KEY:
-                r2 = _get(crypto_url, timeout=20)
-                r2_text = r2.text
+            r2 = _get(crypto_url, timeout=20)
+            r2_text = r2.text
         except Exception:
             pass
 
@@ -2244,7 +2166,7 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_resolve_gadgetsweb, raw_links[i]["url"]): i
                    for i in gw_indices}
-        for fut in as_completed(futures):
+        for fut in as_completed(futures, timeout=90):
             i = futures[fut]
             try:
                 resolved[i] = fut.result()
