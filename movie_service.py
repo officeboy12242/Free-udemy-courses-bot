@@ -1853,20 +1853,17 @@ _FINAL_HOST_KEYWORDS = {
 
 _MEDIATOR_BTN_SELECTORS = [
     "#verify_btn",
-    "a.get-link",
-    "a.btn-primary",
-    "a[class*='get-link']",
-    "a[class*='continue']",
-    "button.get-link",
-    "button[class*='continue']",
+    "#verify_button",
+    "#verify_button2",
     "#btn_download",
     "#downloadButton",
-    "a[id*='verify']",
-    "a[id*='download']",
-    "a[id*='continue']",
-    "button[id*='verify']",
-    "button[id*='download']",
-    "button[id*='continue']",
+    "a.get-link",
+    "a.btn-primary",
+    "[class*='get-link']",
+    "[class*='continue']",
+    "[id*='verify']",
+    "[id*='download']",
+    "[id*='continue']",
 ]
 
 _MEDIATOR_BTN_TEXTS = [
@@ -1874,20 +1871,21 @@ _MEDIATOR_BTN_TEXTS = [
     "download", "generate", "get download", "click to continue",
 ]
 
-
 def _find_mediator_button(page):
     """Find a clickable 'continue/verify/get-link' button on any mediator page.
 
     Tries known selectors first, then falls back to text-matching any
-    visible anchor/button whose text matches common mediator patterns.
+    visible anchor/button/span/div whose text matches common mediator patterns.
     """
     for sel in _MEDIATOR_BTN_SELECTORS:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            return el
+        # Some selectors might match multiple elements, find the first visible one
+        elements = page.query_selector_all(sel)
+        for el in elements:
+            if el.is_visible():
+                return el
 
-    # Fallback: search all visible <a> and <button> elements by text content
-    for tag in ("a", "button"):
+    # Fallback: search all visible elements by text content
+    for tag in ("a", "button", "span", "div"):
         elements = page.query_selector_all(tag)
         for el in elements:
             if not el.is_visible():
@@ -2543,3 +2541,330 @@ def format_hdhub_message(movie_title: str, data: dict, footer: bool = True) -> s
         lines.append("\u2501" * 32)
         lines.append("\u26a1 <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MoviesMod  (https://moviesmod.farm/)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MOVIESMOD_BASE = os.getenv("MOVIESMOD_BASE_URL", "https://moviesmod.farm")
+
+def _resolve_modpro_blog(url: str) -> str:
+    """
+    Resolves episodes.modpro.blog links to their final destination.
+    Flow:
+    1. GET modpro.blog -> extract sid_url (cloud.unblockedgames.world)
+    2. GET sid_url -> extract form1
+    3. POST form1 -> extract form2
+    4. POST form2 -> extract s_343 cookie and ?go= URL
+    5. GET ?go= URL -> extract refresh URL
+    6. GET refresh URL -> extract window.location.replace URL
+    7. GET replace URL -> extract final download links (video-seed.pro, tgseed.link)
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
+    for attempt in range(3):
+        session = requests.Session()
+        session.headers.update(headers)
+        
+        try:
+            # 1. Fetch modpro.blog
+            r1 = session.get(url, verify=False, timeout=15)
+            soup1 = BeautifulSoup(r1.text, 'html.parser')
+            sid_url = None
+            for a in soup1.find_all('a', href=True):
+                if 'cloud.unblockedgames.world/?sid=' in a['href']:
+                    sid_url = a['href']
+                    break
+                    
+            if not sid_url:
+                log.warning("No sid_url found on %s (attempt %d)", url, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            # 2. Fetch sid_url (GET)
+            r2 = session.get(sid_url, verify=False, timeout=15)
+            soup2 = BeautifulSoup(r2.text, 'html.parser')
+            form1 = soup2.find('form', id='landing')
+            if not form1:
+                log.warning("No form1 found on %s (attempt %d)", sid_url, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            action1 = form1.get('action')
+            data1 = {inp.get('name'): inp.get('value') for inp in form1.find_all('input')}
+            
+            # 3. POST form1
+            r3 = session.post(action1, data=data1, verify=False, timeout=15)
+            soup3 = BeautifulSoup(r3.text, 'html.parser')
+            form2 = soup3.find('form', id='landing')
+            if not form2:
+                log.warning("No form2 found on %s (attempt %d)", action1, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            action2 = form2.get('action')
+            data2 = {inp.get('name'): inp.get('value') for inp in form2.find_all('input')}
+            
+            # 4. POST form2
+            r4 = session.post(action2, data=data2, verify=False, timeout=15)
+            
+            # Extract cookie
+            m_cookie = re.search(r"s_343\('([^']+)',\s*'([^']+)'", r4.text)
+            if m_cookie:
+                c_name = m_cookie.group(1)
+                c_value = m_cookie.group(2)
+                session.cookies.set(c_name, c_value, domain='cloud.unblockedgames.world')
+                
+            # 5. Extract ?go= link
+            m = re.search(r'setAttribute\("href","([^"]+)"\)', r4.text)
+            if not m:
+                log.warning("No go_url found on %s (attempt %d)", action2, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            go_url = m.group(1)
+            
+            # 6. Fetch go_url
+            r5 = session.get(go_url, verify=False, timeout=15)
+            
+            # 7. Extract refresh URL
+            m_refresh = re.search(r'url=([^"]+)', r5.text)
+            if not m_refresh:
+                log.warning("No refresh_url found on %s (attempt %d)", go_url, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            refresh_url = m_refresh.group(1)
+            
+            # 8. Fetch refresh_url
+            r6 = session.get(refresh_url, verify=False, timeout=15)
+            
+            # 9. Extract replace URL
+            m_replace = re.search(r'window\.location\.replace\("([^"]+)"\)', r6.text)
+            if not m_replace:
+                log.warning("No replace_url found on %s (attempt %d)", refresh_url, attempt + 1)
+                import time
+                time.sleep(1)
+                continue
+                
+            replace_url = m_replace.group(1)
+            if replace_url.startswith('/'):
+                from urllib.parse import urljoin
+                replace_url = urljoin(r6.url, replace_url)
+                
+            # 10. Fetch final page
+            r7 = session.get(replace_url, verify=False, timeout=15)
+            soup7 = BeautifulSoup(r7.text, 'html.parser')
+            
+            final_links = []
+            for a in soup7.find_all('a', href=True):
+                text = a.get_text(strip=True).lower()
+                href = a['href']
+                if 'instant download' in text or 'telegram file' in text or 'direct' in text:
+                    final_links.append(href)
+                    
+            if final_links:
+                return "\n".join(final_links)
+                
+            return r7.url
+            
+        except Exception as e:
+            log.error("Error resolving modpro blog %s (attempt %d): %s", url, attempt + 1, e)
+            import time
+            time.sleep(1)
+            
+    return url
+
+def moviesmod_movie_links(movie_url: str) -> dict:
+    """
+    Scrapes moviesmod.farm for download links.
+    Returns a dict:
+      {
+        "title": "Movie Title",
+        "links": [
+           {"label": "Season 1 [200MB] - Episode Links", "url": "final_url_1\nfinal_url_2"},
+           ...
+        ]
+      }
+    """
+    try:
+        resp = _get(movie_url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("moviesmod_movie_links %s failed: %s", movie_url, exc)
+        return {"title": "Error", "links": []}
+
+    # Title
+    title_tag = soup.find('h1')
+    title = title_tag.get_text(strip=True) if title_tag else "MoviesMod Content"
+    
+    content = soup.select_one("main, .entry-content, article") or soup
+    
+    links = []
+    current_header = ""
+    
+    for tag in content.find_all(['h2', 'h3', 'a']):
+        if tag.name in ['h2', 'h3']:
+            text = tag.get_text(strip=True)
+            # Ignore some common non-link headers
+            if text.lower() not in ['series info:', 'storyline:', 'screenshots:', 'related posts', 'search movies', 'categories']:
+                current_header = text
+        elif tag.name == 'a':
+            href = tag.get('href', '')
+            text = tag.get_text(strip=True)
+            
+            if 'episodes.modpro.blog' in href:
+                label = f"{current_header} - {text}" if current_header else text
+                links.append({"label": label, "url": href})
+            elif 'uhdmovies.foo' in href:
+                label = f"{current_header} - {text}" if current_header else text
+                links.append({"label": label, "url": href})
+                
+    # Now resolve the links in parallel
+    resolved_links = []
+    
+    def _resolve_link(item):
+        url = item['url']
+        if 'episodes.modpro.blog' in url:
+            resolved_url = _resolve_modpro_blog(url)
+        else:
+            resolved_url = url
+        return {"label": item['label'], "url": resolved_url}
+        
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_resolve_link, item) for item in links]
+        for future in as_completed(futures, timeout=120):
+            try:
+                res = future.result()
+                if res['url']:
+                    resolved_links.append(res)
+            except Exception as e:
+                log.error("Error resolving moviesmod link: %s", e)
+                
+    # Sort to maintain some order (maybe by label)
+    resolved_links.sort(key=lambda x: x['label'])
+    
+    return {
+        "title": title,
+        "links": resolved_links
+    }
+
+
+def format_moviesmod_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format a MoviesMod result as HTML for Telegram."""
+    links = data.get("links", [])
+    
+    lines: list[str] = []
+    disp = movie_title or data.get("title", "")
+    if disp:
+        lines.append(f"🎬 <b>{disp}</b>")
+        
+    if not links:
+        if lines:
+            lines.append("\n❌ No download links parsed.")
+        return "\n".join(lines) if lines else ""
+        
+    zip_links = []
+    ep_links = []
+    other_links = []
+    
+    for lk in links:
+        lbl = lk.get("label", "").lower()
+        if "batch" in lbl or "zip" in lbl:
+            zip_links.append(lk)
+        elif "episode" in lbl:
+            ep_links.append(lk)
+        else:
+            other_links.append(lk)
+            
+    def _render_links(link_list):
+        out = []
+        for lk in link_list:
+            label = lk.get("label", "Download")
+            url_ = lk.get("url", "")
+            
+            out.append(f"📦 <b>{label}</b>")
+            
+            parts = []
+            for u in url_.split('\n'):
+                if 'tgseed.link' in u:
+                    parts.append(f"<a href='{u}'>Telegram File</a>")
+                elif 'video-seed.pro' in u or 'cdn.video-gen.xyz' in u:
+                    parts.append(f"<a href='{u}'>Direct Download</a>")
+                elif 'driveseed.org' in u:
+                    parts.append(f"<a href='{u}'>DriveSeed</a>")
+                elif 'uhdmovies.foo' in u:
+                    parts.append(f"<a href='{u}'>UHDMovies</a>")
+                else:
+                    parts.append(f"<a href='{u}'>Download</a>")
+                    
+            out.append("   🔗 " + " · ".join(parts))
+        return out
+
+    if zip_links:
+        lines.append("\n" + "━" * 32)
+        lines.append("🗂 <b>Batch / ZIP Download</b>\n")
+        lines.extend(_render_links(zip_links))
+        
+    if ep_links:
+        lines.append("\n" + "━" * 32)
+        lines.append("📺 <b>Episode-wise Download</b>\n")
+        lines.extend(_render_links(ep_links))
+        
+    if other_links:
+        lines.append("\n" + "━" * 32)
+        lines.append("📥 <b>Download Links</b>\n")
+        lines.extend(_render_links(other_links))
+        
+    if footer:
+        lines.append("\n" + "━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+        
+    return "\n".join(lines)
+
+
+def _moviesmod_parse_listing(soup: BeautifulSoup, limit: int) -> list[dict]:
+    movies: list[dict] = []
+    for art in soup.select("article"):
+        if len(movies) >= limit:
+            break
+        title_a = art.select_one(".entry-title a, h2 a, h3 a")
+        if not title_a:
+            continue
+        title = title_a.get_text(strip=True)
+        link  = title_a.get("href", "")
+        img   = art.select_one("img")
+        poster = img.get("src", "") or img.get("data-src", "") if img else ""
+        if link:
+            movies.append({"title": title, "url": link, "poster": poster, "source": "moviesmod"})
+    return movies
+
+def moviesmod_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
+    """Fetch latest movies from moviesmod.farm with WordPress /page/N/ pagination."""
+    url = MOVIESMOD_BASE + "/" if page == 1 else f"{MOVIESMOD_BASE}/page/{page}/"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("moviesmod_latest_movies page=%d failed: %s", page, exc)
+        return []
+    return _moviesmod_parse_listing(soup, limit)
+
+def moviesmod_search(query: str, limit: int = 10) -> list[dict]:
+    """Search moviesmod.farm using the WordPress ?s= parameter."""
+    url = f"{MOVIESMOD_BASE}/?s={urllib.parse.quote(query)}"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("moviesmod_search '%s' failed: %s", query, exc)
+        return []
+    return _moviesmod_parse_listing(soup, limit)
