@@ -26,6 +26,12 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
 log = logging.getLogger(__name__)
 
 # If set, all movie requests are routed through ScraperAPI (bypasses Cloudflare on cloud hosts)
@@ -141,6 +147,28 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
 
     ctx.__exit__(None, None, None)
     raise last_exc  # type: ignore[misc]
+
+
+def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 5000) -> str | None:
+    """Fetch a page using Playwright headless Chromium for full JS rendering.
+
+    Returns the rendered HTML string, or None if Playwright is unavailable or fails.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        log.warning("Playwright not installed — cannot render JS for %s", url)
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            page.wait_for_timeout(wait_ms)
+            html = page.content()
+            browser.close()
+        return html
+    except Exception as exc:
+        log.error("Playwright render failed for %s: %s", url, exc)
+        return None
 
 
 # ─── 4KHDHub ────────────────────────────────────────────────────────────────
@@ -1862,6 +1890,7 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
     extract the 'id' query param and call cryptoinsights.site directly, cutting
     one network hop and skipping gadgetsweb's IP-based blocking entirely.
     All HTTP calls go through _get() so ScraperAPI is used when configured.
+    Falls back to Playwright for JS-rendered resolution when HTTP fails.
     """
     try:
         # Extract the 'id' param from the gadgetsweb URL
@@ -1873,8 +1902,21 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
 
         # Step 1: Go directly to cryptoinsights with the same id (skip gadgetsweb hop)
         crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
-        r2 = _get(crypto_url, timeout=20)
-        m = re.search(r"s\('o','([^']+)'", r2.text)
+        r2_text = None
+        try:
+            r2 = _get(crypto_url, timeout=20)
+            r2_text = r2.text
+        except Exception:
+            pass
+
+        # If HTTP failed, try Playwright
+        if r2_text is None and _PLAYWRIGHT_AVAILABLE:
+            r2_text = _get_rendered_html(crypto_url, timeout=20, wait_ms=3000)
+
+        if not r2_text:
+            return []
+
+        m = re.search(r"s\('o','([^']+)'", r2_text)
         if not m:
             return []
 
@@ -2079,12 +2121,40 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
           "is_series": bool,
         }
     """
+    soup = None
     try:
         resp = _get(movie_url, timeout=25)
         soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as exc:
-        log.error("hdhub_movie_links %s failed: %s", movie_url, exc)
-        return {"poster": "", "info": {}, "links": [], "episodes": [], "is_series": False}
+        log.warning("hdhub_movie_links initial fetch %s failed: %s", movie_url, exc)
+
+    # Check if the static fetch found any episode/download links;
+    # if not, fall back to Playwright (JS rendering).
+    _needs_playwright = False
+    if soup is not None:
+        _test_content = soup.select_one("main.page-body, .entry-content, article") or soup
+        _test_headings = _test_content.find_all(["h2", "h3", "h4"])
+        _has_dl_section = any("download links" in h.get_text(strip=True).lower() for h in _test_headings)
+        _found_links = False
+        if _has_dl_section:
+            for h in _test_headings:
+                if h.find("a", href=True) and h.find("a", href=True)["href"].startswith("http"):
+                    ht = h.get_text(strip=True)
+                    if re.search(r"EP(?:i?SODE)?\s*\d+", ht, re.I) or re.search(r"(4K|2160|1080|720|480)", ht):
+                        _found_links = True
+                        break
+        if not _found_links:
+            _needs_playwright = True
+    else:
+        _needs_playwright = True
+
+    if _needs_playwright:
+        log.info("hdhub_movie_links: no links in static HTML, trying Playwright for %s", movie_url)
+        rendered_html = _get_rendered_html(movie_url, timeout=30, wait_ms=5000)
+        if rendered_html:
+            soup = BeautifulSoup(rendered_html, "html.parser")
+        elif soup is None:
+            return {"poster": "", "info": {}, "links": [], "episodes": [], "is_series": False}
 
     og = soup.find("meta", property="og:image")
     poster = _hdhub_clean_poster(og.get("content", "")) if og else ""
