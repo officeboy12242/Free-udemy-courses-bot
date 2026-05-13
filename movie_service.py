@@ -62,7 +62,7 @@ HEADERS = {
 }
 
 # Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
-_NO_VERIFY_HOSTS = {"4khdhub.link"}
+_NO_VERIFY_HOSTS = {"4khdhub.link", "cryptoinsights.site", "hblinks.org"}
 
 # Per-host persistent sessions so cookies are carried across requests
 _sessions: dict[str, requests.Session] = {}
@@ -1844,6 +1844,130 @@ def format_bollyflix_message(movie_title: str, data: dict[str, Any], footer: boo
 
 _GW_AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site"}
 
+_FINAL_HOST_KEYWORDS = {
+    "hubcloud", "hubdrive", "gofile", "pixeldrain", "mediafire",
+    "gdrive", "filepress", "gdflix", "fastdl", "megaup",
+    "drive.google", "hblinks",
+}
+
+
+def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
+    """Navigate gadgetsweb URL in a real browser, click through the mediator page,
+    wait for the countdown, and extract the final hblinks URL.
+
+    Flow: gadgetsweb → mediator page (click verify twice, wait countdown) → hblinks → scrape
+    Returns list of {"label": str, "url": str} for file-host links found.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+
+            page.goto(gw_url, wait_until="domcontentloaded", timeout=15000)
+
+            # Wait for the verify button to appear on the mediator page
+            try:
+                page.wait_for_selector("#verify_btn", timeout=10000)
+            except Exception:
+                # If no verify button, check if we landed directly on a final page
+                current_host = urlparse(page.url).netloc.lower()
+                if any(kw in current_host for kw in _FINAL_HOST_KEYWORDS):
+                    pass  # Will be handled below
+                else:
+                    browser.close()
+                    return []
+
+            # Click verify button multiple times to get past ads
+            hblinks_url = None
+            for attempt in range(4):
+                btn = page.query_selector("#verify_btn")
+                if not btn:
+                    break
+
+                # Check if button already has the final link
+                href = btn.get_attribute("href") or ""
+                if href.startswith("http") and "hblinks" in href:
+                    hblinks_url = href
+                    break
+
+                btn.click()
+                page.wait_for_timeout(1500)
+
+                # Check if countdown started
+                countdown_visible = page.evaluate(
+                    'document.querySelector("#countdown") && '
+                    '!document.querySelector("#countdown").classList.contains("hidden")'
+                )
+                if countdown_visible:
+                    # Wait for countdown to finish (12s covers the 10s timer + buffer)
+                    page.wait_for_timeout(12000)
+
+                    # After countdown, button should have the final href
+                    btn = page.query_selector("#verify_btn")
+                    if btn:
+                        href = btn.get_attribute("href") or ""
+                        if href.startswith("http") and "hblinks" in href:
+                            hblinks_url = href
+                    break
+
+            browser.close()
+
+            # If we got an hblinks URL, fetch it via HTTP (faster & more reliable)
+            if hblinks_url:
+                try:
+                    r = requests.get(
+                        hblinks_url, timeout=20, verify=False,
+                        headers=HEADERS,
+                    )
+                    return _scrape_hblinks_page(r.text)
+                except Exception as exc:
+                    log.debug("_resolve_gadgetsweb_playwright hblinks fetch failed: %s", exc)
+                    return [{"label": "HBLinks Page", "url": hblinks_url}]
+
+            return []
+    except Exception as exc:
+        log.debug("_resolve_gadgetsweb_playwright %s failed: %s", gw_url, exc)
+        return []
+
+
+def _scrape_hblinks_page(html: str) -> list[dict]:
+    """Extract file-host download links from an hblinks.org page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    page_title = soup.title.string if soup.title else ""
+    q_hint = ""
+    q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
+    if q_m:
+        q_hint = q_m.group(1)
+
+    links: list[dict] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http") or "hblinks" in href or href in seen:
+            continue
+        seen.add(href)
+        txt = a.get_text(strip=True)
+        if not txt:
+            domain = urlparse(href).netloc
+            if "hubcloud" in domain:
+                txt = "HubCloud"
+            elif "hubdrive" in domain:
+                txt = "HubDrive"
+            elif "gofile" in domain:
+                txt = "GoFile"
+            else:
+                txt = domain.split(".")[0].capitalize()
+        if q_hint:
+            txt = f"{q_hint} - {txt}"
+        links.append({"label": txt, "url": href})
+    return links
+
+
 def _rot13(s: str) -> str:
     out = []
     for c in s:
@@ -1887,22 +2011,18 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
     Resolve a gadgetsweb.xyz ad-gate URL to its final direct download links.
     Returns a list of {"label": str, "url": str} dicts.  On failure returns [].
 
-    Optimisation for cloud deployments (Render etc.):
-    Instead of following the gadgetsweb → 302 → cryptoinsights redirect, we
-    extract the 'id' query param and call cryptoinsights.site directly, cutting
-    one network hop and skipping gadgetsweb's IP-based blocking entirely.
-    All HTTP calls go through _get() so ScraperAPI is used when configured.
-    Falls back to Playwright for JS-rendered resolution when HTTP fails.
+    Strategy:
+    1. Fast path: HTTP-based decode (works on Render with ScraperAPI)
+    2. Fallback: Playwright navigates the full redirect chain like a real browser
     """
+    # ── Fast path: HTTP decode ────────────────────────────────────────────────
     try:
-        # Extract the 'id' param from the gadgetsweb URL
         parsed = urlparse(gw_url)
         qs = urllib.parse.parse_qs(parsed.query)
         gw_id = qs.get("id", [None])[0]
         if not gw_id:
-            return []
+            return _resolve_gadgetsweb_playwright(gw_url)
 
-        # Step 1: Go directly to cryptoinsights with the same id (skip gadgetsweb hop)
         crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
         r2_text = None
         try:
@@ -1911,62 +2031,27 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         except Exception:
             pass
 
-        # If HTTP failed, try Playwright
-        if r2_text is None and _PLAYWRIGHT_AVAILABLE:
-            r2_text = _get_rendered_html(crypto_url, timeout=20, wait_ms=3000)
-
-        if not r2_text:
-            return []
-
-        m = re.search(r"s\('o','([^']+)'", r2_text)
-        if not m:
-            return []
-
-        # Step 2: Decode locally — no network needed
-        final_url = _decode_gw_o(m.group(1))
-        if not final_url:
-            return []
-
-        # Step 3a: hblinks.org → scrape HubCloud/HubDrive/GoFile links
-        if "hblinks.org" in final_url:
-            r3 = _get(final_url, timeout=20)
-            soup = BeautifulSoup(r3.text, "html.parser")
-
-            page_title = soup.title.string if soup.title else ""
-            q_hint = ""
-            q_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", page_title, re.I)
-            if q_m:
-                q_hint = q_m.group(1)
-
-            links: list[dict] = []
-            seen_hrefs: set[str] = set()
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if not href.startswith("http") or "hblinks" in href or href in seen_hrefs:
-                    continue
-                seen_hrefs.add(href)
-                txt = a.get_text(strip=True)
-                if not txt:
-                    domain = urlparse(href).netloc
-                    if "hubcloud" in domain:
-                        txt = "HubCloud"
-                    elif "hubdrive" in domain:
-                        txt = "HubDrive"
-                    elif "gofile" in domain:
-                        txt = "GoFile"
+        if r2_text:
+            m = re.search(r"s\('o','([^']+)'", r2_text)
+            if m:
+                final_url = _decode_gw_o(m.group(1))
+                if final_url:
+                    if "hblinks.org" in final_url:
+                        try:
+                            r3 = _get(final_url, timeout=20)
+                            links = _scrape_hblinks_page(r3.text)
+                            if links:
+                                return links
+                        except Exception:
+                            pass
                     else:
-                        txt = domain.split(".")[0].capitalize()
-                if q_hint:
-                    txt = f"{q_hint} – {txt}"
-                links.append({"label": txt, "url": href})
-            return links
-
-        # Step 3b: Any other resolved URL — return as direct link
-        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
-        return [{"label": f"🌐 {domain_hint} Pack", "url": final_url}]
+                        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
+                        return [{"label": f"{domain_hint} Download", "url": final_url}]
     except Exception as exc:
-        log.debug("_resolve_gadgetsweb %s failed: %s", gw_url, exc)
-        return []
+        log.debug("_resolve_gadgetsweb HTTP path %s failed: %s", gw_url, exc)
+
+    # ── Fallback: Playwright full redirect chain ──────────────────────────────
+    return _resolve_gadgetsweb_playwright(gw_url)
 
 
 def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
@@ -1985,7 +2070,7 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_resolve_gadgetsweb, raw_links[i]["url"]): i
                    for i in gw_indices}
-        for fut in as_completed(futures, timeout=30):
+        for fut in as_completed(futures, timeout=90):
             i = futures[fut]
             try:
                 resolved[i] = fut.result()
