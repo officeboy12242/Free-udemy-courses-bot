@@ -885,7 +885,7 @@ def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 
 def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
-    """Format movies4u.ee result — same style as MoviesDrive."""
+    """Format movies4u.ee result — grouped by quality."""
     links = data.get("links", [])
     if not links:
         return ""
@@ -903,14 +903,71 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
 
     lines.append("\n📥 <b>Download Links</b>  <i>(Movies4U)</i>\n")
 
-    # Group by quality label
-    by_label: dict[str, list] = {}
-    for lnk in links:
-        by_label.setdefault(lnk["label"], []).append(lnk)
+    # Extract quality from label and group by quality
+    import re as _re
+    
+    def _extract_quality(label: str) -> str:
+        """Extract quality (480p, 720p, 1080p) and size from label."""
+        # Look for patterns like 480p, 720p, 1080p with optional HEVC/HQ
+        match = _re.search(r'(\d{3,4}p)\s*(?:HEVC|HQ|x264)?\s*\[([^\]]+)\]', label)
+        if match:
+            quality = match.group(1)
+            size = match.group(2)
+            hevc = "HEVC" if "HEVC" in label else ""
+            hq = "HQ" if "HQ" in label and "1080p" in label else ""
+            parts = [p for p in [quality, hevc, hq, f"[{size}]"] if p]
+            return " ".join(parts)
+        # Fallback: try to find just the resolution
+        match = _re.search(r'(\d{3,4}p)', label)
+        if match:
+            return match.group(1)
+        return label[:50]  # Fallback to truncated label
 
-    for label, group in by_label.items():
-        lines.append(f"📦 <b>{label}</b>")
-        parts = [f"<a href='{l['url']}'>{l.get('name') or _m4u_provider(l['url'])}</a>" for l in group]
+    # Group by extracted quality
+    by_quality: dict[str, list] = {}
+    for lnk in links:
+        quality = _extract_quality(lnk.get("label", ""))
+        by_quality.setdefault(quality, []).append(lnk)
+    
+    # Remove duplicate URLs within each quality group
+    for quality in by_quality:
+        seen_urls = set()
+        unique_links = []
+        for lnk in by_quality[quality]:
+            url = lnk.get("url", "")
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_links.append(lnk)
+        by_quality[quality] = unique_links
+
+    # Sort qualities (480p first, then 720p, then 1080p)
+    def _quality_sort_key(q: str) -> int:
+        if "480p" in q:
+            return 0
+        if "720p" in q:
+            return 1
+        if "1080p" in q:
+            return 2
+        return 3
+
+    sorted_qualities = sorted(by_quality.keys(), key=_quality_sort_key)
+
+    for quality in sorted_qualities:
+        group = by_quality[quality]
+        lines.append(f"📦 <b>{quality}</b>")
+        
+        # Format each provider link
+        parts = []
+        for l in group:
+            name = l.get('name', '') or _m4u_provider(l['url'])
+            url = l['url']
+            # Clean up emoji and shorten names for display
+            clean_name = name.replace('🚀', '').replace('⚡', '').strip()
+            if len(clean_name) > 15:
+                clean_name = clean_name[:12] + "..."
+            parts.append(f"<a href='{url}'>{clean_name}</a>")
+        
+        # Join with separator
         lines.append("   🔗 " + " · ".join(parts))
         lines.append("")
 
