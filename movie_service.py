@@ -2721,7 +2721,7 @@ def moviesmod_movie_links(movie_url: str) -> dict:
             href = tag.get('href', '')
             text = tag.get_text(strip=True)
             
-            if 'episodes.modpro.blog' in href:
+            if 'episodes.modpro.blog' in href or 'links.modpro.blog' in href:
                 label = f"{current_header} - {text}" if current_header else text
                 links.append({"label": label, "url": href})
             elif 'uhdmovies.foo' in href:
@@ -2733,7 +2733,7 @@ def moviesmod_movie_links(movie_url: str) -> dict:
     
     def _resolve_link(item):
         url = item['url']
-        if 'episodes.modpro.blog' in url:
+        if 'episodes.modpro.blog' in url or 'links.modpro.blog' in url:
             resolved_url = _resolve_modpro_blog(url)
         else:
             resolved_url = url
