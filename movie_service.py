@@ -906,8 +906,8 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
 
     import re as _re
     
-    def _extract_title_and_quality(label: str) -> tuple[str, str]:
-        """Extract title (e.g., Hindi Dub, Tamil) and quality (480p, 720p, etc.) from label."""
+    def _extract_title_and_quality(label: str, provider_name: str) -> tuple[str, str]:
+        """Extract title and quality from label and provider name."""
         # Look for quality pattern: 480p, 720p, 1080p with optional HEVC/HQ and size [XGB]
         quality_match = _re.search(r'(\d{3,4}p)\s*(?:HEVC|HQ|x264)?\s*\[([^\]]+)\]', label)
         
@@ -932,6 +932,16 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
             
             return (title_part if title_part else "Movie", quality_str)
         
+        # If label is generic like "Download", try to extract from movie info
+        if label in ['Download', '']:
+            info_quality = info.get('quality', '')
+            if info_quality:
+                # Parse qualities like "480p || 720p || 1080p"
+                qualities = [q.strip() for q in info_quality.split('||') if q.strip() and 'p' in q]
+                if qualities:
+                    return ("Movie", " | ".join(qualities))
+            return ("Movie", "Download")
+        
         # Fallback: just find resolution
         match = _re.search(r'(\d{3,4}p)', label)
         if match:
@@ -945,7 +955,7 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
             name = _m4u_provider(url)
         
         # Remove emojis and clean up
-        clean = name.replace('🚀', '').replace('⚡', '').replace('[DD]', '').strip()
+        clean = name.replace('🚀', '').replace('⚡', '').replace('[DD]', '').replace('[Instant]', '').replace('[Resumable]', '').replace('[G-Drive]', '').strip()
         
         # Shorten common names
         shorten_map = {
@@ -953,6 +963,7 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
             'G-Direct': 'GDirect',
             'V-Cloud': 'VCloud',
             'Filepress': 'Filepress',
+            'GDFlix': 'GDFlix',
         }
         for full, short in shorten_map.items():
             if full in clean:
@@ -968,7 +979,7 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
     # Group by (title, quality) tuple
     grouped: dict[tuple[str, str], list] = {}
     for lnk in links:
-        title, quality = _extract_title_and_quality(lnk.get("label", ""))
+        title, quality = _extract_title_and_quality(lnk.get("label", ""), lnk.get("name", ""))
         key = (title, quality)
         grouped.setdefault(key, []).append(lnk)
     
@@ -987,14 +998,13 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
     def _sort_key(item: tuple) -> tuple:
         (title, quality), _ = item
         # Quality sort order
+        q_order = 3
         if "480p" in quality:
             q_order = 0
         elif "720p" in quality:
             q_order = 1
         elif "1080p" in quality:
             q_order = 2
-        else:
-            q_order = 3
         return (title, q_order)
 
     sorted_groups = sorted(grouped.items(), key=_sort_key)
@@ -1011,10 +1021,15 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
         # Print quality and links
         lines.append(f"  📦 {quality}")
         
-        # Format provider links
+        # Format provider links - group by provider type to avoid duplicates
+        seen_providers = set()
         parts = []
         for l in group:
             name = _clean_provider_name(l.get('name', ''), l['url'])
+            # Skip if we already have this provider
+            if name in seen_providers:
+                continue
+            seen_providers.add(name)
             parts.append(f"<a href='{l['url']}'>{name}</a>")
         
         lines.append("     🔗 " + " · ".join(parts))
