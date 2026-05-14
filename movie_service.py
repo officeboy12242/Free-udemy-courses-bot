@@ -886,7 +886,7 @@ def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
 
 
 def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
-    """Format movies4u.ee result — grouped by quality."""
+    """Format movies4u.ee result — grouped by title and quality."""
     links = data.get("links", [])
     if not links:
         return ""
@@ -904,77 +904,126 @@ def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = Tr
 
     lines.append("\n📥 <b>Download Links</b>  <i>(Movies4U)</i>\n")
 
-    # Extract quality from label and group by quality
     import re as _re
     
-    def _extract_quality(label: str) -> str:
-        """Extract quality (480p, 720p, 1080p) and size from label."""
-        # Look for patterns like 480p, 720p, 1080p with optional HEVC/HQ
-        match = _re.search(r'(\d{3,4}p)\s*(?:HEVC|HQ|x264)?\s*\[([^\]]+)\]', label)
-        if match:
-            quality = match.group(1)
-            size = match.group(2)
+    def _extract_title_and_quality(label: str) -> tuple[str, str]:
+        """Extract title (e.g., Hindi Dub, Tamil) and quality (480p, 720p, etc.) from label."""
+        # Look for quality pattern: 480p, 720p, 1080p with optional HEVC/HQ and size [XGB]
+        quality_match = _re.search(r'(\d{3,4}p)\s*(?:HEVC|HQ|x264)?\s*\[([^\]]+)\]', label)
+        
+        if quality_match:
+            quality = quality_match.group(1)
+            size = quality_match.group(2)
             hevc = "HEVC" if "HEVC" in label else ""
-            hq = "HQ" if "HQ" in label and "1080p" in label else ""
-            parts = [p for p in [quality, hevc, hq, f"[{size}]"] if p]
-            return " ".join(parts)
-        # Fallback: try to find just the resolution
+            hq = "HQ" if "HQ" in label else ""
+            
+            # Build quality string
+            qual_parts = [p for p in [quality, hevc, hq, f"[{size}]"] if p]
+            quality_str = " ".join(qual_parts)
+            
+            # Extract title - everything before the quality
+            title_part = label[:quality_match.start()].strip()
+            # Remove movie name (usually at start) and year
+            title_part = _re.sub(r'^[\w\s\-:]+\(\d{4}\)', '', title_part).strip()
+            # Remove WEB-LEAK, HDTC, etc.
+            title_part = _re.sub(r'WEB-LEAK|HDTC|HDCAM|DVDScr|WEB-DL|WEB-Rip|HDRip', '', title_part, flags=re.IGNORECASE).strip()
+            # Clean up
+            title_part = title_part.replace('  ', ' ').strip(' -[]')
+            
+            return (title_part if title_part else "Movie", quality_str)
+        
+        # Fallback: just find resolution
         match = _re.search(r'(\d{3,4}p)', label)
         if match:
-            return match.group(1)
-        return label[:50]  # Fallback to truncated label
+            return ("Movie", match.group(1))
+        
+        return (label[:40], "Download")
 
-    # Group by extracted quality
-    by_quality: dict[str, list] = {}
+    def _clean_provider_name(name: str, url: str) -> str:
+        """Clean up provider name for display."""
+        if not name:
+            name = _m4u_provider(url)
+        
+        # Remove emojis and clean up
+        clean = name.replace('🚀', '').replace('⚡', '').replace('[DD]', '').strip()
+        
+        # Shorten common names
+        shorten_map = {
+            'Hub-Cloud': 'HubCloud',
+            'G-Direct': 'GDirect',
+            'V-Cloud': 'VCloud',
+            'Filepress': 'Filepress',
+        }
+        for full, short in shorten_map.items():
+            if full in clean:
+                clean = short
+                break
+        
+        # Limit length
+        if len(clean) > 12:
+            clean = clean[:10] + ".."
+        
+        return clean
+
+    # Group by (title, quality) tuple
+    grouped: dict[tuple[str, str], list] = {}
     for lnk in links:
-        quality = _extract_quality(lnk.get("label", ""))
-        by_quality.setdefault(quality, []).append(lnk)
+        title, quality = _extract_title_and_quality(lnk.get("label", ""))
+        key = (title, quality)
+        grouped.setdefault(key, []).append(lnk)
     
-    # Remove duplicate URLs within each quality group
-    for quality in by_quality:
+    # Remove duplicate URLs within each group
+    for key in grouped:
         seen_urls = set()
         unique_links = []
-        for lnk in by_quality[quality]:
+        for lnk in grouped[key]:
             url = lnk.get("url", "")
-            if url not in seen_urls:
+            if url and url not in seen_urls:
                 seen_urls.add(url)
                 unique_links.append(lnk)
-        by_quality[quality] = unique_links
+        grouped[key] = unique_links
 
-    # Sort qualities (480p first, then 720p, then 1080p)
-    def _quality_sort_key(q: str) -> int:
-        if "480p" in q:
-            return 0
-        if "720p" in q:
-            return 1
-        if "1080p" in q:
-            return 2
-        return 3
+    # Sort: by title first, then by quality (480p < 720p < 1080p)
+    def _sort_key(item: tuple) -> tuple:
+        (title, quality), _ = item
+        # Quality sort order
+        if "480p" in quality:
+            q_order = 0
+        elif "720p" in quality:
+            q_order = 1
+        elif "1080p" in quality:
+            q_order = 2
+        else:
+            q_order = 3
+        return (title, q_order)
 
-    sorted_qualities = sorted(by_quality.keys(), key=_quality_sort_key)
+    sorted_groups = sorted(grouped.items(), key=_sort_key)
 
-    for quality in sorted_qualities:
-        group = by_quality[quality]
-        lines.append(f"📦 <b>{quality}</b>")
+    current_title = None
+    for (title, quality), group in sorted_groups:
+        # Print title header when it changes
+        if title != current_title:
+            if current_title is not None:
+                lines.append("")  # Blank line between sections
+            lines.append(f"📁 <b>{title}</b>")
+            current_title = title
         
-        # Format each provider link
+        # Print quality and links
+        lines.append(f"  📦 {quality}")
+        
+        # Format provider links
         parts = []
         for l in group:
-            name = l.get('name', '') or _m4u_provider(l['url'])
-            url = l['url']
-            # Clean up emoji and shorten names for display
-            clean_name = name.replace('🚀', '').replace('⚡', '').strip()
-            if len(clean_name) > 15:
-                clean_name = clean_name[:12] + "..."
-            parts.append(f"<a href='{url}'>{clean_name}</a>")
+            name = _clean_provider_name(l.get('name', ''), l['url'])
+            parts.append(f"<a href='{l['url']}'>{name}</a>")
         
-        # Join with separator
-        lines.append("   🔗 " + " · ".join(parts))
-        lines.append("")
+        lines.append("     🔗 " + " · ".join(parts))
 
     if footer:
+        lines.append("")
         lines.append("━" * 32)
         lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+    
     return "\n".join(lines)
 
 
