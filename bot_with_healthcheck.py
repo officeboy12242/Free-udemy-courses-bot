@@ -378,6 +378,7 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🌟 Vegamovies (480p–4K)",     callback_data="msite_vega")],
         [InlineKeyboardButton("📀 SDMoviesPoint (HD+4K)",    callback_data="msite_sdmp")],
         [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
+        [InlineKeyboardButton("🚜 MoviesMod",                callback_data="msite_moviesmod")],
     ]
     await update.effective_message.reply_text(
         "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
