@@ -2784,13 +2784,11 @@ def _resolve_mdrive_link(url: str) -> str:
     Resolves mdrive.ink/mdisk links to their final download links.
     The mdrive page contains multiple final links (Hub-Cloud, GDFlix, G-Direct, V-Cloud, etc.)
     Returns a string with all final links separated by newlines.
+    Uses _get() for cloud deployment compatibility (ScraperAPI support).
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-    
     try:
-        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        # Use _get() which handles ScraperAPI for cloud deployments
+        resp = _get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         final_links = []
@@ -2838,8 +2836,10 @@ def _resolve_mdrive_link(url: str) -> str:
                 final_links.append(f"{label}: {href}")
         
         if final_links:
+            log.info("Resolved mdrive link %s to %d final links", url, len(final_links))
             return "\n".join(final_links)
         
+        log.warning("No final links found for %s, returning original", url)
         return url
         
     except Exception as e:
