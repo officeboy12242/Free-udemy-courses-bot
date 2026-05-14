@@ -544,65 +544,104 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         await query.answer("Fetching links…")
 
-        if source == "hdhub":
-            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
-            text = format_hdhub_message(movie["title"], detail)
-        elif source == "hdh":
-            detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
-            text = format_hdh_message(movie["title"], detail)
-        elif source == "md":
-            detail = await asyncio.to_thread(md_movie_links, movie["url"])
-            text = format_md_message(movie["title"], detail)
-        elif source == "vega":
-            detail = await asyncio.to_thread(vega_movie_links, movie["url"])
-            text = format_vega_message(movie["title"], detail)
-        elif source == "sdmp":
-            detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
-            text = format_sdmp_message(movie["title"], detail)
-        elif source == "bolly":
-            detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
-            text = format_bollyflix_message(movie["title"], detail)
-        elif source == "moviesmod":
-            detail = await asyncio.to_thread(moviesmod_movie_links, movie["url"])
-            text = format_moviesmod_message(movie["title"], detail)
-        else:
-            detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
-            text = format_m4u_message(movie["title"], detail)
-
-        poster_url = detail.get("poster") or movie.get("poster", "")
+        poster_url = movie.get("poster", "")
         page = idx // 10 + 1
         back_cb = f"msite_{source}" if page == 1 else f"mpage_{source}_{page}"
-        action_row = [
-            InlineKeyboardButton("📢 Post to Channel", callback_data=f"mpost_single_{source}_{idx}"),
-            InlineKeyboardButton("« Back", callback_data=back_cb),
-        ]
 
-        # Send poster with text as caption if possible
-        if poster_url and len(text) <= 1024:
-            try:
-                await query.message.reply_photo(
-                    photo=poster_url,
-                    caption=text,
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([action_row]),
-                )
-                return
-            except Exception:
-                pass
-
-        # Fallback: send poster without caption, then text message
-        if poster_url:
-            try:
-                await query.message.reply_photo(photo=poster_url)
-            except Exception:
-                pass
-
-        await reply_html_chunked(
-            query.message,
-            text,
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup([action_row]),
+        # Send an immediate "processing" message that we'll edit later
+        processing_msg = await query.message.reply_text(
+            "⏳ Fetching download links... This may take a moment.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Cancel", callback_data=back_cb)
+            ]])
         )
+
+        # Define the scraping task
+        async def _do_scrape():
+            try:
+                if source == "hdhub":
+                    detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+                    text = format_hdhub_message(movie["title"], detail)
+                elif source == "hdh":
+                    detail = await asyncio.to_thread(hdh_movie_links, movie["url"])
+                    text = format_hdh_message(movie["title"], detail)
+                elif source == "md":
+                    detail = await asyncio.to_thread(md_movie_links, movie["url"])
+                    text = format_md_message(movie["title"], detail)
+                elif source == "vega":
+                    detail = await asyncio.to_thread(vega_movie_links, movie["url"])
+                    text = format_vega_message(movie["title"], detail)
+                elif source == "sdmp":
+                    detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
+                    text = format_sdmp_message(movie["title"], detail)
+                elif source == "bolly":
+                    detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
+                    text = format_bollyflix_message(movie["title"], detail)
+                elif source == "moviesmod":
+                    detail = await asyncio.to_thread(moviesmod_movie_links, movie["url"])
+                    text = format_moviesmod_message(movie["title"], detail)
+                else:
+                    detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
+                    text = format_m4u_message(movie["title"], detail)
+
+                poster_url = detail.get("poster") or movie.get("poster", "")
+                action_row = [
+                    InlineKeyboardButton("📢 Post to Channel", callback_data=f"mpost_single_{source}_{idx}"),
+                    InlineKeyboardButton("« Back", callback_data=back_cb),
+                ]
+
+                # Edit the processing message with results
+                try:
+                    if poster_url and len(text) <= 1024:
+                        await processing_msg.delete()
+                        await query.message.reply_photo(
+                            photo=poster_url,
+                            caption=text,
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup([action_row]),
+                        )
+                    elif poster_url:
+                        await processing_msg.delete()
+                        await query.message.reply_photo(photo=poster_url)
+                        await reply_html_chunked(
+                            query.message,
+                            text,
+                            disable_web_page_preview=True,
+                            reply_markup=InlineKeyboardMarkup([action_row]),
+                        )
+                    else:
+                        await reply_html_chunked(
+                            processing_msg,
+                            text,
+                            disable_web_page_preview=True,
+                            reply_markup=InlineKeyboardMarkup([action_row]),
+                        )
+                except Exception as e:
+                    log.error("Error sending results: %s", e)
+                    await processing_msg.edit_text(
+                        f"❌ Error displaying results. Please try again.",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("« Back", callback_data=back_cb)
+                        ]])
+                    )
+            except asyncio.TimeoutError:
+                await processing_msg.edit_text(
+                    "⏱ Scraping timed out. The site may be slow or blocking requests. Please try again.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("« Back", callback_data=back_cb)
+                    ]])
+                )
+            except Exception as e:
+                log.error("Error scraping movie %s: %s", movie["url"], e)
+                await processing_msg.edit_text(
+                    f"❌ Error fetching links: {str(e)[:100]}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("« Back", callback_data=back_cb)
+                    ]])
+                )
+
+        # Run scraping as a background task so bot stays responsive
+        asyncio.create_task(_do_scrape())
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -859,45 +898,86 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
     if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod"):
-        if source == "hdhub":
-            detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
-            text = format_hdhub_message(movie["title"], detail)
-        elif source == "vega":
-            detail = await asyncio.to_thread(vega_movie_links, movie["url"])
-            text = format_vega_message(movie["title"], detail)
-        elif source == "sdmp":
-            detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
-            text = format_sdmp_message(movie["title"], detail)
-        elif source == "bolly":
-            detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
-            text = format_bollyflix_message(movie["title"], detail)
-        elif source == "moviesmod":
-            detail = await asyncio.to_thread(moviesmod_movie_links, movie["url"])
-            text = format_moviesmod_message(movie["title"], detail)
-        else:
-            detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
-            text = format_m4u_message(movie["title"], detail)
-        poster_url = detail.get("poster") or movie.get("poster", "")
-        context.user_data[f"search_pair_{source}_{idx}"] = {
-            "primary": movie, "primary_source": source,
-            "other": None, "other_source": None,
-        }
-        post_cb = f"mpost_combined_{source}_{idx}"
-        action_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Post to Channel", callback_data=post_cb)],
-            [InlineKeyboardButton("« Back to results", callback_data="msrc_back")],
-        ])
-        if poster_url:
-            try:
-                await query.message.reply_photo(photo=poster_url)
-            except Exception:
-                pass
-        await reply_html_chunked(
-            query.message,
-            text or "❌ No download links found.",
-            disable_web_page_preview=True,
-            reply_markup=action_kb,
+        # Send processing message and run scraping in background
+        processing_msg = await query.message.reply_text(
+            "⏳ Fetching download links... This may take a moment.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Cancel", callback_data="msrc_back")
+            ]])
         )
+
+        async def _do_scrape_search():
+            try:
+                if source == "hdhub":
+                    detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
+                    text = format_hdhub_message(movie["title"], detail)
+                elif source == "vega":
+                    detail = await asyncio.to_thread(vega_movie_links, movie["url"])
+                    text = format_vega_message(movie["title"], detail)
+                elif source == "sdmp":
+                    detail = await asyncio.to_thread(sdmp_movie_links, movie["url"])
+                    text = format_sdmp_message(movie["title"], detail)
+                elif source == "bolly":
+                    detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
+                    text = format_bollyflix_message(movie["title"], detail)
+                elif source == "moviesmod":
+                    detail = await asyncio.to_thread(moviesmod_movie_links, movie["url"])
+                    text = format_moviesmod_message(movie["title"], detail)
+                else:
+                    detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
+                    text = format_m4u_message(movie["title"], detail)
+
+                poster_url = detail.get("poster") or movie.get("poster", "")
+                context.user_data[f"search_pair_{source}_{idx}"] = {
+                    "primary": movie, "primary_source": source,
+                    "other": None, "other_source": None,
+                }
+                post_cb = f"mpost_combined_{source}_{idx}"
+                action_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Post to Channel", callback_data=post_cb)],
+                    [InlineKeyboardButton("« Back to results", callback_data="msrc_back")],
+                ])
+
+                # Send results
+                try:
+                    await processing_msg.delete()
+                    if poster_url:
+                        try:
+                            await query.message.reply_photo(photo=poster_url)
+                        except Exception:
+                            pass
+                    await reply_html_chunked(
+                        query.message,
+                        text or "❌ No download links found.",
+                        disable_web_page_preview=True,
+                        reply_markup=action_kb,
+                    )
+                except Exception as e:
+                    log.error("Error sending search results: %s", e)
+                    await processing_msg.edit_text(
+                        "❌ Error displaying results. Please try again.",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("« Back to results", callback_data="msrc_back")
+                        ]])
+                    )
+            except asyncio.TimeoutError:
+                await processing_msg.edit_text(
+                    "⏱ Scraping timed out. The site may be slow or blocking requests.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("« Back to results", callback_data="msrc_back")
+                    ]])
+                )
+            except Exception as e:
+                log.error("Error scraping search result %s: %s", movie["url"], e)
+                await processing_msg.edit_text(
+                    f"❌ Error fetching links: {str(e)[:100]}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("« Back to results", callback_data="msrc_back")
+                    ]])
+                )
+
+        # Run scraping in background task so bot stays responsive
+        asyncio.create_task(_do_scrape_search())
         return
 
     # ── For hdh / md: try to find matching movie on the other site ────────
