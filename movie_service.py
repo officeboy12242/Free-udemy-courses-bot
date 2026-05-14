@@ -773,37 +773,75 @@ def m4u_movie_links(movie_url: str) -> dict[str, Any]:
 
         if labeled and len(unique_urls) > 1:
             # ── Layout A: Series — multiple labeled mdrive.ink URLs ───────────
-            # One link per quality: prefer G-Direct, else first available
+            # Resolve each mdrive URL to get final links (Hub-Cloud, GDFlix, G-Direct, etc.)
             by_label: dict[str, list] = {}
             for c in collected:
                 label = c["label"] or "Download"
                 by_label.setdefault(label, []).append(c)
 
             for label, entries in by_label.items():
-                gdirect = [e for e in entries if e["is_gdirect"]]
-                best = gdirect[0] if gdirect else entries[0]
-                links.append({
-                    "label": label,
-                    "name": "G‑Direct" if best["is_gdirect"] else _m4u_provider_from_btn(best["btn_text"]),
-                    "url": best["url"],
-                })
+                # Get all unique mdrive URLs for this quality
+                seen_urls = set()
+                for entry in entries:
+                    mdrive_url = entry["url"]
+                    if mdrive_url in seen_urls:
+                        continue
+                    seen_urls.add(mdrive_url)
+                    
+                    # Resolve mdrive URL to get final links
+                    final_links = _resolve_mdrive_link(mdrive_url)
+                    if final_links and final_links != mdrive_url:
+                        # Parse the resolved links (they're newline-separated)
+                        for line in final_links.split('\n'):
+                            if ':' in line:
+                                provider, url = line.split(':', 1)
+                                provider = provider.strip()
+                                url = url.strip()
+                                links.append({
+                                    "label": label,
+                                    "name": provider,
+                                    "url": url,
+                                })
+                    else:
+                        # Fallback to original mdrive URL
+                        links.append({
+                            "label": label,
+                            "name": _m4u_provider_from_btn(entry["btn_text"]),
+                            "url": mdrive_url,
+                        })
 
         elif collected:
             # ── Layout B: Movie — one mdrive.ink URL, follow it ───────────────
             mdrive_url = list(unique_urls)[0]
-            raw_links = _scrape_mdrive_ink(mdrive_url)
-            # Per quality: show G-Direct if available, else best provider
-            by_lbl: dict[str, list] = {}
-            for l in raw_links:
-                by_lbl.setdefault(l["label"], []).append(l)
-            for lbl, entries in by_lbl.items():
-                gdirect = [l for l in entries if "fastdl.zip" in l.get("url", "")]
-                best = gdirect[0] if gdirect else entries[0]
-                links.append({
-                    "label": best["label"],
-                    "name": "G‑Direct" if gdirect else _m4u_provider(best["url"]),
-                    "url": best["url"],
-                })
+            final_links = _resolve_mdrive_link(mdrive_url)
+            
+            if final_links and final_links != mdrive_url:
+                # Parse all resolved links
+                current_label = "Download"
+                for line in final_links.split('\n'):
+                    if ':' in line:
+                        provider, url = line.split(':', 1)
+                        provider = provider.strip()
+                        url = url.strip()
+                        links.append({
+                            "label": current_label,
+                            "name": provider,
+                            "url": url,
+                        })
+            else:
+                # Fallback to original scraping method
+                raw_links = _scrape_mdrive_ink(mdrive_url)
+                by_lbl: dict[str, list] = {}
+                for l in raw_links:
+                    by_lbl.setdefault(l["label"], []).append(l)
+                for lbl, entries in by_lbl.items():
+                    gdirect = [l for l in entries if "fastdl.zip" in l.get("url", "")]
+                    best = gdirect[0] if gdirect else entries[0]
+                    links.append({
+                        "label": best["label"],
+                        "name": "G‑Direct" if gdirect else _m4u_provider(best["url"]),
+                        "url": best["url"],
+                    })
 
         return {"poster": poster, "links": links, "info": info}
     except Exception as e:
@@ -2682,6 +2720,74 @@ def _resolve_modpro_blog(url: str) -> str:
             time.sleep(1)
             
     return url
+
+def _resolve_mdrive_link(url: str) -> str:
+    """
+    Resolves mdrive.ink/mdisk links to their final download links.
+    The mdrive page contains multiple final links (Hub-Cloud, GDFlix, G-Direct, V-Cloud, etc.)
+    Returns a string with all final links separated by newlines.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        
+        final_links = []
+        seen_urls = set()
+        
+        # Find all links on the page
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            text = a.get_text(strip=True)
+            text_lower = text.lower()
+            
+            # Skip navigation and irrelevant links
+            if not href or any(x in href for x in ['mdrive.ink', 'javascript:', '#', 'wp-content', 'swagvio']):
+                continue
+            if any(x in text_lower for x in ['skip to content', 'home', 'nex drive', 'join now', 'adult', 'meet place', 'find perfect']):
+                continue
+            
+            # Skip text that looks like a URL protocol
+            if text_lower in ['https', 'http']:
+                continue
+                
+            # These are the final download links we want
+            is_provider = any(x in text_lower for x in ['hub-cloud', 'gdflix', 'g-direct', 'v-cloud', 'filepress', 
+                                               'gofile', 'vikingfile', 'megaup', 'fastdl', 'filebee'])
+            # Also include links to known file hosts even without specific button text
+            is_filehost = any(x in href for x in ['gofile.io', 'vikingfile.com', 'megaup.net', 'hubcloud.foo', 
+                                                    'gdflix.dev', 'fastdl.zip', 'vcloud.zip', 'filebee.xyz'])
+            
+            if is_provider or is_filehost:
+                # Clean up the link
+                if href.startswith('//'):
+                    href = 'https:' + href
+                elif href.startswith('/'):
+                    from urllib.parse import urljoin
+                    href = urljoin(resp.url, href)
+                
+                # Skip duplicates
+                if href in seen_urls:
+                    continue
+                seen_urls.add(href)
+                
+                # Use appropriate label
+                label = text if text else _m4u_provider(href)
+                    
+                final_links.append(f"{label}: {href}")
+        
+        if final_links:
+            return "\n".join(final_links)
+        
+        return url
+        
+    except Exception as e:
+        log.error("Error resolving mdrive link %s: %s", url, e)
+        return url
+
 
 def moviesmod_movie_links(movie_url: str) -> dict:
     """
