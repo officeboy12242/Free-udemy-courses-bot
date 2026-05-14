@@ -7,6 +7,7 @@ Movie scraper — supports multiple sources:
   - Vegamovies      (https://vegamovies.global/)
   - SDMoviesPoint   (https://sd1.sdmoviespoint.trade/)
   - BollyFlix       (https://new.bollyflix.gd/)
+  - MoviesMod       (https://moviesmod.farm/)
 """
 from __future__ import annotations
 
