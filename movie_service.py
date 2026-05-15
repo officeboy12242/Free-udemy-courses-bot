@@ -62,8 +62,17 @@ HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
-# Some sites (e.g. 4khdhub.link) have SSL chain issues on Windows.
-_NO_VERIFY_HOSTS = {"4khdhub.link", "cryptoinsights.site", "hblinks.org"}
+# Some sites have SSL chain issues on Windows / cloud deployments.
+_NO_VERIFY_HOSTS = {
+    "4khdhub.link",
+    "cryptoinsights.site",
+    "hblinks.org",
+    "new1.hdhub4u.limo",  # HDHub4u - SSL cert issues
+    "hdhub4u.limo",
+    "movies4u.ee",  # Movies4U - occasional SSL issues
+    "linksmod.top",  # MoviesMod intermediary - SSL issues
+    "episodes.modpro.blog",  # MoviesMod redirector - SSL issues
+}
 
 # Per-host persistent sessions so cookies are carried across requests
 _sessions: dict[str, requests.Session] = {}
