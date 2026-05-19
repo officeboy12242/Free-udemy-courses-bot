@@ -131,18 +131,22 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                     time.sleep(2 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    # ── curl_cffi mode (free, fast, bypasses Cloudflare TLS fingerprinting) ──
+    # ── Direct mode ────────────────────────────────────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
     verify = host not in _NO_VERIFY_HOSTS
 
-    if _CFFI_AVAILABLE:
+    # For SSL-broken hosts, skip curl_cffi (it can't bypass certain TLS errors)
+    # and go straight to plain requests with verify=False.
+    use_cffi = _CFFI_AVAILABLE and verify
+
+    if use_cffi:
         last_exc = None
         for attempt in range(retries + 1):
             try:
                 timeout = kwargs.get("timeout", 20)
                 params = kwargs.get("params", None)
                 r = cffi_requests.get(
-                    url, headers=HEADERS, verify=verify,
+                    url, headers=HEADERS, verify=True,
                     timeout=timeout, params=params,
                     impersonate="chrome"
                 )
@@ -162,7 +166,7 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                     time.sleep(1.5 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    # ── Fallback: plain requests (if curl_cffi not installed) ─────────────────
+    # ── Plain requests (for SSL-broken hosts or if curl_cffi unavailable) ─────
     session = _session_for(host)
 
     ctx = warnings.catch_warnings()
@@ -2046,7 +2050,7 @@ def format_bollyflix_message(movie_title: str, data: dict[str, Any], footer: boo
 #         → atob → hblinks.org → final HubCloud/HubDrive/GoFile links
 # ══════════════════════════════════════════════════════════════════════════════
 
-_GW_AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site"}
+_GW_AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site", "greenmountmotors.com"}
 
 _FINAL_HOST_KEYWORDS = {
     "hubcloud", "hubdrive", "gofile", "pixeldrain", "mediafire",
@@ -2306,14 +2310,15 @@ def _decode_gw_o(o_val: str) -> str | None:
 
 def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
     """
-    Resolve a gadgetsweb.xyz ad-gate URL to its final direct download links.
+    Resolve a gadgetsweb.xyz / greenmountmotors.com ad-gate URL to final links.
     Returns a list of {"label": str, "url": str} dicts.  On failure returns [].
 
     Strategy:
-    1. Fast path: HTTP-based decode (works on Render with ScraperAPI)
+    1. Fast path: fetch greenmountmotors.com/?id= which embeds the 'o' value
+       in its HTML (no JS execution needed). Decode it to get the hblinks URL.
     2. Fallback: Playwright navigates the full redirect chain like a real browser
     """
-    # ── Fast path: HTTP decode ────────────────────────────────────────────────
+    # ── Fast path: HTTP decode via greenmountmotors ───────────────────────────
     try:
         parsed = urlparse(gw_url)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -2321,16 +2326,17 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         if not gw_id:
             return _resolve_gadgetsweb_playwright(gw_url)
 
-        crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
-        r2_text = None
+        # greenmountmotors.com embeds the 'o' value directly in its response HTML
+        gm_url = f"https://greenmountmotors.com/?id={gw_id}"
+        gm_text = None
         try:
-            r2 = _get(crypto_url, timeout=20)
-            r2_text = r2.text
+            r2 = _get(gm_url, timeout=20)
+            gm_text = r2.text
         except Exception:
             pass
 
-        if r2_text:
-            m = re.search(r"s\('o','([^']+)'", r2_text)
+        if gm_text:
+            m = re.search(r"s\('o','([^']+)'", gm_text)
             if m:
                 final_url = _decode_gw_o(m.group(1))
                 if final_url:
@@ -2345,6 +2351,26 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
                     else:
                         domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
                         return [{"label": f"{domain_hint} Download", "url": final_url}]
+
+        # Legacy fallback: try cryptoinsights directly (may be down)
+        crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
+        try:
+            r2 = _get(crypto_url, timeout=15)
+            m = re.search(r"s\('o','([^']+)'", r2.text)
+            if m:
+                final_url = _decode_gw_o(m.group(1))
+                if final_url:
+                    if "hblinks.org" in final_url:
+                        r3 = _get(final_url, timeout=20)
+                        links = _scrape_hblinks_page(r3.text)
+                        if links:
+                            return links
+                    else:
+                        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
+                        return [{"label": f"{domain_hint} Download", "url": final_url}]
+        except Exception:
+            pass
+
     except Exception as exc:
         log.debug("_resolve_gadgetsweb HTTP path %s failed: %s", gw_url, exc)
 
