@@ -95,52 +95,15 @@ def _session_for(host: str) -> requests.Session:
 def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
     """GET with browser headers, persistent session (cookies), SSL bypass for known hosts.
 
-    When SCRAPER_API_KEY is set (recommended for cloud deployments), all requests
-    are routed through ScraperAPI which bypasses Cloudflare / geo-blocks automatically.
+    Priority: curl_cffi (fast, free) → ScraperAPI fallback (if key set and cffi fails) → plain requests.
     """
-    # ── ScraperAPI mode ──────────────────────────────────────────────────────
-    if SCRAPER_API_KEY:
-        # If the caller passed query params (e.g. search functions), bake them
-        # into the URL first — ScraperAPI uses its own `params` dict so we
-        # cannot pass two separate `params` kwargs to requests.get().
-        caller_params = kwargs.pop("params", None)
-        if caller_params:
-            encoded = urllib.parse.urlencode(caller_params)
-            sep = "&" if "?" in url else "?"
-            url = url + sep + encoded
-
-        api_params = {"api_key": SCRAPER_API_KEY, "url": url, "render": "false"}
-        kwargs.setdefault("timeout", 30)
-        last_exc: Exception | None = None
-        for attempt in range(retries + 1):
-            try:
-                resp = requests.get(SCRAPER_API_URL, params=api_params, **kwargs)
-                if resp.status_code in (403, 429, 500, 503) and attempt < retries:
-                    log.warning("ScraperAPI %s → HTTP %s (attempt %d), retrying…",
-                                url, resp.status_code, attempt + 1)
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                if resp.status_code not in (200, 301, 302):
-                    log.warning("ScraperAPI %s → HTTP %s", url, resp.status_code)
-                return resp
-            except Exception as exc:
-                last_exc = exc
-                log.warning("ScraperAPI %s → %s: %s (attempt %d)",
-                            url, type(exc).__name__, exc, attempt + 1)
-                if attempt < retries:
-                    time.sleep(2 * (attempt + 1))
-        raise last_exc  # type: ignore[misc]
-
-    # ── Direct mode ────────────────────────────────────────────────────────────
     host = urllib.parse.urlparse(url).hostname or ""
     verify = host not in _NO_VERIFY_HOSTS
 
-    # For SSL-broken hosts, skip curl_cffi (it can't bypass certain TLS errors)
-    # and go straight to plain requests with verify=False.
+    # ── Try curl_cffi first (best anti-bot bypass, free) ─────────────────────
     use_cffi = _CFFI_AVAILABLE and verify
-
     if use_cffi:
-        last_exc = None
+        cffi_exc = None
         for attempt in range(retries + 1):
             try:
                 timeout = kwargs.get("timeout", 20)
@@ -155,18 +118,52 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                                 url, r.status_code, attempt + 1)
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                if r.status_code not in (200, 301, 302):
-                    log.warning("_get(cffi) %s → HTTP %s", url, r.status_code)
-                return r
+                if r.status_code == 200:
+                    return r
+                # Non-200: let it fall through to ScraperAPI/plain
+                cffi_exc = None
+                log.info("_get(cffi) %s → HTTP %s, trying fallback", url, r.status_code)
+                break
             except Exception as exc:
-                last_exc = exc
+                cffi_exc = exc
                 log.warning("_get(cffi) %s → %s: %s (attempt %d)",
                             url, type(exc).__name__, exc, attempt + 1)
                 if attempt < retries:
                     time.sleep(1.5 * (attempt + 1))
-        raise last_exc  # type: ignore[misc]
 
-    # ── Plain requests (for SSL-broken hosts or if curl_cffi unavailable) ─────
+    # ── ScraperAPI fallback (only if key is set and cffi failed/returned non-200) ─
+    if SCRAPER_API_KEY:
+        caller_params = kwargs.pop("params", None)
+        target_url = url
+        if caller_params:
+            encoded = urllib.parse.urlencode(caller_params)
+            sep = "&" if "?" in target_url else "?"
+            target_url = target_url + sep + encoded
+
+        api_params = {"api_key": SCRAPER_API_KEY, "url": target_url, "render": "false"}
+        kwargs.setdefault("timeout", 30)
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.get(SCRAPER_API_URL, params=api_params, **kwargs)
+                if resp.status_code in (403, 429, 500, 503) and attempt < retries:
+                    log.warning("ScraperAPI %s → HTTP %s (attempt %d), retrying…",
+                                target_url, resp.status_code, attempt + 1)
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                if resp.status_code not in (200, 301, 302):
+                    log.warning("ScraperAPI %s → HTTP %s", target_url, resp.status_code)
+                return resp
+            except Exception as exc:
+                last_exc = exc
+                log.warning("ScraperAPI %s → %s: %s (attempt %d)",
+                            target_url, type(exc).__name__, exc, attempt + 1)
+                if attempt < retries:
+                    time.sleep(2 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+
+    # ── Plain requests (for SSL-broken hosts or if nothing else worked) ──────
     session = _session_for(host)
 
     ctx = warnings.catch_warnings()
