@@ -206,7 +206,7 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str 
     Returns the rendered HTML string, or None if Playwright is unavailable or fails.
     """
     if not _PLAYWRIGHT_AVAILABLE:
-        log.warning("Playwright not installed — cannot render JS for %s", url)
+        log.debug("Playwright not installed — skipping JS render for %s", url)
         return None
     try:
         with sync_playwright() as p:
@@ -218,7 +218,11 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str 
             browser.close()
         return html
     except Exception as exc:
-        log.error("Playwright render failed for %s: %s", url, exc)
+        exc_str = str(exc)
+        if "Executable doesn't exist" in exc_str or "not found" in exc_str.lower():
+            log.warning("Playwright browser binaries not installed — skipping JS render")
+        else:
+            log.error("Playwright render failed for %s: %s", url, exc)
         return None
 
 
@@ -2127,14 +2131,10 @@ def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
     """Navigate gadgetsweb URL in a real browser and automatically bypass any
     intermediate mediator/redirect pages to reach the final download links.
 
-    This is generic and future-proof: it doesn't depend on specific element IDs
-    or domain names. It detects mediator pages by looking for 'continue/verify'
-    buttons, handles countdowns/timers, and keeps trying until it reaches a
-    known file host (hblinks, hubcloud, etc.).
-
     Returns list of {"label": str, "url": str} for file-host links found.
     """
     if not _PLAYWRIGHT_AVAILABLE:
+        log.debug("Playwright not available, skipping gadgetsweb browser fallback")
         return []
 
     try:
@@ -2540,8 +2540,8 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
         log.warning("hdhub_movie_links initial fetch %s failed: %s", movie_url, exc)
 
     # Check if the static fetch found any episode/download links;
-    # if not, fall back to Playwright (JS rendering).
-    _needs_playwright = False
+    # if not, try Playwright (JS rendering) as optional fallback.
+    _needs_render = False
     if soup is not None:
         _test_content = soup.select_one("main.page-body, .entry-content, article") or soup
         _test_headings = _test_content.find_all(["h2", "h3", "h4"])
@@ -2549,17 +2549,23 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
         _found_links = False
         if _has_dl_section:
             for h in _test_headings:
-                if h.find("a", href=True) and h.find("a", href=True)["href"].startswith("http"):
-                    ht = h.get_text(strip=True)
-                    if re.search(r"EP(?:i?SODE)?\s*\d+", ht, re.I) or re.search(r"(4K|2160|1080|720|480)", ht):
+                a_tag = h.find("a", href=True)
+                if a_tag and a_tag["href"].startswith("http"):
+                    _found_links = True
+                    break
+            if not _found_links:
+                # Also check for links immediately after headings
+                for h in _test_headings:
+                    nxt = h.find_next_sibling()
+                    if nxt and nxt.find("a", href=True):
                         _found_links = True
                         break
         if not _found_links:
-            _needs_playwright = True
+            _needs_render = True
     else:
-        _needs_playwright = True
+        _needs_render = True
 
-    if _needs_playwright:
+    if _needs_render:
         log.info("hdhub_movie_links: no links in static HTML, trying Playwright for %s", movie_url)
         rendered_html = _get_rendered_html(movie_url, timeout=30, wait_ms=5000)
         if rendered_html:
