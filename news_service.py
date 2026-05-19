@@ -9,10 +9,17 @@ import hashlib
 import logging
 import os
 import sqlite3
+import time
 from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _CFFI_AVAILABLE = True
+except ImportError:
+    _CFFI_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +52,28 @@ def ensure_news_table():
                 posted_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Queued articles scraped between post cycles
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS news_queue (
+                hash TEXT PRIMARY KEY,
+                title TEXT,
+                summary TEXT,
+                scraped_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.commit()
+    finally:
+        con.close()
+
+
+def cleanup_old_news(days: int = 7):
+    """Remove posted_news entries older than N days to keep DB lean."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            "DELETE FROM posted_news WHERE posted_at < datetime('now', ?)",
+            (f"-{days} days",),
+        )
         con.commit()
     finally:
         con.close()
@@ -69,10 +98,52 @@ def mark_news_posted(titles: list[str]):
     con = sqlite3.connect(DB_FILE)
     try:
         for t in titles:
+            h = _hash_title(t)
             con.execute(
                 "INSERT OR IGNORE INTO posted_news (hash, title) VALUES (?, ?)",
-                (_hash_title(t), t[:200]),
+                (h, t[:200]),
             )
+            # Remove from queue if present
+            con.execute("DELETE FROM news_queue WHERE hash = ?", (h,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def queue_articles(articles: list[dict[str, str]]):
+    """Store freshly scraped articles in queue for the next post cycle."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        for a in articles:
+            h = _hash_title(a["title"])
+            con.execute(
+                "INSERT OR IGNORE INTO news_queue (hash, title, summary) VALUES (?, ?, ?)",
+                (h, a["title"][:200], a.get("summary", "")[:500]),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_queued_articles() -> list[dict[str, str]]:
+    """Get all queued articles that haven't been posted yet."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        rows = con.execute(
+            """SELECT q.title, q.summary FROM news_queue q
+               WHERE q.hash NOT IN (SELECT hash FROM posted_news)
+               ORDER BY q.scraped_at DESC"""
+        ).fetchall()
+        return [{"title": r[0], "summary": r[1]} for r in rows]
+    finally:
+        con.close()
+
+
+def clear_queue():
+    """Clear the news queue after posting."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute("DELETE FROM news_queue")
         con.commit()
     finally:
         con.close()
@@ -87,21 +158,37 @@ def scrape_inshorts(min_articles: int = 10, skip_posted: bool = True) -> list[di
     """
     Scrape Inshorts tech page. Returns list of {title, summary}.
     Filters spam. If skip_posted=True, also filters already-posted articles.
-    Tries to get at least min_articles.
+    Uses curl_cffi for fresh content (bypasses caching/bot detection).
     """
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+    }
     articles: list[dict[str, str]] = []
     seen_titles: set[str] = set()
 
+    # Add cache-buster to URL
+    cache_bust_url = f"{INSHORTS_URL}?t={int(time.time())}"
+
     try:
-        resp = requests.get(INSHORTS_URL, headers=headers, timeout=15)
-        resp.raise_for_status()
+        if _CFFI_AVAILABLE:
+            resp = cffi_requests.get(cache_bust_url, headers=headers, timeout=15, impersonate="chrome")
+        else:
+            resp = requests.get(cache_bust_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            log.warning("Inshorts returned HTTP %s", resp.status_code)
+            return []
     except Exception as e:
         log.error("Inshorts fetch failed: %s", e)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
     cards = soup.find_all("div", {"itemtype": "http://schema.org/NewsArticle"})
+
+    if not cards:
+        log.warning("Inshorts: no NewsArticle cards found (page may have changed)")
+        return []
 
     for card in cards:
         headline_tag = card.find(itemprop="headline")
@@ -128,9 +215,33 @@ def scrape_inshorts(min_articles: int = 10, skip_posted: bool = True) -> list[di
     return articles
 
 
+def scrape_and_queue() -> int:
+    """Scrape Inshorts and add any new articles to the queue. Returns count of new articles."""
+    articles = scrape_inshorts(min_articles=10, skip_posted=True)
+    if articles:
+        queue_articles(articles)
+        log.info("Queued %d new articles from Inshorts", len(articles))
+    return len(articles)
+
+
 def get_fresh_articles_for_posting(min_articles: int = 10) -> list[dict[str, str]]:
-    """Get only unposted articles (for auto-post and /news Post button)."""
-    return scrape_inshorts(min_articles, skip_posted=True)
+    """Get unposted articles: live scrape + previously queued ones."""
+    # First, do a fresh scrape
+    live_articles = scrape_inshorts(min_articles, skip_posted=True)
+
+    # Also get anything from the queue we captured between cycles
+    queued = get_queued_articles()
+
+    # Merge: live articles first, then queued (deduplicated by title hash)
+    seen: set[str] = set()
+    combined: list[dict[str, str]] = []
+    for a in live_articles + queued:
+        h = _hash_title(a["title"])
+        if h not in seen:
+            seen.add(h)
+            combined.append(a)
+
+    return combined[:min_articles]
 
 
 HEADER = "\u26A1\uFE0F <b>\U0001d413\U0001d404\U0001d402\U0001d407 \U0001d40d\U0001d404\U0001d416\U0001d412 \U0001d405\U0001d40b\U0001d400\U0001d412\U0001d407</b> \u26A1\uFE0F"

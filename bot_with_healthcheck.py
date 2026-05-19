@@ -38,10 +38,13 @@ from market_backtest import run_backtest
 from news_service import (
     ensure_news_table,
     scrape_inshorts,
+    scrape_and_queue,
     get_fresh_articles_for_posting,
     format_news_post,
     format_news_posts,
     mark_news_posted,
+    cleanup_old_news,
+    clear_queue,
 )
 from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
@@ -1856,8 +1859,11 @@ async def start_http_server(app: web.Application):
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
 async def run_news_autopost(bot: Bot):
-    """Auto-post tech news to CHANNEL_ID at configured IST hours (default 10 AM, 10 PM)."""
+    """Auto-post tech news to CHANNEL_ID at configured IST hours (default 10 AM, 10 PM).
+    Also scrapes every 2 hours to queue articles so nothing is missed."""
     posted_today: set[int] = set()
+    last_post_day = None
+    last_scrape_hour = -1
 
     while True:
         try:
@@ -1869,6 +1875,24 @@ async def run_news_autopost(bot: Bot):
         current_hour = now_ist.hour
         current_day = now_ist.date()
 
+        # Reset tracking at midnight (new day)
+        if last_post_day is not None and current_day != last_post_day:
+            posted_today.clear()
+            await asyncio.to_thread(cleanup_old_news, 7)
+        last_post_day = current_day
+
+        # Background scrape every 2 hours to capture new articles into queue
+        scrape_due = (current_hour % 2 == 0) and (current_hour != last_scrape_hour)
+        if scrape_due:
+            try:
+                count = await asyncio.to_thread(scrape_and_queue)
+                if count:
+                    log.info("📰 Background scrape: queued %d new articles", count)
+                last_scrape_hour = current_hour
+            except Exception as e:
+                log.error("📰 Background scrape failed: %s", e)
+
+        # Post at configured hours
         if current_hour in NEWS_POST_HOURS and current_hour not in posted_today:
             log.info("📰 News auto-post triggered (IST %02d:xx)", current_hour)
             articles = await asyncio.to_thread(get_fresh_articles_for_posting, 10)
@@ -1881,17 +1905,13 @@ async def run_news_autopost(bot: Bot):
                         )
                         await asyncio.sleep(1)
                     mark_news_posted([a["title"] for a in articles])
+                    clear_queue()
                     log.info("📰 News posted: %d articles (%d msgs)", len(articles), len(parts))
                 except TelegramError as e:
                     log.error("📰 News post failed: %s", e)
             else:
                 log.info("📰 No new articles for auto-post")
             posted_today.add(current_hour)
-
-        # Reset tracking at midnight
-        check_day = now_ist.date() if hasattr(now_ist, "date") else current_day
-        if check_day != current_day:
-            posted_today.clear()
 
         await asyncio.sleep(120)
 
