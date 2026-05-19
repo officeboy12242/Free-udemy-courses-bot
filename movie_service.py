@@ -28,6 +28,12 @@ import urllib3
 from bs4 import BeautifulSoup
 
 try:
+    from curl_cffi import requests as cffi_requests
+    _CFFI_AVAILABLE = True
+except ImportError:
+    _CFFI_AVAILABLE = False
+
+try:
     from playwright.sync_api import sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
@@ -125,9 +131,38 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                     time.sleep(2 * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    # ── Direct mode (local / non-blocked network) ────────────────────────────
+    # ── curl_cffi mode (free, fast, bypasses Cloudflare TLS fingerprinting) ──
     host = urllib.parse.urlparse(url).hostname or ""
     verify = host not in _NO_VERIFY_HOSTS
+
+    if _CFFI_AVAILABLE:
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                timeout = kwargs.get("timeout", 20)
+                params = kwargs.get("params", None)
+                r = cffi_requests.get(
+                    url, headers=HEADERS, verify=verify,
+                    timeout=timeout, params=params,
+                    impersonate="chrome"
+                )
+                if r.status_code in (403, 429, 503) and attempt < retries:
+                    log.warning("_get(cffi) %s → HTTP %s (attempt %d), retrying…",
+                                url, r.status_code, attempt + 1)
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                if r.status_code not in (200, 301, 302):
+                    log.warning("_get(cffi) %s → HTTP %s", url, r.status_code)
+                return r
+            except Exception as exc:
+                last_exc = exc
+                log.warning("_get(cffi) %s → %s: %s (attempt %d)",
+                            url, type(exc).__name__, exc, attempt + 1)
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+
+    # ── Fallback: plain requests (if curl_cffi not installed) ─────────────────
     session = _session_for(host)
 
     ctx = warnings.catch_warnings()

@@ -1094,6 +1094,9 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         elif source == "bolly":
             detail = await asyncio.to_thread(bollyflix_movie_links, movie["url"])
             text = format_bollyflix_message(movie["title"], detail)
+        elif source == "moviesmod":
+            detail = await asyncio.to_thread(moviesmod_movie_links, movie["url"])
+            text = format_moviesmod_message(movie["title"], detail)
         else:  # m4u
             detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
             text = format_m4u_message(movie["title"], detail)
