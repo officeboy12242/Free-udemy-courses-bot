@@ -3435,20 +3435,19 @@ def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
     soup = BeautifulSoup(resp.text, "html.parser")
     content = soup.select_one("article") or soup
 
-    # Extract poster image
+    # Extract poster image - skip site assets, rank badges, torrent icons
+    _skip_poster = ["avatar", "emoji", "icon", "logo", "rep_", "reaction",
+                    "grandmaster", "torrborder", "utorrent", ".svg", ".gif"]
     for img in content.find_all("img", src=True):
         src = img.get("src", "").strip()
-        if not src:
+        if not src or not src.startswith("http"):
             continue
-        if any(x in src.lower() for x in ["poster", "tmdb", "image.tmdb.org", "img.posterbox"]):
+        src_lower = src.lower()
+        if any(x in src_lower for x in _skip_poster):
+            continue
+        if any(ext in src_lower for ext in [".jpg", ".jpeg", ".png", ".webp"]):
             result["poster"] = src
             break
-        if src.startswith("http") and any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-            w = img.get("width", "")
-            h = img.get("height", "")
-            if (w and int(w) > 150) or (h and int(h) > 150) or (not w and not h):
-                result["poster"] = src
-                break
 
     if not result["poster"]:
         og_img = soup.find("meta", property="og:image")
@@ -3486,45 +3485,68 @@ def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
 
 
 def tamilmv_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]]:
-    """Fetch recently added movies from 1TamilMV homepage with pagination."""
-    url = TAMILMV_BASE + "/" if page <= 1 else f"{TAMILMV_BASE}/index.php?/discover/{page}/"
+    """Fetch recently added movies from 1TamilMV homepage with pagination.
+    
+    The RECENTLY ADDED section on the homepage contains ~40 links.
+    We paginate by slicing: page 1 = items 0-9, page 2 = items 10-19, etc.
+    """
     try:
-        resp = _tamilmv_get(url)
+        resp = _tamilmv_get(TAMILMV_BASE + "/")
         resp.raise_for_status()
     except Exception as exc:
-        log.error("tamilmv_latest_movies page %d failed: %s", page, exc)
+        log.error("tamilmv_latest_movies failed: %s", exc)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    movies: list[dict[str, str]] = []
 
-    for a in soup.select("a[href*='/forums/topic/']"):
-        if len(movies) >= limit:
-            break
-        title = a.get_text(strip=True)
+    # The RECENTLY ADDED section is inside .banger-container
+    container = soup.select_one(".banger-container")
+    if not container:
+        container = soup
+
+    all_movies: list[dict[str, str]] = []
+    seen_urls: set = set()
+
+    for a in container.find_all("a", href=True):
         href = a.get("href", "")
-        if not title or len(title) < 15:
+        if "/forums/topic/" not in href:
+            continue
+        link_url = href if href.startswith("http") else TAMILMV_BASE + href
+        if link_url in seen_urls:
+            continue
+
+        # Title: sometimes the <a> text is just quality info like "[1080p & 720p...]"
+        # In that case, the actual movie name is the preceding text node
+        a_text = a.get_text(strip=True)
+        title = a_text
+
+        if a_text.startswith("[") or not any(c.isalpha() for c in a_text[:5]):
+            # Get preceding text from parent
+            prev_text = ""
+            for prev in a.previous_siblings:
+                if isinstance(prev, str):
+                    prev_text = prev.strip()
+                    if prev_text:
+                        break
+                elif hasattr(prev, 'get_text'):
+                    prev_text = prev.get_text(strip=True)
+                    if prev_text:
+                        break
+            if prev_text:
+                title = f"{prev_text} {a_text}"
+
+        if not title or len(title) < 10:
             continue
         if "story explain" in title.lower():
             continue
-        if not any(x in title for x in ["1080p", "720p", "480p", "WEB-DL", "BluRay", "HD", "4K"]):
-            continue
-        link_url = href if href.startswith("http") else TAMILMV_BASE + href
-        if any(m["url"] == link_url for m in movies):
-            continue
 
-        poster = ""
-        parent = a.find_parent("li") or a.find_parent("div") or a.find_parent("tr")
-        if parent:
-            img = parent.find("img", src=True)
-            if img:
-                src = img.get("src", "").strip()
-                if src.startswith("http") and any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-                    poster = src
+        seen_urls.add(link_url)
+        all_movies.append({"title": title[:120], "url": link_url, "poster": "", "source": "tamilmv"})
 
-        movies.append({"title": title[:100], "url": link_url, "poster": poster, "source": "tamilmv"})
-
-    return movies
+    # Paginate by slicing
+    start = (page - 1) * limit
+    end = start + limit
+    return all_movies[start:end]
 
 
 def format_tamilmv_message(movie_title: str, data: dict, footer: bool = True) -> str:
