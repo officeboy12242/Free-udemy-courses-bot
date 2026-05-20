@@ -56,7 +56,7 @@ from movie_service import (
     bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
-    tamilmv_search, tamilmv_movie_links, format_tamilmv_message,
+    tamilmv_search, tamilmv_movie_links, tamilmv_latest_movies, format_tamilmv_message,
     hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
 )
@@ -385,6 +385,7 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
         [InlineKeyboardButton("🚜 MoviesMod",                callback_data="msite_moviesmod")],
         [InlineKeyboardButton("🅰️ AtoZ Cinemas",            callback_data="msite_atoz")],
+        [InlineKeyboardButton("🎬 1TamilMV (Multi Audio)",   callback_data="msite_tamilmv")],
     ]
     await update.effective_message.reply_text(
         "🍿 <b>Movie Downloader</b>\n\nChoose a source:",
@@ -472,6 +473,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     else bollyflix_latest_movies if source == "bolly"
                     else moviesmod_latest_movies if source == "moviesmod"
                     else atoz_latest_movies    if source == "atoz"
+                    else tamilmv_latest_movies if source == "tamilmv"
                     else m4u_latest_movies)
         movies = await asyncio.to_thread(fetch_fn, page)
 
@@ -507,7 +509,8 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         site_label = {"hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
                       "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
-                      "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas"}.get(source, source)
+                      "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
+                      "tamilmv": "1TamilMV"}.get(source, source)
         await _edit_or_reply(
             f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -532,6 +535,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
             [InlineKeyboardButton("🚜 MoviesMod",               callback_data="msite_moviesmod")],
             [InlineKeyboardButton("🅰️ AtoZ Cinemas",            callback_data="msite_atoz")],
+            [InlineKeyboardButton("🎬 1TamilMV (Multi Audio)",   callback_data="msite_tamilmv")],
         ]
         await _edit_or_reply(
             "🍿 <b>Movie Downloader</b>\n\nChoose a source:",

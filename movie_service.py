@@ -3466,19 +3466,19 @@ def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
     return result
 
 
-def tamilmv_latest_movies(limit: int = 10) -> list[dict[str, str]]:
-    """Fetch recently added movies from 1TamilMV homepage."""
+def tamilmv_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]]:
+    """Fetch recently added movies from 1TamilMV homepage with pagination."""
+    url = TAMILMV_BASE + "/" if page <= 1 else f"{TAMILMV_BASE}/index.php?/discover/{page}/"
     try:
-        resp = _tamilmv_get(TAMILMV_BASE + "/")
+        resp = _tamilmv_get(url)
         resp.raise_for_status()
     except Exception as exc:
-        log.error("tamilmv_latest_movies failed: %s", exc)
+        log.error("tamilmv_latest_movies page %d failed: %s", page, exc)
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
     movies: list[dict[str, str]] = []
 
-    # Find forum topic links on the homepage
     for a in soup.select("a[href*='/forums/topic/']"):
         if len(movies) >= limit:
             break
@@ -3488,12 +3488,11 @@ def tamilmv_latest_movies(limit: int = 10) -> list[dict[str, str]]:
             continue
         if "story explain" in title.lower():
             continue
-        # Must look like a movie post (has quality indicators)
         if not any(x in title for x in ["1080p", "720p", "480p", "WEB-DL", "BluRay", "HD", "4K"]):
             continue
-        url = href if href.startswith("http") else TAMILMV_BASE + href
-        if not any(m["url"] == url for m in movies):
-            movies.append({"title": title[:100], "url": url, "poster": "", "source": "tamilmv"})
+        link_url = href if href.startswith("http") else TAMILMV_BASE + href
+        if not any(m["url"] == link_url for m in movies):
+            movies.append({"title": title[:100], "url": link_url, "poster": "", "source": "tamilmv"})
 
     return movies
 
