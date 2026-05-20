@@ -1,11 +1,51 @@
 services:
-  # OPTION: Change this to run stream_server.py if you want THIS URL to handle /search
-  # Current: Runs main bot (market tracker)
-  # To fix: Change startCommand to "python stream_server.py" and add API_ID, API_HASH, STREAM_BOT_TOKEN, STREAM_CHANNEL_ID to envVars
   - type: web
     name: telegram-course-bot
     env: python
     buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
+    startCommand: python bot_with_healthcheck.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: MARKET_ALERT_CHAT_ID
+        sync: false
+      - key: MOVIES_CHANNEL_ID
+        sync: false
+      - key: SCRAPER_API_KEY
+        sync: false
+      - key: DIP_THRESHOLD_PERCENT
+        value: "1"
+      - key: MIN_DEEPER_STEP
+        value: "0.5"
+      - key: MARKET_POLL_INTERVAL
+        value: "120"
+      - key: MARKET_FEATURES_ENABLED
+        value: "1"
+      - key: PORT
+        value: "10000"
+      - key: HDHUB_BASE_URL
+        value: "https://new1.hdhub4u.limo"
+      - key: HDH_BASE_URL
+        value: "https://4khdhub.link"
+      - key: MD_BASE_URL
+        value: "https://new2.moviesdrives.my"
+      - key: M4U_BASE_URL
+        value: "https://movies4u.ee"
+      - key: VEGA_BASE_URL
+        value: "https://vegamovies.global"
+      - key: SDMP_BASE_URL
+        value: "https://sd1.sdmoviespoint.trade"
+      - key: BOLLYFLIX_BASE_URL
+        value: "https://new.bollyflix.gd"
+    healthCheckPath: /health
+    autoDeploy: true
+  
+  - type: web
+    name: telegram-stream-server
+    env: python
+    buildCommand: pip install -r requirements.txt
     startCommand: python stream_server.py
     envVars:
       - key: API_ID
@@ -17,5 +57,6 @@ services:
       - key: STREAM_CHANNEL_ID
         sync: false
       - key: PORT
-        value: "10000"
+        value: "8080"
+    healthCheckPath: /health
     autoDeploy: true
