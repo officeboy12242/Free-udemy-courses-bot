@@ -57,9 +57,7 @@ class Streamer:
             "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{file_name}"',
-            "Access-Control-Allow-Origin": "*",  # Allow embedding in other sites/players
-            "Cache-Control": "public, max-age=31536000",  # Cache for 1 year (like AtoZ)
-            "X-Content-Type-Options": "nosniff",
+            "Access-Control-Allow-Origin": "*" # Allow embedding in other sites/players
         }
 
         # Handle HTTP Range requests (crucial for video seeking/skipping)
@@ -112,31 +110,102 @@ class Streamer:
 
         results = []
         try:
-            # Search messages in the channel
-            async for message in tg_app.search_messages(STREAM_CHANNEL_ID, query=query, limit=20):
-                if not message or getattr(message, "empty", True):
-                    continue
+            query_lower = query.lower()
+            
+            # Try to search using Pyrogram's search_messages first
+            try:
+                async for message in tg_app.search_messages(STREAM_CHANNEL_ID, query=query, limit=50):
+                    if not message or getattr(message, "empty", True):
+                        continue
+                    
+                    # Check if it has media
+                    media = message.document or message.video or message.audio
+                    if not media:
+                        continue
+                    
+                    file_name = getattr(media, "file_name", "Unknown File")
+                    file_size = getattr(media, "file_size", 0)
+                    caption = message.caption or ""
+                    
+                    # Additional filtering: check if query matches file name or caption
+                    if (query_lower in file_name.lower() or 
+                        (caption and query_lower in caption.lower())):
+                        results.append({
+                            "message_id": message.id,
+                            "file_name": file_name,
+                            "file_size": file_size,
+                            "caption": caption
+                        })
+                    
+                    if len(results) >= 20:
+                        break
+            except Exception as search_err:
+                log.warning("Pyrogram search failed, falling back to manual scan: %s", search_err)
                 
-                # Check if it has media
-                media = message.document or message.video or message.audio
-                if not media:
-                    continue
-                
-                file_name = getattr(media, "file_name", "Unknown File")
-                file_size = getattr(media, "file_size", 0)
-                caption = message.caption or ""
-                
-                results.append({
-                    "message_id": message.id,
-                    "file_name": file_name,
-                    "file_size": file_size,
-                    "caption": caption
-                })
+                # Fallback: manually iterate through recent messages
+                # This will work even if the bot doesn't have search permissions
+                async for message in tg_app.get_chat_history(STREAM_CHANNEL_ID, limit=200):
+                    if not message or getattr(message, "empty", True):
+                        continue
+                    
+                    media = message.document or message.video or message.audio
+                    if not media:
+                        continue
+                    
+                    file_name = getattr(media, "file_name", "Unknown File")
+                    file_size = getattr(media, "file_size", 0)
+                    caption = message.caption or ""
+                    
+                    # Check if query matches file name or caption
+                    if (query_lower in file_name.lower() or 
+                        (caption and query_lower in caption.lower())):
+                        results.append({
+                            "message_id": message.id,
+                            "file_name": file_name,
+                            "file_size": file_size,
+                            "caption": caption
+                        })
+                    
+                    if len(results) >= 20:
+                        break
+                        
         except Exception as e:
             log.error("Error searching messages: %s", e)
-            return web.json_response({"error": "Error searching Telegram channel"}, status=500)
+            return web.json_response({
+                "error": f"Error searching Telegram channel: {str(e)}",
+                "hint": "Make sure the bot is added to the channel and has 'Read Messages' permission"
+            }, status=500)
 
-        return web.json_response({"results": results})
+        return web.json_response({"results": results, "total": len(results)})
+
+    async def handle_health(self, request):
+        """Health check endpoint to verify bot is connected and can access the channel."""
+        try:
+            # Try to get channel info
+            chat = await tg_app.get_chat(STREAM_CHANNEL_ID)
+            
+            # Try to get recent messages count
+            message_count = 0
+            async for _ in tg_app.get_chat_history(STREAM_CHANNEL_ID, limit=10):
+                message_count += 1
+            
+            return web.json_response({
+                "status": "ok",
+                "bot_connected": tg_app.is_connected,
+                "channel_id": STREAM_CHANNEL_ID,
+                "channel_title": getattr(chat, "title", "Unknown"),
+                "can_read_messages": message_count > 0,
+                "recent_messages_count": message_count
+            })
+        except Exception as e:
+            log.error("Health check failed: %s", e)
+            return web.json_response({
+                "status": "error",
+                "error": str(e),
+                "bot_connected": tg_app.is_connected if hasattr(tg_app, 'is_connected') else False,
+                "channel_id": STREAM_CHANNEL_ID,
+                "hint": "Make sure the bot is added to the channel as admin or with 'Read Messages' permission"
+            }, status=500)
 
 async def on_startup(app_web):
     """Start the Telegram client when the web server starts."""
@@ -159,6 +228,7 @@ def main():
     # Define our routes
     server.router.add_get("/watch/{message_id}", streamer.handle_stream)
     server.router.add_get("/search", streamer.handle_search)
+    server.router.add_get("/health", streamer.handle_health)
     
     # Hook into startup/shutdown
     server.on_startup.append(on_startup)
