@@ -57,7 +57,9 @@ class Streamer:
             "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{file_name}"',
-            "Access-Control-Allow-Origin": "*" # Allow embedding in other sites/players
+            "Access-Control-Allow-Origin": "*",  # Allow embedding in other sites/players
+            "Cache-Control": "public, max-age=31536000",  # Cache for 1 year (like AtoZ)
+            "X-Content-Type-Options": "nosniff",
         }
 
         # Handle HTTP Range requests (crucial for video seeking/skipping)
