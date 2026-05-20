@@ -101,7 +101,7 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
     verify = host not in _NO_VERIFY_HOSTS
 
     # ── Try curl_cffi first (best anti-bot bypass, free) ─────────────────────
-    use_cffi = _CFFI_AVAILABLE and verify
+    use_cffi = _CFFI_AVAILABLE
     if use_cffi:
         cffi_exc = None
         for attempt in range(retries + 1):
@@ -109,7 +109,7 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
                 timeout = kwargs.get("timeout", 20)
                 params = kwargs.get("params", None)
                 r = cffi_requests.get(
-                    url, headers=HEADERS, verify=True,
+                    url, headers=HEADERS, verify=verify,
                     timeout=timeout, params=params,
                     impersonate="chrome"
                 )
