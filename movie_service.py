@@ -3297,6 +3297,12 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
             continue
 
         file_name = data.get("file_name", "") or _atoz_button_label(btn)
+        
+        # Clean up the file name to remove @AtoZ_Files and extensions
+        file_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
+        file_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', file_name)
+        file_name = file_name.strip()
+        
         file_size = data.get("file_size", "")
         label = f"{file_name} ({file_size})" if file_size else file_name
         result["links"].append({"label": label, "url": final_url})
