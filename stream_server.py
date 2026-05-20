@@ -10,7 +10,7 @@ log = logging.getLogger(__name__)
 API_ID = int(os.environ.get("API_ID", 0) or 0)
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("STREAM_BOT_TOKEN", "")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID", 0) or 0)
+STREAM_CHANNEL_ID = int(os.environ.get("STREAM_CHANNEL_ID", 0) or 0)
 PORT = int(os.environ.get("PORT", 8080))
 
 # Initialize Pyrogram Client (MTProto API)
@@ -33,7 +33,7 @@ class Streamer:
 
         try:
             # Fetch the message from your private channel
-            message = await tg_app.get_messages(CHANNEL_ID, message_id)
+            message = await tg_app.get_messages(STREAM_CHANNEL_ID, message_id)
         except Exception as e:
             log.error("Error fetching message: %s", e)
             return web.Response(status=500, text="Error fetching message from Telegram")
@@ -101,7 +101,7 @@ class Streamer:
 
 async def on_startup(app_web):
     """Start the Telegram client when the web server starts."""
-    if API_ID and API_HASH and BOT_TOKEN and CHANNEL_ID:
+    if API_ID and API_HASH and BOT_TOKEN and STREAM_CHANNEL_ID:
         await tg_app.start()
         log.info("✅ Pyrogram Client Started Successfully")
     else:
