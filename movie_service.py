@@ -3435,6 +3435,26 @@ def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
     soup = BeautifulSoup(resp.text, "html.parser")
     content = soup.select_one("article") or soup
 
+    # Extract poster image
+    for img in content.find_all("img", src=True):
+        src = img.get("src", "").strip()
+        if not src:
+            continue
+        if any(x in src.lower() for x in ["poster", "tmdb", "image.tmdb.org", "img.posterbox"]):
+            result["poster"] = src
+            break
+        if src.startswith("http") and any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+            w = img.get("width", "")
+            h = img.get("height", "")
+            if (w and int(w) > 150) or (h and int(h) > 150) or (not w and not h):
+                result["poster"] = src
+                break
+
+    if not result["poster"]:
+        og_img = soup.find("meta", property="og:image")
+        if og_img:
+            result["poster"] = og_img.get("content", "")
+
     for a in content.find_all("a", href=True):
         text = a.get_text(strip=True)
         href = a.get("href", "")
@@ -3443,7 +3463,6 @@ def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
             continue
 
         if text.upper() == "DIRECT LINK":
-            # Extract quality from previous <strong> sibling
             prev = a.find_previous("strong")
             quality_text = prev.get_text(strip=True) if prev else ""
             quality = "Unknown"
@@ -3491,8 +3510,19 @@ def tamilmv_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]
         if not any(x in title for x in ["1080p", "720p", "480p", "WEB-DL", "BluRay", "HD", "4K"]):
             continue
         link_url = href if href.startswith("http") else TAMILMV_BASE + href
-        if not any(m["url"] == link_url for m in movies):
-            movies.append({"title": title[:100], "url": link_url, "poster": "", "source": "tamilmv"})
+        if any(m["url"] == link_url for m in movies):
+            continue
+
+        poster = ""
+        parent = a.find_parent("li") or a.find_parent("div") or a.find_parent("tr")
+        if parent:
+            img = parent.find("img", src=True)
+            if img:
+                src = img.get("src", "").strip()
+                if src.startswith("http") and any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                    poster = src
+
+        movies.append({"title": title[:100], "url": link_url, "poster": poster, "source": "tamilmv"})
 
     return movies
 
