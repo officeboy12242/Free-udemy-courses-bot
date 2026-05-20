@@ -8,6 +8,7 @@ Movie scraper — supports multiple sources:
   - SDMoviesPoint   (https://sd1.sdmoviespoint.trade/)
   - BollyFlix       (https://new.bollyflix.gd/)
   - MoviesMod       (https://moviesmod.farm/)
+  - AtoZ Cinemas    (https://atoz.cinemaz.workers.dev/)
 """
 from __future__ import annotations
 
@@ -3169,3 +3170,164 @@ def moviesmod_search(query: str, limit: int = 10) -> list[dict]:
         log.error("moviesmod_search '%s' failed: %s", query, exc)
         return []
     return _moviesmod_parse_listing(soup, limit)
+
+
+# ── AtoZ Cinemas ──────────────────────────────────────────────────────────────
+
+ATOZ_BASE = os.getenv("ATOZ_BASE_URL", "https://atoz.cinemaz.workers.dev")
+
+
+def _atoz_abs_url(href: str) -> str:
+    if not href:
+        return ""
+    if href.startswith("http"):
+        return href
+    base = ATOZ_BASE.rstrip("/")
+    return base + (href if href.startswith("/") else f"/{href}")
+
+
+def _atoz_parse_listing(soup: BeautifulSoup, limit: int) -> list[dict]:
+    movies: list[dict] = []
+    for card in soup.select("a.movie-card"):
+        if len(movies) >= limit:
+            break
+        h3 = card.select_one("h3")
+        title_el = h3 or card.select_one(".card-title")
+        title = title_el.get_text(strip=True) if title_el else ""
+        if not title:
+            img = card.select_one("img")
+            title = (img.get("alt", "") if img else "").strip()
+        href = card.get("href", "")
+        url = _atoz_abs_url(href)
+        img = card.select_one("img")
+        poster = ""
+        if img:
+            poster = img.get("src", "") or img.get("data-src", "") or ""
+        if url and title:
+            movies.append({"title": title, "url": url, "poster": poster, "source": "atoz"})
+    return movies
+
+
+def atoz_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
+    """Fetch latest movies from AtoZ Cinemas."""
+    url = f"{ATOZ_BASE}/?page={page}"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("atoz_latest_movies page=%d failed: %s", page, exc)
+        return []
+    return _atoz_parse_listing(soup, limit)
+
+
+def atoz_search(query: str, limit: int = 10) -> list[dict]:
+    """Search AtoZ Cinemas."""
+    url = f"{ATOZ_BASE}/search?q={urllib.parse.quote(query)}"
+    try:
+        resp = _get(url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("atoz_search '%s' failed: %s", query, exc)
+        return []
+    return _atoz_parse_listing(soup, limit)
+
+
+def _atoz_button_label(btn: Any) -> str:
+    """Extract filename text from a download button's surrounding container."""
+    container = btn.find_parent(class_="file-item")
+    if not container:
+        for anc in btn.parents:
+            if anc.name in ("body", "html", "[document]"):
+                break
+            name_el = anc.select_one(".dl-btn-name")
+            if name_el:
+                return name_el.get_text(strip=True)
+        return btn.get_text(strip=True)
+    name_el = container.select_one(".dl-btn-name")
+    return name_el.get_text(strip=True) if name_el else btn.get_text(strip=True)
+
+
+def atoz_movie_links(movie_url: str) -> dict[str, Any]:
+    """Fetch download links for an AtoZ movie page."""
+    movie_url = _atoz_abs_url(movie_url)
+    result: dict[str, Any] = {
+        "poster": "",
+        "info": {},
+        "links": [],
+        "episodes": [],
+        "is_series": False,
+    }
+    try:
+        resp = _get(movie_url, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("atoz_movie_links %s failed: %s", movie_url, exc)
+        return result
+
+    for img in soup.find_all("img"):
+        src = img.get("src", "") or ""
+        if "tmdb" in src or (img.get("class") and "poster" in " ".join(img.get("class", []))):
+            result["poster"] = src
+            break
+    if not result["poster"]:
+        img = soup.select_one("img")
+        if img:
+            result["poster"] = img.get("src", "") or img.get("data-src", "") or ""
+
+    buttons = soup.find_all("button", attrs={"data-id": True})
+    if len(buttons) > 1:
+        result["is_series"] = True
+
+    seen_ids: set[str] = set()
+    for btn in buttons:
+        data_id = btn.get("data-id", "").strip()
+        if not data_id or data_id in seen_ids:
+            continue
+        seen_ids.add(data_id)
+
+        try:
+            gen_resp = _get(f"{ATOZ_BASE}/generate_links?id={data_id}", timeout=25)
+            data = gen_resp.json()
+        except Exception as exc:
+            log.warning("atoz generate_links id=%s failed: %s", data_id, exc)
+            continue
+
+        final_url = data.get("url", "")
+        if not final_url:
+            continue
+
+        file_name = data.get("file_name", "") or _atoz_button_label(btn)
+        file_size = data.get("file_size", "")
+        label = f"{file_name} ({file_size})" if file_size else file_name
+        result["links"].append({"label": label, "url": final_url})
+
+    return result
+
+
+def format_atoz_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format an AtoZ Cinemas result as HTML for Telegram."""
+    links = data.get("links", [])
+
+    lines: list[str] = []
+    disp = movie_title or data.get("title", "")
+    if disp:
+        lines.append(f"🅰️ <b>{disp}</b>")
+
+    if not links:
+        if lines:
+            lines.append("\n❌ No download links parsed.")
+        return "\n".join(lines) if lines else ""
+
+    lines.append("\n" + "━" * 32)
+    lines.append("📥 <b>Download Links (AtoZ Cinemas)</b>\n")
+    for lk in links:
+        label = lk.get("label", "Download")
+        url_ = lk.get("url", "")
+        lines.append(f"📦 <b>{label}</b>")
+        lines.append(f"   🔗 <a href='{url_}'>Download</a>")
+
+    if footer:
+        lines.append("\n" + "━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+
+    return "\n".join(lines)
