@@ -56,6 +56,7 @@ from movie_service import (
     bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
+    tamilmv_search, tamilmv_movie_links, format_tamilmv_message,
     hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
 )
@@ -590,6 +591,9 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 elif source == "atoz":
                     detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
                     text = format_atoz_message(movie["title"], detail)
+                elif source == "tamilmv":
+                    detail = await asyncio.to_thread(tamilmv_movie_links, movie["url"])
+                    text = format_tamilmv_message(movie["title"], detail)
                 else:
                     detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
                     text = format_m4u_message(movie["title"], detail)
@@ -681,7 +685,8 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
          InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
         [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
          InlineKeyboardButton("🚜 MoviesMod",    callback_data="msrc_moviesmod")],
-        [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz")],
+        [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz"),
+         InlineKeyboardButton("🎬 1TamilMV",     callback_data="msrc_tamilmv")],
         [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
     ]
     await update.effective_message.reply_html(
@@ -726,7 +731,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
              InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
             [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
              InlineKeyboardButton("🚜 MoviesMod",    callback_data="msrc_moviesmod")],
-            [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz")],
+            [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz"),
+             InlineKeyboardButton("🎬 1TamilMV",     callback_data="msrc_tamilmv")],
             [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
         ]
         await _src_edit(
@@ -745,7 +751,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
         "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
         "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
-        "both": "All Sites",
+        "tamilmv": "1TamilMV", "both": "All Sites",
     }.get(source, source)
     await _src_edit(
         f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
@@ -762,6 +768,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     bolly_results: list = []
     moviesmod_results: list = []
     atoz_results: list = []
+    tamilmv_results: list = []
 
     if source == "hdhub":
         hdhub_results = await asyncio.to_thread(hdhub_search, search_query, 10)
@@ -781,10 +788,13 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         moviesmod_results = await asyncio.to_thread(moviesmod_search, search_query, 10)
     elif source == "atoz":
         atoz_results = await asyncio.to_thread(atoz_search, search_query, 10)
+    elif source == "tamilmv":
+        tamilmv_results = await asyncio.to_thread(tamilmv_search, search_query, 10)
     else:  # all sites
         (
             hdhub_results, hdh_results, md_results, m4u_results,
-            vega_results, sdmp_results, bolly_results, moviesmod_results, atoz_results
+            vega_results, sdmp_results, bolly_results, moviesmod_results,
+            atoz_results, tamilmv_results
         ) = await asyncio.gather(
             asyncio.to_thread(hdhub_search, search_query, 4),
             asyncio.to_thread(hdh_search,   search_query, 3),
@@ -795,11 +805,12 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             asyncio.to_thread(bollyflix_search, search_query, 3),
             asyncio.to_thread(moviesmod_search, search_query, 3),
             asyncio.to_thread(atoz_search, search_query, 3),
+            asyncio.to_thread(tamilmv_search, search_query, 3),
         )
 
     if (not hdhub_results and not hdh_results and not md_results and not m4u_results
             and not vega_results and not sdmp_results and not bolly_results
-            and not moviesmod_results and not atoz_results):
+            and not moviesmod_results and not atoz_results and not tamilmv_results):
         await _src_edit(
             f"❌ No results found for <b>{search_query}</b> on {source_label}.",
             parse_mode="HTML",
@@ -816,6 +827,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     all_results.update({f"bolly_{i}": m for i, m in enumerate(bolly_results)})
     all_results.update({f"moviesmod_{i}": m for i, m in enumerate(moviesmod_results)})
     all_results.update({f"atoz_{i}": m for i, m in enumerate(atoz_results)})
+    all_results.update({f"tamilmv_{i}": m for i, m in enumerate(tamilmv_results)})
     context.user_data["search_results"] = all_results
 
     keyboard = []
@@ -873,6 +885,12 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🅰️ {title}", callback_data=f"msres_atoz_{i}")])
 
+    if tamilmv_results:
+        keyboard.append([InlineKeyboardButton("━━ 1TamilMV ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(tamilmv_results):
+            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
+            keyboard.append([InlineKeyboardButton(f"🎬 {title}", callback_data=f"msres_tamilmv_{i}")])
+
     # Post to channel + back
     keyboard.append([InlineKeyboardButton("📢 Post to Channel", callback_data="mpost_search")])
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
@@ -880,7 +898,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     total = (
         len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results)
         + len(vega_results) + len(sdmp_results) + len(bolly_results)
-        + len(moviesmod_results) + len(atoz_results)
+        + len(moviesmod_results) + len(atoz_results) + len(tamilmv_results)
     )
     await _src_edit(
         f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
@@ -923,7 +941,7 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz"):
+    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "tamilmv"):
         # Send processing message and run scraping in background
         processing_msg = await query.message.reply_text(
             "⏳ Fetching download links... This may take a moment.",
@@ -952,6 +970,9 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
                 elif source == "atoz":
                     detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
                     text = format_atoz_message(movie["title"], detail)
+                elif source == "tamilmv":
+                    detail = await asyncio.to_thread(tamilmv_movie_links, movie["url"])
+                    text = format_tamilmv_message(movie["title"], detail)
                 else:
                     detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
                     text = format_m4u_message(movie["title"], detail)
@@ -1129,6 +1150,9 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         elif source == "atoz":
             detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
             text = format_atoz_message(movie["title"], detail)
+        elif source == "tamilmv":
+            detail = await asyncio.to_thread(tamilmv_movie_links, movie["url"])
+            text = format_tamilmv_message(movie["title"], detail)
         else:  # m4u
             detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
             text = format_m4u_message(movie["title"], detail)

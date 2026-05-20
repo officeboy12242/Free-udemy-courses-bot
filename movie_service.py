@@ -3337,3 +3337,190 @@ def format_atoz_message(movie_title: str, data: dict, footer: bool = True) -> st
         lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
 
     return "\n".join(lines)
+
+
+# ─── 1TamilMV ────────────────────────────────────────────────────────────────
+
+TAMILMV_BASE = os.getenv("TAMILMV_BASE_URL", "https://www.1tamilmv.futbol")
+
+try:
+    import cloudscraper as _cloudscraper
+    _tamilmv_scraper = _cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+except ImportError:
+    _tamilmv_scraper = None
+    log.warning("cloudscraper not installed; 1TamilMV source will not work")
+
+
+def _tamilmv_get(url: str, retries: int = 3, **kwargs) -> Any:
+    """GET with cloudscraper + retries for 1TamilMV (Cloudflare-protected)."""
+    if not _tamilmv_scraper:
+        raise RuntimeError("cloudscraper not available")
+    kwargs.setdefault("timeout", 20)
+    for attempt in range(retries):
+        try:
+            return _tamilmv_scraper.get(url, **kwargs)
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+            else:
+                raise
+
+
+def _tamilmv_resolve_direct_link(cyberloom_url: str) -> str:
+    """Resolve cyberloom.best/l/xxx -> inkvoyage/stackmint -> cyberloom/out -> messycloud.ink."""
+    resp = _tamilmv_get(cyberloom_url, allow_redirects=True)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    continue_link = None
+    for a in soup.find_all("a", href=True):
+        if "/out?" in a.get("href", ""):
+            continue_link = a["href"]
+            break
+
+    if not continue_link:
+        return resp.url
+
+    time.sleep(1)
+    final_resp = _tamilmv_get(continue_link, allow_redirects=True)
+    return final_resp.url
+
+
+def tamilmv_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search 1TamilMV forums."""
+    search_url = (
+        f"{TAMILMV_BASE}/index.php?/search/&q={urllib.parse.quote(query)}"
+        "&type=forums_topic&search_and_or=and&search_in=titles"
+    )
+    try:
+        resp = _tamilmv_get(search_url)
+        resp.raise_for_status()
+    except Exception as exc:
+        log.error("tamilmv_search '%s' failed: %s", query, exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    movies: list[dict[str, str]] = []
+    for item in soup.select("li.ipsStreamItem, .ipsDataItem"):
+        if len(movies) >= limit:
+            break
+        title_link = item.select_one("a.ipsType_break, .ipsDataItem_title a, h2 a")
+        if not title_link:
+            continue
+        title = title_link.get_text(strip=True)
+        href = title_link.get("href", "")
+        if not title or not href:
+            continue
+        # Skip "story explain" posts
+        if "story explain" in title.lower():
+            continue
+        url = href if href.startswith("http") else TAMILMV_BASE + href
+        movies.append({"title": title[:100], "url": url, "poster": "", "source": "tamilmv"})
+    return movies
+
+
+def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
+    """Extract direct download links (messycloud.ink) from a 1TamilMV topic page."""
+    result: dict[str, Any] = {
+        "poster": "", "info": {}, "links": [], "episodes": [], "is_series": False,
+    }
+    try:
+        resp = _tamilmv_get(movie_url)
+        resp.raise_for_status()
+    except Exception as exc:
+        log.error("tamilmv_movie_links failed for %s: %s", movie_url, exc)
+        return result
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    content = soup.select_one("article") or soup
+
+    for a in content.find_all("a", href=True):
+        text = a.get_text(strip=True)
+        href = a.get("href", "")
+
+        if href.startswith("magnet:") or ".torrent" in href.lower():
+            continue
+
+        if text.upper() == "DIRECT LINK":
+            # Extract quality from previous <strong> sibling
+            prev = a.find_previous("strong")
+            quality_text = prev.get_text(strip=True) if prev else ""
+            quality = "Unknown"
+            if "1080p" in quality_text:
+                quality = "1080p"
+            elif "720p" in quality_text:
+                quality = "720p"
+            elif "480p" in quality_text or "Rip" in quality_text or "500MB" in quality_text:
+                quality = "480p"
+            elif "4K" in quality_text or "2160p" in quality_text:
+                quality = "4K"
+
+            try:
+                time.sleep(2)
+                final_url = _tamilmv_resolve_direct_link(href)
+                result["links"].append({"label": f"{quality} - Direct Download", "url": final_url})
+            except Exception as exc:
+                log.warning("tamilmv link resolve failed for %s: %s", href[:50], exc)
+
+    return result
+
+
+def tamilmv_latest_movies(limit: int = 10) -> list[dict[str, str]]:
+    """Fetch recently added movies from 1TamilMV homepage."""
+    try:
+        resp = _tamilmv_get(TAMILMV_BASE + "/")
+        resp.raise_for_status()
+    except Exception as exc:
+        log.error("tamilmv_latest_movies failed: %s", exc)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    movies: list[dict[str, str]] = []
+
+    # Find forum topic links on the homepage
+    for a in soup.select("a[href*='/forums/topic/']"):
+        if len(movies) >= limit:
+            break
+        title = a.get_text(strip=True)
+        href = a.get("href", "")
+        if not title or len(title) < 15:
+            continue
+        if "story explain" in title.lower():
+            continue
+        # Must look like a movie post (has quality indicators)
+        if not any(x in title for x in ["1080p", "720p", "480p", "WEB-DL", "BluRay", "HD", "4K"]):
+            continue
+        url = href if href.startswith("http") else TAMILMV_BASE + href
+        if not any(m["url"] == url for m in movies):
+            movies.append({"title": title[:100], "url": url, "poster": "", "source": "tamilmv"})
+
+    return movies
+
+
+def format_tamilmv_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format a 1TamilMV result as HTML for Telegram."""
+    links = data.get("links", [])
+    lines: list[str] = []
+    disp = movie_title or data.get("title", "")
+    if disp:
+        lines.append(f"🎬 <b>{disp}</b>")
+
+    if not links:
+        if lines:
+            lines.append("\n❌ No direct download links found.")
+        return "\n".join(lines) if lines else ""
+
+    lines.append("\n" + "━" * 32)
+    lines.append("📥 <b>Download Links (1TamilMV)</b>\n")
+    for lk in links:
+        label = lk.get("label", "Download")
+        url_ = lk.get("url", "")
+        lines.append(f"📦 <b>{label}</b>")
+        lines.append(f"   🔗 <a href='{url_}'>Download</a>")
+
+    if footer:
+        lines.append("\n" + "━" * 32)
+        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
+
+    return "\n".join(lines)
