@@ -2,6 +2,9 @@ import os
 import logging
 from aiohttp import web
 from pyrogram import Client
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -99,6 +102,40 @@ class Streamer:
             
             return response
 
+    async def handle_search(self, request):
+        """Search the Telegram channel for messages matching the query."""
+        query = request.query.get("q", "")
+        if not query:
+            return web.json_response({"error": "Missing query parameter 'q'"}, status=400)
+
+        results = []
+        try:
+            # Search messages in the channel
+            async for message in tg_app.search_messages(STREAM_CHANNEL_ID, query=query, limit=20):
+                if not message or getattr(message, "empty", True):
+                    continue
+                
+                # Check if it has media
+                media = message.document or message.video or message.audio
+                if not media:
+                    continue
+                
+                file_name = getattr(media, "file_name", "Unknown File")
+                file_size = getattr(media, "file_size", 0)
+                caption = message.caption or ""
+                
+                results.append({
+                    "message_id": message.id,
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "caption": caption
+                })
+        except Exception as e:
+            log.error("Error searching messages: %s", e)
+            return web.json_response({"error": "Error searching Telegram channel"}, status=500)
+
+        return web.json_response({"results": results})
+
 async def on_startup(app_web):
     """Start the Telegram client when the web server starts."""
     if API_ID and API_HASH and BOT_TOKEN and STREAM_CHANNEL_ID:
@@ -117,8 +154,9 @@ def main():
     server = web.Application()
     streamer = Streamer()
     
-    # Define our streaming route
+    # Define our routes
     server.router.add_get("/watch/{message_id}", streamer.handle_stream)
+    server.router.add_get("/search", streamer.handle_search)
     
     # Hook into startup/shutdown
     server.on_startup.append(on_startup)

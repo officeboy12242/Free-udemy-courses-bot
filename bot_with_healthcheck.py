@@ -56,6 +56,7 @@ from movie_service import (
     bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
+    mychannel_search, mychannel_movie_links, format_mychannel_message,
     hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
 )
@@ -673,6 +674,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Store query and show source picker
     context.user_data["pending_search"] = search_query
     keyboard = [
+        [InlineKeyboardButton("📁 My Telegram Channel", callback_data="msrc_mychannel")],
         [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
          InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
         [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
@@ -718,6 +720,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Session expired — run /search again.", show_alert=True)
             return
         keyboard = [
+            [InlineKeyboardButton("📁 My Telegram Channel", callback_data="msrc_mychannel")],
             [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
              InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
             [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
@@ -742,6 +745,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     source_label = {
+        "mychannel": "My Telegram Channel",
         "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
         "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
         "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
@@ -753,6 +757,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     )
 
     # Fetch from selected source(s)
+    mychannel_results: list = []
     hdhub_results: list = []
     hdh_results:   list = []
     md_results:    list = []
@@ -763,7 +768,9 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     moviesmod_results: list = []
     atoz_results: list = []
 
-    if source == "hdhub":
+    if source == "mychannel":
+        mychannel_results = await asyncio.to_thread(mychannel_search, search_query, 10)
+    elif source == "hdhub":
         hdhub_results = await asyncio.to_thread(hdhub_search, search_query, 10)
     elif source == "hdh":
         hdh_results = await asyncio.to_thread(hdh_search, search_query, 10)
@@ -783,9 +790,10 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         atoz_results = await asyncio.to_thread(atoz_search, search_query, 10)
     else:  # all sites
         (
-            hdhub_results, hdh_results, md_results, m4u_results,
-            vega_results, sdmp_results, bolly_results, moviesmod_results
+            mychannel_results, hdhub_results, hdh_results, md_results, m4u_results,
+            vega_results, sdmp_results, bolly_results, moviesmod_results, atoz_results
         ) = await asyncio.gather(
+            asyncio.to_thread(mychannel_search, search_query, 5),
             asyncio.to_thread(hdhub_search, search_query, 4),
             asyncio.to_thread(hdh_search,   search_query, 3),
             asyncio.to_thread(md_search,    search_query, 3),
@@ -794,9 +802,10 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             asyncio.to_thread(sdmp_search,  search_query, 3),
             asyncio.to_thread(bollyflix_search, search_query, 3),
             asyncio.to_thread(moviesmod_search, search_query, 3),
+            asyncio.to_thread(atoz_search, search_query, 3),
         )
 
-    if (not hdhub_results and not hdh_results and not md_results and not m4u_results
+    if (not mychannel_results and not hdhub_results and not hdh_results and not md_results and not m4u_results
             and not vega_results and not sdmp_results and not bolly_results
             and not moviesmod_results and not atoz_results):
         await _src_edit(
@@ -806,7 +815,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Store results in user_data
-    all_results = {f"hdhub_{i}": m for i, m in enumerate(hdhub_results)}
+    all_results = {f"mychannel_{i}": m for i, m in enumerate(mychannel_results)}
+    all_results.update({f"hdhub_{i}": m for i, m in enumerate(hdhub_results)})
     all_results.update({f"hdh_{i}": m for i, m in enumerate(hdh_results)})
     all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
     all_results.update({f"m4u_{i}": m for i, m in enumerate(m4u_results)})
@@ -818,6 +828,10 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["search_results"] = all_results
 
     keyboard = []
+    if mychannel_results:
+        keyboard.append([InlineKeyboardButton("━━ My Channel ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(mychannel_results):
+            keyboard.append([InlineKeyboardButton(m["title"], callback_data=f"msres_mychannel_{i}")])
     if hdh_results:
         keyboard.append([InlineKeyboardButton("━━ 4KHDHub ━━", callback_data="msearch_noop")])
         for i, m in enumerate(hdh_results):
@@ -877,7 +891,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
 
     total = (
-        len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results)
+        len(mychannel_results) + len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results)
         + len(vega_results) + len(sdmp_results) + len(bolly_results)
         + len(moviesmod_results) + len(atoz_results)
     )
@@ -922,7 +936,7 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz"):
+    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "mychannel"):
         # Send processing message and run scraping in background
         processing_msg = await query.message.reply_text(
             "⏳ Fetching download links... This may take a moment.",
@@ -933,7 +947,10 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
         async def _do_scrape_search():
             try:
-                if source == "hdhub":
+                if source == "mychannel":
+                    detail = await asyncio.to_thread(mychannel_movie_links, movie["url"])
+                    text = format_mychannel_message(movie["title"], detail)
+                elif source == "hdhub":
                     detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
                     text = format_hdhub_message(movie["title"], detail)
                 elif source == "vega":
@@ -1104,7 +1121,10 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
     """Fetch full download links for one movie and post poster + links to channel.
     Returns a status string for logging."""
     try:
-        if source == "hdhub":
+        if source == "mychannel":
+            detail = await asyncio.to_thread(mychannel_movie_links, movie["url"])
+            text = format_mychannel_message(movie["title"], detail)
+        elif source == "hdhub":
             detail = await asyncio.to_thread(hdhub_movie_links, movie["url"])
             text = format_hdhub_message(movie["title"], detail)
         elif source == "hdh":

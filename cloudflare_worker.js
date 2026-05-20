@@ -3,7 +3,7 @@ export default {
     const url = new URL(request.url);
     
     // ⚠️ REPLACE THIS with your actual Render URL where stream_server.py is running
-    const backendUrl = "https://your-render-app-name.onrender.com";
+    const backendUrl = "https://free-udemy-courses-bot.onrender.com";
     
     // Construct the new URL to point to Render
     const targetUrl = backendUrl + url.pathname + url.search;
