@@ -39,24 +39,9 @@ services:
         value: "https://sd1.sdmoviespoint.trade"
       - key: BOLLYFLIX_BASE_URL
         value: "https://new.bollyflix.gd"
-    healthCheckPath: /health
-    autoDeploy: true
-  
-  - type: web
-    name: telegram-stream-server
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python stream_server.py
-    envVars:
-      - key: API_ID
-        sync: false
-      - key: API_HASH
-        sync: false
-      - key: STREAM_BOT_TOKEN
-        sync: false
-      - key: STREAM_CHANNEL_ID
-        sync: false
-      - key: PORT
-        value: "8080"
+      - key: MOVIESMOD_BASE_URL
+        value: "https://moviesmod.farm"
+      - key: ZEEFLIZ_BASE_URL
+        value: "https://zeefliz.beer"
     healthCheckPath: /health
     autoDeploy: true
