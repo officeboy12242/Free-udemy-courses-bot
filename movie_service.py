@@ -3339,218 +3339,164 @@ def format_atoz_message(movie_title: str, data: dict, footer: bool = True) -> st
     return "\n".join(lines)
 
 
-# ─── 1TamilMV ────────────────────────────────────────────────────────────────
+# ─── ZeeFliz ─────────────────────────────────────────────────────────────────
 
-TAMILMV_BASE = os.getenv("TAMILMV_BASE_URL", "https://www.1tamilmv.futbol")
-
-try:
-    import cloudscraper as _cloudscraper
-    _tamilmv_scraper = _cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-except ImportError:
-    _tamilmv_scraper = None
-    log.warning("cloudscraper not installed; 1TamilMV source will not work")
+ZEEFLIZ_BASE = os.getenv("ZEEFLIZ_BASE_URL", "https://zeefliz.beer")
 
 
-def _tamilmv_get(url: str, retries: int = 3, **kwargs) -> Any:
-    """GET with cloudscraper + retries for 1TamilMV (Cloudflare-protected)."""
-    if not _tamilmv_scraper:
-        raise RuntimeError("cloudscraper not available")
-    kwargs.setdefault("timeout", 20)
-    for attempt in range(retries):
-        try:
-            return _tamilmv_scraper.get(url, **kwargs)
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(3 * (attempt + 1))
-            else:
-                raise
-
-
-def _tamilmv_resolve_direct_link(cyberloom_url: str) -> str:
-    """Resolve cyberloom.best/l/xxx -> inkvoyage/stackmint -> cyberloom/out -> messycloud.ink."""
-    resp = _tamilmv_get(cyberloom_url, allow_redirects=True)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    continue_link = None
-    for a in soup.find_all("a", href=True):
-        if "/out?" in a.get("href", ""):
-            continue_link = a["href"]
-            break
-
-    if not continue_link:
-        return resp.url
-
-    time.sleep(1)
-    final_resp = _tamilmv_get(continue_link, allow_redirects=True)
-    return final_resp.url
-
-
-def tamilmv_search(query: str, limit: int = 10) -> list[dict[str, str]]:
-    """Search 1TamilMV forums."""
-    search_url = (
-        f"{TAMILMV_BASE}/index.php?/search/&q={urllib.parse.quote(query)}"
-        "&type=forums_topic&search_and_or=and&search_in=titles"
-    )
+def zeefliz_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search ZeeFliz via WP REST API."""
+    api_url = f"{ZEEFLIZ_BASE}/wp-json/wp/v2/posts?search={urllib.parse.quote(query)}&per_page={limit}&_embed"
     try:
-        resp = _tamilmv_get(search_url)
-        resp.raise_for_status()
+        resp = _get(api_url, timeout=15)
+        posts = resp.json()
     except Exception as exc:
-        log.error("tamilmv_search '%s' failed: %s", query, exc)
+        log.error("zeefliz_search '%s' failed: %s", query, exc)
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
     movies: list[dict[str, str]] = []
-    for item in soup.select("li.ipsStreamItem, .ipsDataItem"):
-        if len(movies) >= limit:
-            break
-        title_link = item.select_one("a.ipsType_break, .ipsDataItem_title a, h2 a")
-        if not title_link:
-            continue
-        title = title_link.get_text(strip=True)
-        href = title_link.get("href", "")
-        if not title or not href:
-            continue
-        # Skip "story explain" posts
-        if "story explain" in title.lower():
-            continue
-        url = href if href.startswith("http") else TAMILMV_BASE + href
-        movies.append({"title": title[:100], "url": url, "poster": "", "source": "tamilmv"})
+    for p in posts:
+        title = BeautifulSoup(p.get("title", {}).get("rendered", ""), "html.parser").get_text()
+        link = p.get("link", "")
+        poster = ""
+        embedded = p.get("_embedded", {})
+        media = embedded.get("wp:featuredmedia", [])
+        if media:
+            poster = media[0].get("source_url", "")
+        if title and link:
+            movies.append({"title": title[:100], "url": link, "poster": poster, "source": "zeefliz"})
     return movies
 
 
-def tamilmv_movie_links(movie_url: str) -> dict[str, Any]:
-    """Extract direct download links (messycloud.ink) from a 1TamilMV topic page."""
+def zeefliz_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]]:
+    """Fetch latest movies from ZeeFliz via WP REST API with pagination."""
+    api_url = f"{ZEEFLIZ_BASE}/wp-json/wp/v2/posts?per_page={limit}&page={page}&_embed"
+    try:
+        resp = _get(api_url, timeout=15)
+        if resp.status_code == 400:
+            return []
+        posts = resp.json()
+    except Exception as exc:
+        log.error("zeefliz_latest_movies page %d failed: %s", page, exc)
+        return []
+
+    movies: list[dict[str, str]] = []
+    for p in posts:
+        title = BeautifulSoup(p.get("title", {}).get("rendered", ""), "html.parser").get_text()
+        link = p.get("link", "")
+        poster = ""
+        embedded = p.get("_embedded", {})
+        media = embedded.get("wp:featuredmedia", [])
+        if media:
+            poster = media[0].get("source_url", "")
+        if title and link:
+            movies.append({"title": title[:100], "url": link, "poster": poster, "source": "zeefliz"})
+    return movies
+
+
+def zeefliz_movie_links(movie_url: str) -> dict[str, Any]:
+    """Extract download links from a ZeeFliz movie/series page.
+
+    Returns quality options with nexdrive links, and resolves each nexdrive
+    page to get the actual download sources (G-Direct, Filepress, gofile, etc.).
+    """
     result: dict[str, Any] = {
         "poster": "", "info": {}, "links": [], "episodes": [], "is_series": False,
     }
     try:
-        resp = _tamilmv_get(movie_url)
+        resp = _get(movie_url, timeout=15)
         resp.raise_for_status()
     except Exception as exc:
-        log.error("tamilmv_movie_links failed for %s: %s", movie_url, exc)
+        log.error("zeefliz_movie_links failed for %s: %s", movie_url, exc)
         return result
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    content = soup.select_one("article") or soup
 
-    # Extract poster image - skip site assets, rank badges, torrent icons
-    _skip_poster = ["avatar", "emoji", "icon", "logo", "rep_", "reaction",
-                    "grandmaster", "torrborder", "utorrent", ".svg", ".gif"]
-    for img in content.find_all("img", src=True):
-        src = img.get("src", "").strip()
-        if not src or not src.startswith("http"):
-            continue
-        src_lower = src.lower()
-        if any(x in src_lower for x in _skip_poster):
-            continue
-        if any(ext in src_lower for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-            result["poster"] = src
-            break
+    # Poster via og:image
+    og_img = soup.find("meta", property="og:image")
+    if og_img:
+        result["poster"] = og_img.get("content", "")
 
+    # Fallback: get poster from WP API using post slug
     if not result["poster"]:
-        og_img = soup.find("meta", property="og:image")
-        if og_img:
-            result["poster"] = og_img.get("content", "")
+        slug = movie_url.rstrip("/").split("/")[-1]
+        try:
+            api_resp = _get(f"{ZEEFLIZ_BASE}/wp-json/wp/v2/posts?slug={slug}&_embed", timeout=10)
+            posts = api_resp.json()
+            if posts:
+                media = posts[0].get("_embedded", {}).get("wp:featuredmedia", [])
+                if media:
+                    result["poster"] = media[0].get("source_url", "")
+        except Exception:
+            pass
 
-    for a in content.find_all("a", href=True):
-        text = a.get_text(strip=True)
-        href = a.get("href", "")
+    # Collect nexdrive links with quality context from preceding h3
+    quality_map: list[tuple[str, str]] = []
+    current_quality = "Download"
+    for el in soup.find_all(["h3", "a"]):
+        if el.name == "h3":
+            text = el.get_text(strip=True)
+            if any(x in text for x in ["480p", "720p", "1080p", "2160p", "4K", "Season", "Episode"]):
+                current_quality = text
+        elif el.name == "a":
+            href = el.get("href", "")
+            if "nexdrive" in href:
+                quality_map.append((current_quality, href))
 
-        if href.startswith("magnet:") or ".torrent" in href.lower():
+    if not quality_map:
+        return result
+
+    # Detect series
+    is_series = any(x in movie_url.lower() for x in ["season", "episode", "s0", "s1"])
+    result["is_series"] = is_series
+
+    # Resolve nexdrive pages to get actual download sources
+    # Limit resolution: max 6 unique nexdrive pages to avoid timeout
+    seen_nex: set = set()
+    max_resolve = 6
+    for quality_label, nex_url in quality_map:
+        if nex_url in seen_nex:
+            continue
+        seen_nex.add(nex_url)
+
+        if len(seen_nex) > max_resolve:
+            result["links"].append({"label": quality_label, "url": nex_url})
             continue
 
-        if text.upper() == "DIRECT LINK":
-            prev = a.find_previous("strong")
-            quality_text = prev.get_text(strip=True) if prev else ""
-            quality = "Unknown"
-            if "1080p" in quality_text:
-                quality = "1080p"
-            elif "720p" in quality_text:
-                quality = "720p"
-            elif "480p" in quality_text or "Rip" in quality_text or "500MB" in quality_text:
-                quality = "480p"
-            elif "4K" in quality_text or "2160p" in quality_text:
-                quality = "4K"
+        try:
+            nex_resp = _get(nex_url, timeout=15)
+            nex_soup = BeautifulSoup(nex_resp.text, "html.parser")
+        except Exception:
+            result["links"].append({"label": quality_label, "url": nex_url})
+            continue
 
-            try:
-                time.sleep(2)
-                final_url = _tamilmv_resolve_direct_link(href)
-                result["links"].append({"label": f"{quality} - Direct Download", "url": final_url})
-            except Exception as exc:
-                log.warning("tamilmv link resolve failed for %s: %s", href[:50], exc)
+        # Get quality/file info from page title
+        nex_title = nex_soup.title.get_text(strip=True) if nex_soup.title else ""
+        file_label = nex_title.split("–")[0].strip() if "–" in nex_title else quality_label
+
+        # Collect download sources from nexdrive page
+        sources: list[dict[str, str]] = []
+        for a in nex_soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if not href or href == "#":
+                continue
+            if "zee-dl" in href:
+                sources.append({"label": f"{file_label} [G-Direct]", "url": href})
+            elif "filebee" in href or "filepress" in href:
+                sources.append({"label": f"{file_label} [Filepress]", "url": href})
+            elif any(x in href for x in ["gofile.io", "vikingfile", "megaup.net", "pixeldrain", "hubcloud"]):
+                sources.append({"label": f"{file_label} [Mirror]", "url": href})
+
+        if sources:
+            result["links"].extend(sources)
+        else:
+            result["links"].append({"label": file_label or quality_label, "url": nex_url})
 
     return result
 
 
-def tamilmv_latest_movies(page: int = 1, limit: int = 10) -> list[dict[str, str]]:
-    """Fetch recently added movies from 1TamilMV homepage with pagination.
-    
-    The RECENTLY ADDED section on the homepage contains ~40 links.
-    We paginate by slicing: page 1 = items 0-9, page 2 = items 10-19, etc.
-    """
-    try:
-        resp = _tamilmv_get(TAMILMV_BASE + "/")
-        resp.raise_for_status()
-    except Exception as exc:
-        log.error("tamilmv_latest_movies failed: %s", exc)
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # The RECENTLY ADDED section is inside .banger-container
-    container = soup.select_one(".banger-container")
-    if not container:
-        container = soup
-
-    all_movies: list[dict[str, str]] = []
-    seen_urls: set = set()
-
-    for a in container.find_all("a", href=True):
-        href = a.get("href", "")
-        if "/forums/topic/" not in href:
-            continue
-        link_url = href if href.startswith("http") else TAMILMV_BASE + href
-        if link_url in seen_urls:
-            continue
-
-        # Title: sometimes the <a> text is just quality info like "[1080p & 720p...]"
-        # In that case, the actual movie name is the preceding text node
-        a_text = a.get_text(strip=True)
-        title = a_text
-
-        if a_text.startswith("[") or not any(c.isalpha() for c in a_text[:5]):
-            # Get preceding text from parent
-            prev_text = ""
-            for prev in a.previous_siblings:
-                if isinstance(prev, str):
-                    prev_text = prev.strip()
-                    if prev_text:
-                        break
-                elif hasattr(prev, 'get_text'):
-                    prev_text = prev.get_text(strip=True)
-                    if prev_text:
-                        break
-            if prev_text:
-                title = f"{prev_text} {a_text}"
-
-        if not title or len(title) < 10:
-            continue
-        if "story explain" in title.lower():
-            continue
-
-        seen_urls.add(link_url)
-        all_movies.append({"title": title[:120], "url": link_url, "poster": "", "source": "tamilmv"})
-
-    # Paginate by slicing
-    start = (page - 1) * limit
-    end = start + limit
-    return all_movies[start:end]
-
-
-def format_tamilmv_message(movie_title: str, data: dict, footer: bool = True) -> str:
-    """Format a 1TamilMV result as HTML for Telegram."""
+def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) -> str:
+    """Format a ZeeFliz result as HTML for Telegram."""
     links = data.get("links", [])
     lines: list[str] = []
     disp = movie_title or data.get("title", "")
@@ -3559,11 +3505,12 @@ def format_tamilmv_message(movie_title: str, data: dict, footer: bool = True) ->
 
     if not links:
         if lines:
-            lines.append("\n❌ No direct download links found.")
+            lines.append("\n❌ No download links found.")
         return "\n".join(lines) if lines else ""
 
     lines.append("\n" + "━" * 32)
-    lines.append("📥 <b>Download Links (1TamilMV)</b>\n")
+    lines.append("📥 <b>Download Links (ZeeFliz)</b>\n")
+
     for lk in links:
         label = lk.get("label", "Download")
         url_ = lk.get("url", "")
