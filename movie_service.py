@@ -730,8 +730,10 @@ def m4u_latest_movies(page: int = 1) -> list[dict[str, str]]:
     try:
         url = M4U_BASE + "/" if page == 1 else f"{M4U_BASE}/page/{page}/"
         resp = _get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
+        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
+            html = _get_rendered_html(url) or html
+        soup = BeautifulSoup(html, "html.parser")
         movies: list[dict[str, str]] = []
         for art in soup.select("article"):
             title_a = art.select_one(".entry-title a, h2 a, h3 a")
@@ -776,8 +778,10 @@ def m4u_movie_links(movie_url: str) -> dict[str, Any]:
     """
     try:
         resp = _get(movie_url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
+        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
+            html = _get_rendered_html(movie_url) or html
+        soup = BeautifulSoup(html, "html.parser")
 
         poster = ""
         og = soup.find("meta", property="og:image")
@@ -806,6 +810,19 @@ def m4u_movie_links(movie_url: str) -> dict[str, Any]:
                     current_label = txt
             elif tag.name == "a":
                 href = tag.get("href", "")
+                
+                # Decode fly2url.com shorteners
+                if "fly2url.com" in href:
+                    parsed = urllib.parse.urlparse(href)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    if "url" in qs:
+                        try:
+                            b64_url = qs["url"][0]
+                            b64_url += "=" * ((4 - len(b64_url) % 4) % 4)
+                            href = base64.b64decode(b64_url).decode("utf-8")
+                        except Exception:
+                            pass
+
                 if "mdrive.ink/mdisk" not in href:
                     continue
                 btn_text = tag.get_text(strip=True)
@@ -912,9 +929,12 @@ def _m4u_provider_from_btn(btn_text: str) -> str:
 def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
     """Search movies4u.ee via WordPress ?s= parameter."""
     try:
-        resp = _get(M4U_SEARCH + urllib.parse.quote_plus(query), timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        url = M4U_SEARCH + urllib.parse.quote_plus(query)
+        resp = _get(url, timeout=15)
+        html = resp.text
+        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
+            html = _get_rendered_html(url) or html
+        soup = BeautifulSoup(html, "html.parser")
         movies: list[dict[str, str]] = []
         for art in soup.select("article"):
             title_a = art.select_one(".entry-title a, h2 a, h3 a")
