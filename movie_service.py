@@ -732,7 +732,12 @@ def m4u_latest_movies(page: int = 1) -> list[dict[str, str]]:
         resp = _get(url, timeout=15)
         html = resp.text
         if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            html = _get_rendered_html(url) or html
+            rendered = _get_rendered_html(url)
+            if rendered:
+                html = rendered
+            else:
+                log.warning("Movies4U JS challenge detected but Playwright unavailable")
+                return []  # Return empty instead of parsing challenge page
         soup = BeautifulSoup(html, "html.parser")
         movies: list[dict[str, str]] = []
         for art in soup.select("article"):
@@ -780,7 +785,12 @@ def m4u_movie_links(movie_url: str) -> dict[str, Any]:
         resp = _get(movie_url, timeout=15)
         html = resp.text
         if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            html = _get_rendered_html(movie_url) or html
+            rendered = _get_rendered_html(movie_url)
+            if rendered:
+                html = rendered
+            else:
+                log.warning("Movies4U JS challenge detected but Playwright unavailable")
+                return {"poster": "", "links": [], "info": {}}  # Return empty
         soup = BeautifulSoup(html, "html.parser")
 
         poster = ""
@@ -933,7 +943,12 @@ def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         resp = _get(url, timeout=15)
         html = resp.text
         if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            html = _get_rendered_html(url) or html
+            rendered = _get_rendered_html(url)
+            if rendered:
+                html = rendered
+            else:
+                log.warning("Movies4U JS challenge detected but Playwright unavailable")
+                return []  # Return empty instead of parsing challenge page
         soup = BeautifulSoup(html, "html.parser")
         movies: list[dict[str, str]] = []
         for art in soup.select("article"):

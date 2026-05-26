@@ -2,7 +2,7 @@ services:
   - type: web
     name: telegram-course-bot
     env: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium || echo "Playwright install failed, continuing without it"
     startCommand: python bot_with_healthcheck.py
     envVars:
       - key: BOT_TOKEN
@@ -32,7 +32,7 @@ services:
       - key: MD_BASE_URL
         value: "https://new2.moviesdrives.my"
       - key: M4U_BASE_URL
-        value: "https://movies4u.ee"
+        value: "https://movies4u.gr"
       - key: VEGA_BASE_URL
         value: "https://vegamovies.global"
       - key: SDMP_BASE_URL
