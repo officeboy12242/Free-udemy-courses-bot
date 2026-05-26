@@ -58,6 +58,23 @@ PORT=10000
 3. Click **Edit** → Update the value → Save
 4. Render will automatically restart with new URL
 
+## Known Issues on Render Free Tier:
+
+### Movies4U Requires Playwright
+
+**Movies4U** (`movies4u.gr`) uses aggressive Sucuri JavaScript challenge that requires Playwright (headless browser) to bypass. 
+
+**Status on Render:**
+- Playwright is configured to install during build
+- May fail on free tier due to disk space limits (~500MB browser binaries)
+- If installation fails, Movies4U will return empty results with warning logs
+- **Other sites (ZeeFliz, HDHub4u, etc.) will continue working normally**
+
+**If Movies4U is critical:**
+- Upgrade to Render paid plan (more disk space)
+- Or use ScraperAPI (but Movies4U also blocks ScraperAPI sometimes)
+- Or rely on alternative sources (ZeeFliz provides similar content)
+
 ## Current Base URLs (as of May 26, 2026):
 
 | Variable | Current URL |
