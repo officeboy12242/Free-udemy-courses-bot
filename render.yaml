@@ -26,22 +26,22 @@ services:
       - key: PORT
         value: "10000"
       - key: HDHUB_BASE_URL
-        value: "https://new1.hdhub4u.limo"
+        sync: false
       - key: HDH_BASE_URL
-        value: "https://4khdhub.link"
+        sync: false
       - key: MD_BASE_URL
-        value: "https://new2.moviesdrives.my"
+        sync: false
       - key: M4U_BASE_URL
-        value: "https://movies4u.gr"
+        sync: false
       - key: VEGA_BASE_URL
-        value: "https://vegamovies.global"
+        sync: false
       - key: SDMP_BASE_URL
-        value: "https://sd1.sdmoviespoint.trade"
+        sync: false
       - key: BOLLYFLIX_BASE_URL
-        value: "https://new.bollyflix.gd"
+        sync: false
       - key: MOVIESMOD_BASE_URL
-        value: "https://moviesmod.farm"
+        sync: false
       - key: ZEEFLIZ_BASE_URL
-        value: "https://zeefliz.beer"
+        sync: false
     healthCheckPath: /health
     autoDeploy: true
