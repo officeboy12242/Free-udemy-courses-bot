@@ -46,11 +46,12 @@ wheels/
 Thumbs.db
 
 # Local test/debug scripts and dumps (never commit these)
-_test_*.py
-test_*.py
+_test_*
+test_*
 _replace_*.py
 _append_*.py
 _quick_test.py
+_commit_msg.txt
 _*.html
 *.html
 RENDER_ENV_SETUP.md
