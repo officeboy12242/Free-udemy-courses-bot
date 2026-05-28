@@ -3,12 +3,13 @@ Movie scraper — supports multiple sources:
   - HDHub4u         (https://new1.hdhub4u.limo/)          ← primary
   - 4KHDHub         (https://4khdhub.link/category/hindi-movies/)
   - MoviesDrive     (https://new2.moviesdrives.my/)
-  - Movies4U        (https://movies4u.ee/)
+  - HDMovie2        (https://newhdmovie2.pro/)
   - Vegamovies      (https://vegamovies.global/)
   - SDMoviesPoint   (https://sd1.sdmoviespoint.trade/)
   - BollyFlix       (https://new.bollyflix.gd/)
   - MoviesMod       (https://moviesmod.farm/)
   - AtoZ Cinemas    (https://atoz.cinemaz.workers.dev/)
+  - ZeeFliz         (https://zeefliz.beer/)
 """
 from __future__ import annotations
 
@@ -76,7 +77,6 @@ _NO_VERIFY_HOSTS = {
     "hblinks.org",
     "new1.hdhub4u.limo",  # HDHub4u - SSL cert issues
     "hdhub4u.limo",
-    "movies4u.ee",  # Movies4U - occasional SSL issues
     "linksmod.top",  # MoviesMod intermediary - SSL issues
     "episodes.modpro.blog",  # MoviesMod redirector - SSL issues
 }
@@ -627,503 +627,312 @@ def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         return []
 
 
-# ─── Movies4U ────────────────────────────────────────────────────────────────
+# ─── HDMovie2 (newhdmovie2.pro) ─────────────────────────────────────────────
 
-M4U_BASE   = os.getenv("M4U_BASE_URL", "https://movies4u.ee")
-M4U_SEARCH = f"{M4U_BASE}/?s="
+HDMOVIE2_BASE = os.getenv("HDMOVIE2_BASE_URL", "https://newhdmovie2.pro")
 
-# Domains to treat as ads / skip
-_M4U_AD_HOSTS = {"swagvio.com", "fuckmaza.com", "hianime.mx"}
-
-# Recognised download providers on mdrive.ink
-_M4U_DL_HOSTS = {
-    "fastdl.zip", "vcloud.zip", "filebee.xyz", "dgdrive.site",
-    "hubcloud.foo", "hubdrive.space", "gdflix.pro", "gofile.io",
-    "mediafire.com", "pixeldrain.com", "1fichier.com",
+# Recognised final download providers on hdm.im redirect pages
+_HDMOVIE2_DL_HOSTS = {
+    "gdflix.dev", "gdflix.pro", "gdflix.", "gdtotv2.site", "gdtot.",
+    "filebee.xyz", "gofile.io", "vikingfile.com", "megaup.net",
+    "pixeldrain.com", "krakenfiles.com", "uploadrar.com",
+    "hubcloud.foo", "hubdrive.space", "1fichier.com", "mediafire.com",
+    "fastdl.zip", "vcloud.zip", "fileapi.com",
 }
 
 
-def _is_m4u_dl(href: str) -> bool:
-    host = urllib.parse.urlparse(href).hostname or ""
-    return any(h in host for h in _M4U_DL_HOSTS)
+def _hdmovie2_provider(href: str, text: str = "") -> str:
+    """Friendly provider name extracted from URL host or button text."""
+    # Prefer text label like "[Gdflix]" / "[Filebee]" if present
+    if text:
+        m = re.search(r"\[([^\]]+)\]", text)
+        if m:
+            label = m.group(1).strip()
+            # Normalise common labels
+            normalise = {
+                "Gdflix": "GDFlix",
+                "Gdtotv2 Direct": "GDToT",
+                "Gdtot": "GDToT",
+                "Filebee": "Filepress",
+            }
+            return normalise.get(label, label)
 
-
-def _m4u_provider(href: str) -> str:
-    host = urllib.parse.urlparse(href).hostname or ""
-    host = host.lstrip("www.")
-    # Friendly names
+    host = (urllib.parse.urlparse(href).hostname or "").lstrip("www.")
     _MAP = {
-        "fastdl.zip": "G-Direct",
-        "vcloud.zip": "V-Cloud",
-        "filebee.xyz": "Filepress",
-        "dgdrive.site": "DropGalaxy",
+        "gdflix": "GDFlix",
+        "gdtotv2": "GDToT",
+        "gdtot": "GDToT",
+        "filebee": "Filepress",
+        "gofile": "GoFile",
+        "vikingfile": "VikingFile",
+        "megaup": "MegaUp",
+        "pixeldrain": "PixelDrain",
+        "hubcloud": "HubCloud",
+        "hubdrive": "HubDrive",
+        "krakenfiles": "Kraken",
+        "1fichier": "1Fichier",
+        "mediafire": "MediaFire",
+        "fastdl": "G-Direct",
+        "vcloud": "V-Cloud",
     }
-    for domain, name in _MAP.items():
-        if domain in host:
+    for needle, name in _MAP.items():
+        if needle in host:
             return name
-    return host.split(".")[0].title()
+    return host.split(".")[0].title() if host else "Download"
 
 
-def _scrape_mdrive_ink(mdrive_url: str) -> list[dict[str, Any]]:
-    """Scrape an mdrive.ink/mdisk page — returns links grouped by quality label."""
+def _is_hdmovie2_dl(href: str) -> bool:
+    """Check if URL points to a known final-download host."""
+    if not href or not href.startswith("http"):
+        return False
+    return any(h in href for h in _HDMOVIE2_DL_HOSTS)
+
+
+def _scrape_hdmim(hdm_url: str) -> list[dict[str, str]]:
+    """Scrape an hdm.im redirect page → list of final download links.
+
+    Each link dict: {"label": "1080P [Gdflix] 5.83 GB", "url": "https://gdflix.dev/..."}
+    """
     try:
-        resp = _get(mdrive_url, timeout=15)
+        resp = _get(hdm_url, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        links: list[dict[str, Any]] = []
-        current_label = "Download"
+        links: list[dict[str, str]] = []
+        seen_urls: set = set()
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            text = a.get_text(strip=True)
 
-        # Walk all children of <body> in order; h5 = quality label, a = link
-        for tag in soup.find_all(["h5", "a"]):
-            if tag.name == "h5":
-                current_label = tag.get_text(strip=True)
-            elif tag.name == "a":
-                href = tag.get("href", "")
-                host = urllib.parse.urlparse(href).hostname or ""
-                # Skip ads and non-download links
-                if not href.startswith("http"):
-                    continue
-                if any(ad in host for ad in _M4U_AD_HOSTS):
-                    continue
-                if not _is_m4u_dl(href):
-                    continue
-                prov = _m4u_provider(href)
-                links.append({
-                    "label": current_label,
-                    "name": f"{current_label} ({prov})",
-                    "url": href,
-                })
+            if not _is_hdmovie2_dl(href):
+                continue
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+
+            label = text if text else _hdmovie2_provider(href)
+            links.append({"label": label, "url": href})
         return links
     except Exception as e:
-        log.error("mdrive.ink scrape failed (%s): %s", mdrive_url, e)
+        log.error("hdm.im scrape failed (%s): %s", hdm_url, e)
         return []
 
 
-def _scrape_m4u_info(content) -> dict[str, str]:
-    """Parse movies4u.ee info block (plain text 'Label:\\nValue' format)."""
-    info: dict[str, str] = {}
-    text = content.get_text("\n", strip=True)
-
-    # Map of search patterns → field name
-    _PATTERNS = [
-        (r"IMDb\s+Rating\s*[:\-]+\s*([\d./]+)", "imdb"),
-        (r"Language\s*:\s*\n?((?:(?!(?:Subtitle|Size|Quality|Format|Movie|Release|Genre|Director|Cast|Plot|Synopsis))[^\n])+)", "language"),
-        (r"Genre\s*:\s*\n?([^\n]+)", "genre"),
-        (r"Quality\s*:\s*\n?([^\n]+)", "quality"),
-        (r"(?:Director|Directed by)\s*:\s*\n?([^\n]+)", "director"),
-        (r"(?:Stars?|Cast)\s*:\s*\n?([^\n]+)", "stars"),
-    ]
-    for pattern, field in _PATTERNS:
-        if field in info:
+def _parse_hdmovie2_articles(soup: BeautifulSoup, limit: int = 10) -> list[dict[str, str]]:
+    """Extract movie list (title/url/poster) from a homepage / search-results page."""
+    movies: list[dict[str, str]] = []
+    for art in soup.select("article"):
+        title_a = art.select_one(
+            ".entry-title a, h2 a, h3 a, a[rel='bookmark'], a[title]"
+        )
+        if not title_a:
             continue
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip().rstrip(".")
-            if val:
-                info[field] = val
+        title = title_a.get_text(strip=True)
+        link = title_a.get("href", "")
+        # Some themes nest the link inside .entry-title with the title in attribute
+        if not title and title_a.get("title"):
+            title = title_a["title"]
+
+        # Poster
+        poster = ""
+        img = art.select_one("img")
+        if img:
+            poster = (
+                img.get("src", "")
+                or img.get("data-src", "")
+                or img.get("data-lazy-src", "")
+            )
+
+        if title and link:
+            movies.append(
+                {"title": title, "url": link, "poster": poster, "source": "hdmovie2"}
+            )
+        if len(movies) >= limit:
+            break
+    return movies
+
+
+def hdmovie2_latest_movies(page: int = 1) -> list[dict[str, str]]:
+    """Recently-added movies from HDMovie2.
+
+    Page 1 uses the homepage (newest trending titles). Subsequent pages use
+    the /movie/page/N/ archive listing for proper pagination.
+    """
+    try:
+        if page == 1:
+            url = HDMOVIE2_BASE + "/"
+        else:
+            # Archive starts at /movie/page/1/ → bot page 2; offset by one
+            url = f"{HDMOVIE2_BASE}/movie/page/{page - 1}/"
+        resp = _get(url, timeout=15)
+        if resp.status_code == 404:
+            return []
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return _parse_hdmovie2_articles(soup, limit=10)
+    except Exception as e:
+        log.error("HDMovie2 listing failed (page %d): %s", page, e)
+        return []
+
+
+def hdmovie2_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+    """Search HDMovie2 via WordPress ?s= parameter."""
+    try:
+        url = f"{HDMOVIE2_BASE}/?s={urllib.parse.quote_plus(query)}"
+        resp = _get(url, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        return _parse_hdmovie2_articles(soup, limit=limit)
+    except Exception as e:
+        log.error("HDMovie2 search failed for '%s': %s", query, e)
+        return []
+
+
+def _scrape_hdmovie2_info(soup: BeautifulSoup) -> dict[str, str]:
+    """Parse genre/year/plot from a movie page."""
+    info: dict[str, str] = {}
+
+    # Genre tags
+    genre_links = soup.select("a[href*='/genre/']")
+    if genre_links:
+        genres = list(
+            dict.fromkeys(
+                g.get_text(strip=True) for g in genre_links if g.get_text(strip=True)
+            )
+        )[:5]
+        if genres:
+            info["genre"] = ", ".join(genres)
+
+    # Year
+    year_link = soup.select_one("a[href*='/year/']")
+    if year_link:
+        year = year_link.get_text(strip=True)
+        if year:
+            info["year"] = year
+
     return info
 
 
-def m4u_latest_movies(page: int = 1) -> list[dict[str, str]]:
-    """Scrape page N of movies4u.ee homepage."""
-    try:
-        url = M4U_BASE + "/" if page == 1 else f"{M4U_BASE}/page/{page}/"
-        resp = _get(url, timeout=15)
-        html = resp.text
-        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            rendered = _get_rendered_html(url)
-            if rendered:
-                html = rendered
-            else:
-                log.warning("Movies4U JS challenge detected but Playwright unavailable")
-                return []  # Return empty instead of parsing challenge page
-        soup = BeautifulSoup(html, "html.parser")
-        movies: list[dict[str, str]] = []
-        for art in soup.select("article"):
-            title_a = art.select_one(".entry-title a, h2 a, h3 a")
-            if not title_a:
-                continue
-            title = title_a.get_text(strip=True)
-            link  = title_a.get("href", "")
-            img   = art.select_one("img")
-            poster = img.get("src", "") or img.get("data-src", "") if img else ""
-            if link:
-                movies.append({"title": title, "url": link,
-                               "poster": poster, "source": "m4u"})
-            if len(movies) >= 10:
-                break
-        return movies
-    except Exception as e:
-        log.error("Movies4U listing failed: %s", e)
-        return []
+def hdmovie2_movie_links(movie_url: str) -> dict[str, Any]:
+    """Scrape an HDMovie2 movie page → poster, info, final download links.
 
-
-_M4U_SKIP_HEADINGS = {
-    "series info:", "movie info:", "series-synopsis/plot:", "screenshots:",
-    "synopsis/plot:", "plot:", "——", "—–", "download",
-}
-
-_M4U_QUALITY_KEYWORDS = ("480p", "720p", "1080p", "2160p", "4k", "season", "episode", "blu", "web")
-
-
-def _is_gdirect(text: str) -> bool:
-    t = text.lower()
-    return "g-direct" in t or "instant" in t
-
-
-def m4u_movie_links(movie_url: str) -> dict[str, Any]:
-    """Scrape a movies4u.ee movie page.
-
-    Two page layouts:
-      A) Series  — h3/h4 quality labels, multiple mdrive.ink buttons per label
-                   → parse labels from page, keep only G-Direct mdrive.ink link per quality
-      B) Movie   — single mdrive.ink URL for all qualities
-                   → follow it, parse quality sections inside, keep G-Direct links
+    Workflow:
+      1. Fetch the movie page
+      2. Pick up the unique hdm.im redirect URL(s) (one per movie, several for series)
+      3. Resolve each hdm.im URL → quality-labeled final download links
     """
+    result: dict[str, Any] = {"poster": "", "info": {}, "links": []}
     try:
         resp = _get(movie_url, timeout=15)
-        html = resp.text
-        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            rendered = _get_rendered_html(movie_url)
-            if rendered:
-                html = rendered
-            else:
-                log.warning("Movies4U JS challenge detected but Playwright unavailable")
-                return {"poster": "", "links": [], "info": {}}  # Return empty
-        soup = BeautifulSoup(html, "html.parser")
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        poster = ""
+        # Poster: og:image first, fall back to first article image
         og = soup.find("meta", property="og:image")
         if og:
-            poster = og.get("content", "")
+            result["poster"] = og.get("content", "")
+        if not result["poster"]:
+            img = soup.select_one("article img, .post img")
+            if img:
+                result["poster"] = (
+                    img.get("src", "")
+                    or img.get("data-src", "")
+                    or img.get("data-lazy-src", "")
+                )
 
-        content = soup.select_one(".entry-content") or soup.find("main") or soup
-        info = _scrape_m4u_info(content)
+        result["info"] = _scrape_hdmovie2_info(soup)
 
-        # ── Walk DOM in order: headings become labels, <a> → mdrive.ink ────────
-        current_label = ""
-        collected: list[dict] = []   # {"label", "url", "is_gdirect"}
+        # Find unique hdm.im redirect URLs
+        hdm_urls: list[str] = []
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "").strip()
+            host = (urllib.parse.urlparse(href).hostname or "").lower()
+            if "hdm.im" in host or "hdmovie2.im" in host:
+                if href not in hdm_urls:
+                    hdm_urls.append(href)
 
-        for tag in content.find_all(["h2", "h3", "h4", "h5", "strong", "a"]):
-            if tag.name in ("h2", "h3", "h4", "h5"):
-                txt = tag.get_text(strip=True)
-                # Skip non-quality headings
-                if txt.lower().rstrip(":").strip() in _M4U_SKIP_HEADINGS:
+        # Resolve each — keep dedupe across all of them
+        seen_urls: set = set()
+        for hdm_url in hdm_urls:
+            for lk in _scrape_hdmim(hdm_url):
+                if lk["url"] in seen_urls:
                     continue
-                if any(kw in txt.lower() for kw in _M4U_QUALITY_KEYWORDS):
-                    current_label = txt
-            elif tag.name == "strong":
-                txt = tag.get_text(strip=True)
-                # Some pages use <strong> as quality label
-                if any(kw in txt.lower() for kw in _M4U_QUALITY_KEYWORDS) and len(txt) > 8:
-                    current_label = txt
-            elif tag.name == "a":
-                href = tag.get("href", "")
-                
-                # Decode fly2url.com shorteners
-                if "fly2url.com" in href:
-                    parsed = urllib.parse.urlparse(href)
-                    qs = urllib.parse.parse_qs(parsed.query)
-                    if "url" in qs:
-                        try:
-                            b64_url = qs["url"][0]
-                            b64_url += "=" * ((4 - len(b64_url) % 4) % 4)
-                            href = base64.b64decode(b64_url).decode("utf-8")
-                        except Exception:
-                            pass
+                seen_urls.add(lk["url"])
+                result["links"].append(lk)
 
-                if "mdrive.ink/mdisk" not in href:
-                    continue
-                btn_text = tag.get_text(strip=True)
-                collected.append({
-                    "label": current_label,
-                    "url": href,
-                    "is_gdirect": _is_gdirect(btn_text),
-                    "btn_text": btn_text,
-                })
-
-        # ── Detect layout ────────────────────────────────────────────────────
-        labeled = [c for c in collected if c["label"]]
-        unique_urls = {c["url"] for c in collected}
-
-        links: list[dict[str, Any]] = []
-
-        if labeled and len(unique_urls) > 1:
-            # ── Layout A: Series — multiple labeled mdrive.ink URLs ───────────
-            # Resolve each mdrive URL to get final links (Hub-Cloud, GDFlix, G-Direct, etc.)
-            by_label: dict[str, list] = {}
-            for c in collected:
-                label = c["label"] or "Download"
-                by_label.setdefault(label, []).append(c)
-
-            for label, entries in by_label.items():
-                # Get all unique mdrive URLs for this quality
-                seen_urls = set()
-                for entry in entries:
-                    mdrive_url = entry["url"]
-                    if mdrive_url in seen_urls:
-                        continue
-                    seen_urls.add(mdrive_url)
-                    
-                    # Resolve mdrive URL to get final links
-                    final_links = _resolve_mdrive_link(mdrive_url)
-                    if final_links and final_links != mdrive_url:
-                        # Parse the resolved links (they're newline-separated)
-                        for line in final_links.split('\n'):
-                            if ':' in line:
-                                provider, url = line.split(':', 1)
-                                provider = provider.strip()
-                                url = url.strip()
-                                links.append({
-                                    "label": label,
-                                    "name": provider,
-                                    "url": url,
-                                })
-                    else:
-                        # Fallback to original mdrive URL
-                        links.append({
-                            "label": label,
-                            "name": _m4u_provider_from_btn(entry["btn_text"]),
-                            "url": mdrive_url,
-                        })
-
-        elif collected:
-            # ── Layout B: Movie — one mdrive.ink URL, follow it ───────────────
-            mdrive_url = list(unique_urls)[0]
-            final_links = _resolve_mdrive_link(mdrive_url)
-            
-            if final_links and final_links != mdrive_url:
-                # Parse all resolved links
-                current_label = "Download"
-                for line in final_links.split('\n'):
-                    if ':' in line:
-                        provider, url = line.split(':', 1)
-                        provider = provider.strip()
-                        url = url.strip()
-                        links.append({
-                            "label": current_label,
-                            "name": provider,
-                            "url": url,
-                        })
-            else:
-                # Fallback to original scraping method
-                raw_links = _scrape_mdrive_ink(mdrive_url)
-                by_lbl: dict[str, list] = {}
-                for l in raw_links:
-                    by_lbl.setdefault(l["label"], []).append(l)
-                for lbl, entries in by_lbl.items():
-                    gdirect = [l for l in entries if "fastdl.zip" in l.get("url", "")]
-                    best = gdirect[0] if gdirect else entries[0]
-                    links.append({
-                        "label": best["label"],
-                        "name": "G‑Direct" if gdirect else _m4u_provider(best["url"]),
-                        "url": best["url"],
-                    })
-
-        return {"poster": poster, "links": links, "info": info}
+        return result
     except Exception as e:
-        log.error("Movies4U movie page failed (%s): %s", movie_url, e)
-        return {"poster": "", "links": [], "info": {}}
+        log.error("HDMovie2 movie page failed (%s): %s", movie_url, e)
+        return result
 
 
-def _m4u_provider_from_btn(btn_text: str) -> str:
-    t = btn_text.lower()
-    if "v-cloud" in t or "resumable" in t:
-        return "V‑Cloud"
-    if "batch" in t or "zip" in t:
-        return "Batch/Zip"
-    return btn_text.strip("⚡ ").split("[")[0].strip()
-
-
-def m4u_search(query: str, limit: int = 10) -> list[dict[str, str]]:
-    """Search movies4u.ee via WordPress ?s= parameter."""
-    try:
-        url = M4U_SEARCH + urllib.parse.quote_plus(query)
-        resp = _get(url, timeout=15)
-        html = resp.text
-        if resp.status_code in (202, 403) or "Please turn JavaScript on" in html:
-            rendered = _get_rendered_html(url)
-            if rendered:
-                html = rendered
-            else:
-                log.warning("Movies4U JS challenge detected but Playwright unavailable")
-                return []  # Return empty instead of parsing challenge page
-        soup = BeautifulSoup(html, "html.parser")
-        movies: list[dict[str, str]] = []
-        for art in soup.select("article"):
-            title_a = art.select_one(".entry-title a, h2 a, h3 a")
-            if not title_a:
-                continue
-            title = title_a.get_text(strip=True)
-            link  = title_a.get("href", "")
-            img   = art.select_one("img")
-            poster = img.get("src", "") or img.get("data-src", "") if img else ""
-            if link:
-                movies.append({"title": title, "url": link,
-                               "poster": poster, "source": "m4u"})
-            if len(movies) >= limit:
-                break
-        return movies
-    except Exception as e:
-        log.error("Movies4U search failed for '%s': %s", query, e)
-        return []
-
-
-def format_m4u_message(movie_title: str, data: dict[str, Any], footer: bool = True) -> str:
-    """Format movies4u.ee result — grouped by title and quality."""
+def format_hdmovie2_message(
+    movie_title: str, data: dict[str, Any], footer: bool = True
+) -> str:
+    """Format an HDMovie2 result as HTML for Telegram, grouped by quality."""
     links = data.get("links", [])
-    if not links:
-        return ""
-
-    lines = []
+    lines: list[str] = []
     if movie_title:
         lines.append(f"🎬 <b>{movie_title}</b>")
-    lines.append("━" * 32)
 
-    info = data.get("info", {})
-    info_lines = _info_block(info)
+    if not links:
+        if lines:
+            lines.append("\n❌ No download links found.")
+        return "\n".join(lines) if lines else ""
+
+    lines.append("━" * 32)
+    info_lines = _info_block(data.get("info", {}))
     if info_lines:
         lines.extend(info_lines)
         lines.append("━" * 32)
 
-    lines.append("\n📥 <b>Download Links</b>  <i>(Movies4U)</i>\n")
+    lines.append("\n📥 <b>Download Links</b>  <i>(HDMovie2)</i>\n")
 
-    import re as _re
-    
-    def _extract_title_and_quality(label: str, provider_name: str) -> tuple[str, str]:
-        """Extract title and quality from label and provider name."""
-        # Look for quality pattern: 480p, 720p, 1080p with optional HEVC/HQ and size [XGB]
-        quality_match = _re.search(r'(\d{3,4}p)\s*(?:HEVC|HQ|x264)?\s*\[([^\]]+)\]', label)
-        
-        if quality_match:
-            quality = quality_match.group(1)
-            size = quality_match.group(2)
-            hevc = "HEVC" if "HEVC" in label else ""
-            hq = "HQ" if "HQ" in label else ""
-            
-            # Build quality string
-            qual_parts = [p for p in [quality, hevc, hq, f"[{size}]"] if p]
-            quality_str = " ".join(qual_parts)
-            
-            # Extract title - everything before the quality
-            title_part = label[:quality_match.start()].strip()
-            # Remove movie name (usually at start) and year
-            title_part = _re.sub(r'^[\w\s\-:]+\(\d{4}\)', '', title_part).strip()
-            # Remove WEB-LEAK, HDTC, etc.
-            title_part = _re.sub(r'WEB-LEAK|HDTC|HDCAM|DVDScr|WEB-DL|WEB-Rip|HDRip', '', title_part, flags=re.IGNORECASE).strip()
-            # Clean up
-            title_part = title_part.replace('  ', ' ').strip(' -[]')
-            
-            return (title_part if title_part else "Movie", quality_str)
-        
-        # If label is generic like "Download", try to extract from movie info
-        if label in ['Download', '']:
-            info_quality = info.get('quality', '')
-            if info_quality:
-                # Parse qualities like "480p || 720p || 1080p"
-                qualities = [q.strip() for q in info_quality.split('||') if q.strip() and 'p' in q]
-                if qualities:
-                    return ("Movie", " | ".join(qualities))
-            return ("Movie", "Download")
-        
-        # Fallback: just find resolution
-        match = _re.search(r'(\d{3,4}p)', label)
-        if match:
-            return ("Movie", match.group(1))
-        
-        return (label[:40], "Download")
+    # Group by quality (e.g. 480P / 720P / 1080P / 2160P)
+    grouped: dict[str, list[tuple[str, str, str]]] = {}
+    for lk in links:
+        label = lk.get("label", "Download")
+        url_ = lk.get("url", "")
 
-    def _clean_provider_name(name: str, url: str) -> str:
-        """Clean up provider name for display."""
-        if not name:
-            name = _m4u_provider(url)
-        
-        # Remove emojis and clean up
-        clean = name.replace('🚀', '').replace('⚡', '').replace('[DD]', '').replace('[Instant]', '').replace('[Resumable]', '').replace('[G-Drive]', '').strip()
-        
-        # Shorten common names
-        shorten_map = {
-            'Hub-Cloud': 'HubCloud',
-            'G-Direct': 'GDirect',
-            'V-Cloud': 'VCloud',
-            'Filepress': 'Filepress',
-            'GDFlix': 'GDFlix',
-        }
-        for full, short in shorten_map.items():
-            if full in clean:
-                clean = short
-                break
-        
-        # Limit length
-        if len(clean) > 12:
-            clean = clean[:10] + ".."
-        
-        return clean
+        q_match = re.search(r"(\d{3,4}P|4K|2160P)", label, re.IGNORECASE)
+        quality = q_match.group(1).upper() if q_match else "Download"
+        if quality == "4K":
+            quality = "2160P"
 
-    # Group by (title, quality) tuple
-    grouped: dict[tuple[str, str], list] = {}
-    for lnk in links:
-        title, quality = _extract_title_and_quality(lnk.get("label", ""), lnk.get("name", ""))
-        key = (title, quality)
-        grouped.setdefault(key, []).append(lnk)
-    
-    # Remove duplicate URLs within each group
-    for key in grouped:
-        seen_urls = set()
-        unique_links = []
-        for lnk in grouped[key]:
-            url = lnk.get("url", "")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                unique_links.append(lnk)
-        grouped[key] = unique_links
+        provider = _hdmovie2_provider(url_, label)
 
-    # Sort: by title first, then by quality (480p < 720p < 1080p)
-    def _sort_key(item: tuple) -> tuple:
-        (title, quality), _ = item
-        # Quality sort order
-        q_order = 3
-        if "480p" in quality:
-            q_order = 0
-        elif "720p" in quality:
-            q_order = 1
-        elif "1080p" in quality:
-            q_order = 2
-        return (title, q_order)
+        size_match = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB))", label, re.IGNORECASE)
+        size = size_match.group(1) if size_match else ""
 
-    sorted_groups = sorted(grouped.items(), key=_sort_key)
+        grouped.setdefault(quality, []).append((provider, url_, size))
 
-    current_title = None
-    for (title, quality), group in sorted_groups:
-        # Print title header when it changes
-        if title != current_title:
-            if current_title is not None:
-                lines.append("")  # Blank line between sections
-            lines.append(f"📁 <b>{title}</b>")
-            current_title = title
-        
-        # Print quality and links
-        lines.append(f"  📦 {quality}")
-        
-        # Format provider links - group by provider type to avoid duplicates
-        seen_providers = set()
-        parts = []
-        for l in group:
-            name = _clean_provider_name(l.get('name', ''), l['url'])
-            # Skip if we already have this provider
-            if name in seen_providers:
+    # Sort 480 < 720 < 1080 < 2160
+    quality_order = {"480P": 0, "720P": 1, "1080P": 2, "2160P": 3}
+    sorted_qs = sorted(grouped.keys(), key=lambda q: quality_order.get(q, 99))
+
+    for q in sorted_qs:
+        entries = grouped[q]
+        size = next((s for _, _, s in entries if s), "")
+        header = f"📦 <b>{q}</b>" + (f"  <i>{size}</i>" if size else "")
+        lines.append(header)
+
+        seen_provs: set = set()
+        parts: list[str] = []
+        for prov, url_, _ in entries:
+            if prov in seen_provs:
                 continue
-            seen_providers.add(name)
-            parts.append(f"<a href='{l['url']}'>{name}</a>")
-        
-        lines.append("     🔗 " + " · ".join(parts))
+            seen_provs.add(prov)
+            parts.append(f"<a href='{url_}'>{prov}</a>")
+        if parts:
+            lines.append("   🔗 " + " · ".join(parts))
 
     if footer:
         lines.append("")
         lines.append("━" * 32)
-        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
-    
+        lines.append(
+            "⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>"
+        )
+
     return "\n".join(lines)
 
 
@@ -2951,73 +2760,6 @@ def _resolve_modpro_blog(url: str) -> str:
             time.sleep(1)
             
     return url
-
-def _resolve_mdrive_link(url: str) -> str:
-    """
-    Resolves mdrive.ink/mdisk links to their final download links.
-    The mdrive page contains multiple final links (Hub-Cloud, GDFlix, G-Direct, V-Cloud, etc.)
-    Returns a string with all final links separated by newlines.
-    Uses _get() for cloud deployment compatibility (ScraperAPI support).
-    """
-    try:
-        # Use _get() which handles ScraperAPI for cloud deployments
-        resp = _get(url, timeout=20)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        final_links = []
-        seen_urls = set()
-        
-        # Find all links on the page
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            text = a.get_text(strip=True)
-            text_lower = text.lower()
-            
-            # Skip navigation and irrelevant links
-            if not href or any(x in href for x in ['mdrive.ink', 'javascript:', '#', 'wp-content', 'swagvio']):
-                continue
-            if any(x in text_lower for x in ['skip to content', 'home', 'nex drive', 'join now', 'adult', 'meet place', 'find perfect']):
-                continue
-            
-            # Skip text that looks like a URL protocol
-            if text_lower in ['https', 'http']:
-                continue
-                
-            # These are the final download links we want
-            is_provider = any(x in text_lower for x in ['hub-cloud', 'gdflix', 'g-direct', 'v-cloud', 'filepress', 
-                                               'gofile', 'vikingfile', 'megaup', 'fastdl', 'filebee'])
-            # Also include links to known file hosts even without specific button text
-            is_filehost = any(x in href for x in ['gofile.io', 'vikingfile.com', 'megaup.net', 'hubcloud.foo', 
-                                                    'gdflix.dev', 'fastdl.zip', 'vcloud.zip', 'filebee.xyz'])
-            
-            if is_provider or is_filehost:
-                # Clean up the link
-                if href.startswith('//'):
-                    href = 'https:' + href
-                elif href.startswith('/'):
-                    from urllib.parse import urljoin
-                    href = urljoin(resp.url, href)
-                
-                # Skip duplicates
-                if href in seen_urls:
-                    continue
-                seen_urls.add(href)
-                
-                # Use appropriate label
-                label = text if text else _m4u_provider(href)
-                    
-                final_links.append(f"{label}: {href}")
-        
-        if final_links:
-            log.info("Resolved mdrive link %s to %d final links", url, len(final_links))
-            return "\n".join(final_links)
-        
-        log.warning("No final links found for %s, returning original", url)
-        return url
-        
-    except Exception as e:
-        log.error("Error resolving mdrive link %s: %s", url, e)
-        return url
 
 
 def moviesmod_movie_links(movie_url: str) -> dict:

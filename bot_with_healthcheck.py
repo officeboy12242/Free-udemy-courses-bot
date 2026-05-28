@@ -50,14 +50,14 @@ from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
     md_latest_movies, md_movie_links, format_md_message,
-    m4u_latest_movies, m4u_movie_links, format_m4u_message,
+    hdmovie2_latest_movies, hdmovie2_movie_links, format_hdmovie2_message,
     vega_latest_movies, vega_movie_links, format_vega_message,
     sdmp_latest_movies, sdmp_movie_links, format_sdmp_message,
     bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
     zeefliz_search, zeefliz_movie_links, zeefliz_latest_movies, format_zeefliz_message,
-    hdhub_search, hdh_search, md_search, m4u_search, vega_search, sdmp_search,
+    hdhub_search, hdh_search, md_search, hdmovie2_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
 )
 
@@ -379,7 +379,7 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("⭐ HDHub4u (4K/HDR – Best)",  callback_data="msite_hdhub")],
         [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",        callback_data="msite_hdh")],
         [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",    callback_data="msite_md")],
-        [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
+        [InlineKeyboardButton("🎞 HDMovie2 (480p–1080p)",    callback_data="msite_hdmovie2")],
         [InlineKeyboardButton("🌟 Vegamovies (480p–4K)",     callback_data="msite_vega")],
         [InlineKeyboardButton("📀 SDMoviesPoint (HD+4K)",    callback_data="msite_sdmp")],
         [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
@@ -409,6 +409,7 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ("HDHub4u",        "https://new1.hdhub4u.limo/"),
         ("4KHDHub",        "https://4khdhub.link/category/hindi-movies/"),
         ("MoviesDrive",    "https://new2.moviesdrives.my/"),
+        ("HDMovie2",       "https://newhdmovie2.pro/"),
         ("Vegamovies",     "https://vegamovies.global/"),
         ("SDMoviesPoint",  "https://sd1.sdmoviespoint.trade/"),
         ("BollyFlix",      f"{BOLLY_BASE}/"),
@@ -474,7 +475,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     else moviesmod_latest_movies if source == "moviesmod"
                     else atoz_latest_movies    if source == "atoz"
                     else zeefliz_latest_movies if source == "zeefliz"
-                    else m4u_latest_movies)
+                    else hdmovie2_latest_movies)
         movies = await asyncio.to_thread(fetch_fn, page)
 
         if not movies:
@@ -508,7 +509,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard.append([InlineKeyboardButton("« Back to sources", callback_data="mback_sites")])
 
         site_label = {"hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
-                      "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
+                      "hdmovie2": "HDMovie2", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
                       "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
                       "zeefliz": "ZeeFliz"}.get(source, source)
         await _edit_or_reply(
@@ -529,7 +530,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("⭐ HDHub4u (4K/HDR – Best)",  callback_data="msite_hdhub")],
             [InlineKeyboardButton("🎬 4KHDHub (4K/HDR)",        callback_data="msite_hdh")],
             [InlineKeyboardButton("🎥 MoviesDrive (480p–4K)",    callback_data="msite_md")],
-            [InlineKeyboardButton("🍿 Movies4U (480p–1080p)",    callback_data="msite_m4u")],
+            [InlineKeyboardButton("🎞 HDMovie2 (480p–1080p)",    callback_data="msite_hdmovie2")],
             [InlineKeyboardButton("🌟 Vegamovies (480p–4K)",     callback_data="msite_vega")],
             [InlineKeyboardButton("📀 SDMoviesPoint (HD+4K)",    callback_data="msite_sdmp")],
             [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
@@ -599,8 +600,8 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
                     text = format_zeefliz_message(movie["title"], detail)
                 else:
-                    detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
-                    text = format_m4u_message(movie["title"], detail)
+                    detail = await asyncio.to_thread(hdmovie2_movie_links, movie["url"])
+                    text = format_hdmovie2_message(movie["title"], detail)
 
                 poster_url = detail.get("poster") or movie.get("poster", "")
                 action_row = [
@@ -684,7 +685,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
          InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
         [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
-         InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
+         InlineKeyboardButton("🎞 HDMovie2",     callback_data="msrc_hdmovie2")],
         [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
          InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
         [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
@@ -730,7 +731,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("⭐ HDHub4u",      callback_data="msrc_hdhub"),
              InlineKeyboardButton("🎬 4KHDHub",      callback_data="msrc_hdh")],
             [InlineKeyboardButton("🎥 MoviesDrive",  callback_data="msrc_md"),
-             InlineKeyboardButton("🍿 Movies4U",     callback_data="msrc_m4u")],
+             InlineKeyboardButton("🎞 HDMovie2",     callback_data="msrc_hdmovie2")],
             [InlineKeyboardButton("🌟 Vegamovies",   callback_data="msrc_vega"),
              InlineKeyboardButton("📀 SDMoviesPoint", callback_data="msrc_sdmp")],
             [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
@@ -753,7 +754,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     source_label = {
         "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
-        "m4u": "Movies4U", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
+        "hdmovie2": "HDMovie2", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
         "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
         "zeefliz": "ZeeFliz", "both": "All Sites",
     }.get(source, source)
@@ -766,7 +767,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     hdhub_results: list = []
     hdh_results:   list = []
     md_results:    list = []
-    m4u_results:   list = []
+    hdmovie2_results: list = []
     vega_results:  list = []
     sdmp_results:  list = []
     bolly_results: list = []
@@ -780,8 +781,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         hdh_results = await asyncio.to_thread(hdh_search, search_query, 10)
     elif source == "md":
         md_results = await asyncio.to_thread(md_search, search_query, 10)
-    elif source == "m4u":
-        m4u_results = await asyncio.to_thread(m4u_search, search_query, 10)
+    elif source == "hdmovie2":
+        hdmovie2_results = await asyncio.to_thread(hdmovie2_search, search_query, 10)
     elif source == "vega":
         vega_results = await asyncio.to_thread(vega_search, search_query, 10)
     elif source == "sdmp":
@@ -796,14 +797,14 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         zeefliz_results = await asyncio.to_thread(zeefliz_search, search_query, 10)
     else:  # all sites
         (
-            hdhub_results, hdh_results, md_results, m4u_results,
+            hdhub_results, hdh_results, md_results, hdmovie2_results,
             vega_results, sdmp_results, bolly_results, moviesmod_results,
             atoz_results, zeefliz_results
         ) = await asyncio.gather(
             asyncio.to_thread(hdhub_search, search_query, 4),
             asyncio.to_thread(hdh_search,   search_query, 3),
             asyncio.to_thread(md_search,    search_query, 3),
-            asyncio.to_thread(m4u_search,   search_query, 3),
+            asyncio.to_thread(hdmovie2_search, search_query, 3),
             asyncio.to_thread(vega_search,  search_query, 3),
             asyncio.to_thread(sdmp_search,  search_query, 3),
             asyncio.to_thread(bollyflix_search, search_query, 3),
@@ -812,7 +813,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             asyncio.to_thread(zeefliz_search, search_query, 3),
         )
 
-    if (not hdhub_results and not hdh_results and not md_results and not m4u_results
+    if (not hdhub_results and not hdh_results and not md_results and not hdmovie2_results
             and not vega_results and not sdmp_results and not bolly_results
             and not moviesmod_results and not atoz_results and not zeefliz_results):
         await _src_edit(
@@ -825,7 +826,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     all_results = {f"hdhub_{i}": m for i, m in enumerate(hdhub_results)}
     all_results.update({f"hdh_{i}": m for i, m in enumerate(hdh_results)})
     all_results.update({f"md_{i}": m for i, m in enumerate(md_results)})
-    all_results.update({f"m4u_{i}": m for i, m in enumerate(m4u_results)})
+    all_results.update({f"hdmovie2_{i}": m for i, m in enumerate(hdmovie2_results)})
     all_results.update({f"vega_{i}": m for i, m in enumerate(vega_results)})
     all_results.update({f"sdmp_{i}": m for i, m in enumerate(sdmp_results)})
     all_results.update({f"bolly_{i}": m for i, m in enumerate(bolly_results)})
@@ -847,11 +848,11 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🎥 {title}", callback_data=f"msres_md_{i}")])
 
-    if m4u_results:
-        keyboard.append([InlineKeyboardButton("━━ Movies4U ━━", callback_data="msearch_noop")])
-        for i, m in enumerate(m4u_results):
+    if hdmovie2_results:
+        keyboard.append([InlineKeyboardButton("━━ HDMovie2 ━━", callback_data="msearch_noop")])
+        for i, m in enumerate(hdmovie2_results):
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
-            keyboard.append([InlineKeyboardButton(f"🍿 {title}", callback_data=f"msres_m4u_{i}")])
+            keyboard.append([InlineKeyboardButton(f"🎞 {title}", callback_data=f"msres_hdmovie2_{i}")])
 
     if hdhub_results:
         keyboard.append([InlineKeyboardButton("━━ HDHub4u ━━", callback_data="msearch_noop")])
@@ -900,7 +901,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     keyboard.append([InlineKeyboardButton("« Change source", callback_data="msrc_back")])
 
     total = (
-        len(hdhub_results) + len(hdh_results) + len(md_results) + len(m4u_results)
+        len(hdhub_results) + len(hdh_results) + len(md_results) + len(hdmovie2_results)
         + len(vega_results) + len(sdmp_results) + len(bolly_results)
         + len(moviesmod_results) + len(atoz_results) + len(zeefliz_results)
     )
@@ -940,12 +941,12 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     await query.answer("Fetching links…")
 
-    # ── For m4u / vega, show own detail without cross-site matching ───────
+    # ── For hdmovie2 / vega, show own detail without cross-site matching ───
     import re as _re
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("m4u", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "zeefliz"):
+    if source in ("hdmovie2", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "zeefliz"):
         # Send processing message and run scraping in background
         processing_msg = await query.message.reply_text(
             "⏳ Fetching download links... This may take a moment.",
@@ -978,8 +979,8 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
                     detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
                     text = format_zeefliz_message(movie["title"], detail)
                 else:
-                    detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
-                    text = format_m4u_message(movie["title"], detail)
+                    detail = await asyncio.to_thread(hdmovie2_movie_links, movie["url"])
+                    text = format_hdmovie2_message(movie["title"], detail)
 
                 poster_url = detail.get("poster") or movie.get("poster", "")
                 context.user_data[f"search_pair_{source}_{idx}"] = {
@@ -1157,9 +1158,9 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         elif source == "zeefliz":
             detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
             text = format_zeefliz_message(movie["title"], detail)
-        else:  # m4u
-            detail = await asyncio.to_thread(m4u_movie_links, movie["url"])
-            text = format_m4u_message(movie["title"], detail)
+        else:  # hdmovie2 (default fallback)
+            detail = await asyncio.to_thread(hdmovie2_movie_links, movie["url"])
+            text = format_hdmovie2_message(movie["title"], detail)
 
         if not text:
             text = f"🎬 <b>{movie['title']}</b>\n\n❌ No download links found."
@@ -1283,14 +1284,22 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
                 src = "hdh"
             elif k.startswith("md_"):
                 src = "md"
+            elif k.startswith("hdmovie2_"):
+                src = "hdmovie2"
             elif k.startswith("vega_"):
                 src = "vega"
             elif k.startswith("sdmp_"):
                 src = "sdmp"
             elif k.startswith("bolly_"):
                 src = "bolly"
+            elif k.startswith("moviesmod_"):
+                src = "moviesmod"
+            elif k.startswith("atoz_"):
+                src = "atoz"
+            elif k.startswith("zeefliz_"):
+                src = "zeefliz"
             else:
-                src = "m4u"
+                src = "hdmovie2"
             movies_to_post.append((m, src))
 
     if not movies_to_post:

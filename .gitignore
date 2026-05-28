@@ -44,3 +44,13 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local test/debug scripts and dumps (never commit these)
+_test_*.py
+test_*.py
+_replace_*.py
+_append_*.py
+_quick_test.py
+_*.html
+*.html
+RENDER_ENV_SETUP.md
