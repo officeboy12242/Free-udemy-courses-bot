@@ -1,0 +1,202 @@
+╔════════════════════════════════════════════════════════════════════╗
+║           🎓 MULTI-USER UDEMY ENROLLER - QUICK START               ║
+║                  Set Up Credentials & Scrape Courses               ║
+╚════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣  START THE BOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PS> python run_bot_local.py
+
+Expected: Bot connects to Telegram, ready for commands
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2️⃣  FIRST-TIME SETUP (One-Time Only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In Telegram:
+
+/enroll_setup
+
+↓ Bot shows instructions
+
+Send your access_token (from browser cookies):
+   1. Open https://www.udemy.com
+   2. Log in
+   3. Press F12 → Application → Cookies → udemy.com
+   4. Find "access_token" and copy the VALUE
+   5. Paste here in Telegram
+
+You send: [long token string]
+Bot responds: ✅ Access token saved!
+
+↓ Bot asks for client_id
+
+Send your client_id:
+   Same location: Find "client_id" and copy the VALUE
+
+You send: [short client_id string]
+Bot responds: 🎉 Setup Complete!
+
+NOW YOU'RE READY! 👍
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3️⃣  USE THE ENROLLER (Anytime, Anywhere)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Scrape courses:
+   /enroll
+   
+   ↓ Shows 8 coupon sites (all selected by default)
+   ↓ Click sites to toggle on/off
+   ↓ Click "🚀 Start Scraping"
+   ↓ Wait 1-2 minutes
+   ↓ Results show course counts per site
+
+View results:
+   /enroll_status
+   
+   Shows:
+   • Total courses found
+   • Breakdown by site
+   • Sample course titles
+
+View your profile:
+   /myprofile
+   
+   Shows:
+   • Setup status
+   • Total scrapes
+   • Total courses
+   • Last scrape time
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4️⃣  MULTI-USER EXAMPLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPORTANT: Each user needs their OWN Udemy cookies!
+
+User 1:
+   /enroll_setup → [sends User 1's cookies]
+   Setup: ✅ Complete
+   /enroll → Scrapes using User 1's credentials
+
+User 2 (Different account):
+   /enroll_setup → [sends User 2's cookies]
+   Setup: ✅ Complete
+   /enroll → Scrapes using User 2's credentials
+
+Both users can scrape simultaneously!
+Each user's data is completely separate!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️  COMMANDS REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Setup:
+   /enroll_setup             Interactive setup
+   /set_token <token>        Set token directly
+   /set_client_id <id>       Set client ID directly
+
+Use:
+   /enroll                   Scrape courses
+   /enroll_status            View your results
+   /myprofile                View your profile
+
+Manage:
+   /myprofile                Show options to update/delete
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔐 SECURITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Your credentials are stored in a secure database
+✅ Only YOU can access your credentials
+✅ Other users cannot see your tokens
+✅ You can update credentials anytime
+✅ You can delete all your data anytime: /myprofile → Clear Data
+✅ GDPR compliant - you own your data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 HOW TO GET COOKIES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Open https://www.udemy.com in your browser
+2. Log in with your Udemy account
+3. Press F12 (or right-click → Inspect)
+4. Go to "Application" tab (at the top)
+5. On left sidebar: Storage → Cookies → https://www.udemy.com
+6. Find these in the list:
+   - access_token (looks like: eyJhbGc...)
+   - client_id (looks like: 6U...)
+7. Click on each and copy the VALUE
+8. Send to bot when asked
+
+⚠️ IMPORTANT: These are personal to your Udemy account!
+   • Don't share them with anyone
+   • Don't post them publicly
+   • Only send to this bot
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⏹️  STOP THE BOT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Press: Ctrl + C
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 AVAILABLE COUPON SITES (8 Total)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 🎓 DiscUdemy        - ~75 courses per scrape
+2. 📚 Udemy Freebies   - ~36 courses per scrape
+3. 📖 Tutorial Bar      - Variable (API dependent)
+4. 💰 Real Discount    - ~500 courses per scrape
+5. 🏫 CourseVania      - Variable (slower)
+6. 💼 E-Next           - Variable (slower)
+7. 🔗 CourseJoiner     - Variable
+8. 🎯 Courson          - Variable (API dependent)
+
+Total: 600-700+ free Udemy courses typically found!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 WHAT GETS TRACKED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Per-User Statistics:
+   ✅ Total number of scrapes
+   ✅ Total courses found (sum of all scrapes)
+   ✅ Last time you scraped
+   ✅ Breakdown per coupon site
+
+View with: /enroll_status
+
+All data is YOUR data. You can delete it anytime!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✨ KEY FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Multi-User        → Each user independent
+✅ Secure Storage    → Database, not env variables
+✅ Automatic Filter  → Expired coupons removed
+✅ Quick Setup       → One-time credential entry
+✅ Easy Updates      → Change credentials anytime
+✅ Privacy Control   → See only your own data
+✅ Data Deletion     → Delete your data anytime (GDPR)
+✅ Analytics         → Track your scrapes
+✅ 600+ Courses      → From 8 coupon sites
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Ready? Let's go!
+
+PS> python run_bot_local.py
+
+Then in Telegram:
+
+/enroll_setup
+
+Follow the prompts and start scraping! 🚀
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

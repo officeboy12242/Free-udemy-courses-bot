@@ -27,7 +27,7 @@ from user_enroller import (
 log = logging.getLogger(__name__)
 
 COURSES_API = "https://cdn.real.discount/api/courses"
-AUTO_ENROLL_INTERVAL = 180  # 3 minutes
+AUTO_ENROLL_INTERVAL = 120  # 2 minutes
 
 
 # ─── Setup Commands ──────────────────────────────────────────────────────────
@@ -245,11 +245,11 @@ async def cmd_autoenroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.effective_message.reply_text(
         f"⚡ **Auto-Enrollment Status:** {status}\n\n"
         f"Accounts with auto-enroll: {len(auto_accounts)}/{len(accounts)}\n"
-        f"Check interval: Every 3 minutes\n"
+        f"Check interval: Every 2 minutes\n"
         f"Total auto-enrolled: {state['total']}\n"
         f"Last check: {state['last_check'] or 'Never'}\n\n"
         "When active, I check for new free courses every 10 minutes "
-        "and auto-enroll your accounts. You get notified for each enrollment.",
+        "and auto-enroll your accounts. You get notified when new courses are enrolled.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -717,19 +717,25 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
 # ─── Auto-Enroll Background Job ──────────────────────────────────────────────
 
 async def auto_enroll_job(app: Application) -> None:
-    """Background job: checks API for new courses and auto-enrolls enabled accounts"""
+    """Background job: checks API every 2 min, enrolls all enabled accounts, notifies user"""
     bot: Bot = app.bot
+    log.info("Auto-enroll background job started (every 2 min)")
     
     while True:
         await asyncio.sleep(AUTO_ENROLL_INTERVAL)
         
         try:
+            # Get ALL accounts with auto_enroll flag on
             accounts = await asyncio.to_thread(get_all_auto_enroll_accounts)
             if not accounts:
                 continue
             
-            courses = await asyncio.to_thread(_fetch_courses_from_api, 30)
+            log.info(f"Auto-enroll: {len(accounts)} accounts active, fetching courses...")
+            
+            # Fetch latest courses from API
+            courses = await asyncio.to_thread(_fetch_courses_from_api, 50)
             if not courses:
+                log.info("Auto-enroll: No courses from API this cycle")
                 continue
             
             # Group accounts by user
@@ -738,47 +744,38 @@ async def auto_enroll_job(app: Application) -> None:
                 user_accounts.setdefault(acc["user_id"], []).append(acc)
             
             for user_id, user_accs in user_accounts.items():
-                state = get_auto_enroll_state(user_id)
-                if not state["enabled"]:
-                    continue
-                
-                # Filter to only new courses (not already enrolled by this user)
-                new_courses = [
-                    c for c in courses
-                    if not is_course_enrolled(user_id, c.url)
-                ]
-                
-                if not new_courses:
-                    update_auto_enroll_state(user_id)
-                    continue
-                
                 all_enrolled = []
                 
                 for acc in user_accs:
-                    result = await asyncio.to_thread(
-                        _enroll_account_in_courses, acc, new_courses
-                    )
+                    try:
+                        result = await asyncio.to_thread(
+                            _enroll_account_in_courses, acc, courses
+                        )
+                    except Exception as e:
+                        log.error(f"Auto-enroll error acc {acc['id']}: {e}")
+                        continue
                     
                     if result["error"]:
-                        log.warning(f"Auto-enroll failed for user {user_id} acc {acc['id']}: {result['error']}")
+                        log.warning(f"Auto-enroll login failed user {user_id} acc {acc['id']}: {result['error']}")
                         continue
                     
                     for title in result["enrolled"]:
-                        log_enrollment(user_id, acc["id"], "", title)
+                        log_enrollment(user_id, acc["id"], title, title)
                         all_enrolled.append((title, acc["name"]))
                 
+                # Always update state (last_check timestamp)
+                update_auto_enroll_state(
+                    user_id,
+                    last_course_id=courses[0].url if courses else None,
+                    enrolled_count=len(all_enrolled)
+                )
+                
+                # Notify user only if something new was enrolled
                 if all_enrolled:
-                    update_auto_enroll_state(
-                        user_id,
-                        last_course_id=new_courses[0].url if new_courses else None,
-                        enrolled_count=len(all_enrolled)
-                    )
-                    
-                    # Notify user
                     lines = [f"🔔 **Auto-Enrolled {len(all_enrolled)} Courses!**\n"]
                     for title, acc_name in all_enrolled[:8]:
                         short = title[:42] + "..." if len(title) > 42 else title
-                        lines.append(f"• {short}")
+                        lines.append(f"• {short} ({acc_name})")
                     if len(all_enrolled) > 8:
                         lines.append(f"  ...+{len(all_enrolled) - 8} more")
                     
@@ -789,12 +786,13 @@ async def auto_enroll_job(app: Application) -> None:
                             parse_mode="Markdown"
                         )
                     except Exception as e:
-                        log.debug(f"Failed to notify user {user_id}: {e}")
-                else:
-                    update_auto_enroll_state(user_id)
+                        log.debug(f"Notify user {user_id} failed: {e}")
+                    
+                    log.info(f"Auto-enroll: user {user_id} got {len(all_enrolled)} new courses")
         
         except Exception as e:
             log.error(f"Auto-enroll job error: {e}")
+            await asyncio.sleep(10)
 
 
 # Initialize database

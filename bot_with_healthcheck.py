@@ -227,7 +227,7 @@ Here's what I can do:
 /set_client_id &lt;id&gt; — set client_id
 /enroll — enroll now (all accounts or latest)
 /accounts — manage your Udemy accounts
-/autoenroll — toggle auto-enrollment (checks every 3 min)
+/autoenroll — toggle auto-enrollment (checks every 2 min)
 /enroll_status — view enrollment stats
 /myprofile — profile &amp; data management
 
@@ -240,7 +240,7 @@ Here's what I can do:
 1. /enroll_setup → add 1 or more Udemy accounts
 2. /enroll → manually enroll in 50 latest free courses
 3. /autoenroll → turn on background auto-enrollment
-   → Bot checks every 3 min for new courses
+   → Bot checks every 2 min for new courses
    → Auto-enrolls all your accounts
    → Sends you notification when courses are enrolled
 
@@ -300,7 +300,7 @@ Manage your Udemy accounts:
 
 <b>/autoenroll</b>
 Toggle background auto-enrollment ON/OFF.
-When ON: Bot checks every 3 min for new free courses
+When ON: Bot checks every 2 min for new free courses
 and auto-enrolls all your enabled accounts.
 You get notified when courses are enrolled!
 
@@ -378,7 +378,7 @@ A: Yes! Run /enroll_setup multiple times to add more accounts.
 Use /accounts to manage them.
 
 <b>Q: How does auto-enroll work?</b>
-A: Enable via /autoenroll. Bot checks API every 3 minutes
+A: Enable via /autoenroll. Bot checks API every 2 minutes
 for new free courses and enrolls all your enabled accounts.
 You get a Telegram notification for each batch enrolled.
 

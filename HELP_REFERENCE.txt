@@ -1,0 +1,209 @@
+╔════════════════════════════════════════════════════════════════════╗
+║              📖 BOT HELP SYSTEM - REFERENCE GUIDE                  ║
+║                   All Commands & Descriptions                      ║
+╚════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+START HERE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+New to the bot? Send:
+
+/start        → Quick overview of all features (2 min read)
+/help         → Detailed documentation for every command (5 min read)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎓 UDEMY ENROLLER - FREE COURSES (6 Commands)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/enroll_setup
+📝 Setup your Udemy credentials (one-time)
+   Asks for: access_token & client_id from browser cookies
+   Takes: 2 minutes
+   Result: Ready to scrape courses
+
+/set_token <token>
+🔑 Set access_token directly via command
+   Usage: /set_token eyJhbGc...
+   Alternative to interactive setup
+
+/set_client_id <id>
+🔑 Set client_id directly via command
+   Usage: /set_client_id 6U...
+   Alternative to interactive setup
+
+/enroll
+📚 Scrape 600+ free Udemy courses
+   From: 8 coupon sites (DiscUdemy, Real.Discount, etc.)
+   Time: 1-2 minutes to scrape
+   Result: Course counts per site
+   Requirement: Must run /enroll_setup first
+
+/enroll_status
+📊 View your scrape results & statistics
+   Shows: Courses found, breakdown per site, samples
+   Tracks: Your lifetime stats
+
+/myprofile
+👤 View your profile & manage credentials
+   Shows: Setup status, total scrapes, stats
+   Options: Update credentials, delete all data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📽️ MOVIE COMMANDS (3 Commands)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/movies
+🎬 Browse latest movies from 10+ sites
+   Sites: HDHub4u, MoviesDrive, HDMovie2, AtoZ, ZeeFliz + more
+   Action: Click site → Select quality → Browse latest
+   Result: Direct download links
+
+/search <title>
+🔍 Search all movie sites for a specific movie
+   Usage: /search Project Hail Mary
+   Searches: All 10+ sources simultaneously
+   Result: Results from each site with links
+
+/movietest
+🧪 Quick test of movie sources
+   Shows: Latest movies from popular sites
+   Purpose: Test if all scrapers are working
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📰 NEWS COMMANDS (1 Command)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/news
+📰 Preview latest tech news
+   From: Inshorts (Indian tech news)
+   Action: Post each article to channel or Skip
+   Auto-posts: Daily at 10 AM & 10 PM IST
+   Current: Today's latest articles
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 MARKET COMMANDS (3 Commands)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/market
+📊 Live market snapshot & dip status
+   Tracks: Nifty 50, Sensex, Nifty BeES
+   Shows: Current value, % change, dip status
+   Updates: Every 2 minutes
+   Data: Yahoo Finance (unofficial/delayed)
+
+/testdip
+⚠️ Sample dip alert (simulated, not real)
+   Purpose: Show what dip alerts look like
+   Shows: Alert format & template
+   Data: Fake values for demo
+
+/testalert
+✅ Test if dip alerts can reach the channel
+   Purpose: Verify alert delivery system
+   Use: For debugging & verification
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 UTILITY COMMANDS (4 Commands)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/start
+👋 Quick overview of all features
+   Shows: All command categories & brief descriptions
+   Time: 2-3 minutes to read
+   Purpose: First-time user onboarding
+
+/help
+📖 Detailed documentation
+   Shows: Every command with full description
+   Includes: Examples, prerequisites, FAQ
+   Time: 5-10 minutes to read thoroughly
+   Purpose: Complete reference guide
+
+/myid
+🆔 Show your Telegram user ID
+   Purpose: Debugging, permissions check
+   Useful: For setting up in admins list
+
+/updateapi
+⚙️ Update API settings (admin only)
+   Purpose: Manage scraper API keys
+   Access: Restricted to administrators
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 TOTAL COMMANDS: 17
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Category         | Count | Commands
+─────────────────┼───────┼──────────────────────────
+Udemy Enroller   | 6     | /enroll_setup, /set_token, /set_client_id,
+                 |       | /enroll, /enroll_status, /myprofile
+Movies           | 3     | /movies, /search, /movietest
+News             | 1     | /news
+Market           | 3     | /market, /testdip, /testalert
+Utility          | 4     | /start, /help, /myid, /updateapi
+─────────────────┼───────┼──────────────────────────
+TOTAL            | 17    | All documented!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 QUICK START GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Want to scrape free Udemy courses?
+
+1. /enroll_setup
+   ↓ Follow prompts, send your Udemy cookies
+   
+2. /enroll
+   ↓ Select coupon sites, click Start
+   ↓ Wait 1-2 minutes
+   
+3. /enroll_status
+   ↓ See results: 600+ courses found!
+
+That's it! You're done! 🚀
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+❓ COMMON QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: How do I get started?
+A: Send /start for quick overview, /help for details
+
+Q: Where are the Udemy commands?
+A: /enroll_setup, /enroll, /enroll_status, /myprofile
+
+Q: How do I get Udemy cookies?
+A: Run /enroll_setup - it shows step-by-step instructions
+
+Q: Can I use this with my friend?
+A: Yes! Each person runs /enroll_setup with their own cookies.
+   Each gets separate scraping with own stats.
+
+Q: How many commands total?
+A: 17 commands across 5 categories (Movies, News, Market, Enroller, Utility)
+
+Q: Is my data private?
+A: Yes! Each user only sees their own credentials and stats.
+
+Q: Can I delete my data?
+A: Yes! Run /myprofile → Clear Data (GDPR compliant)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎓 TOP FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Scrape 600+ free Udemy courses
+✅ Browse movies from 10+ sources
+✅ Get latest tech news daily
+✅ Track market dips in real-time
+✅ Multi-user support (each user independent)
+✅ Secure credential storage (database)
+✅ Personal statistics & history
+✅ Delete your data anytime (GDPR)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👉 READY? SEND /start OR /help NOW! 👈
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
