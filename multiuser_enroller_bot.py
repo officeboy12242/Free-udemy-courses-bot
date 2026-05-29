@@ -361,47 +361,78 @@ async def enroll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await cmd_enroll_setup(update, context)
 
 
+def _progress_bar(current: int, total: int, width: int = 15) -> str:
+    """Generate a text progress bar"""
+    if total == 0:
+        return "░" * width
+    pct = current / total
+    filled = int(width * pct)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar} {int(pct * 100)}%"
+
+
 async def _run_scraper_multiuser(update: Update, context: ContextTypes.DEFAULT_TYPE, sites: list) -> None:
-    """Run scraper for multi-user"""
+    """Run scraper with live progress bar per site"""
     try:
         user_id = update.effective_user.id
         scraper = UdemyScraper()
+        msg = update.callback_query.message if update.callback_query else update.effective_message
         
-        results = await asyncio.to_thread(scraper.scrape_all, sites)
+        total_sites = len(sites)
+        results = {}
         
-        total_courses = sum(len(courses) for courses in results.values())
+        for i, site in enumerate(sites):
+            site_label = AVAILABLE_SITES.get(site, site)
+            bar = _progress_bar(i, total_sites)
+            
+            # Build progress message
+            lines = [f"🔍 **Scraping Courses...**\n", f"{bar}  ({i}/{total_sites})\n"]
+            lines.append(f"⏳ Scraping: {site_label}...")
+            if results:
+                lines.append("")
+                for s, courses in results.items():
+                    sl = AVAILABLE_SITES.get(s, s)
+                    lines.append(f"✅ {sl}: {len(courses)}")
+                lines.append(f"\n📊 Total so far: {sum(len(c) for c in results.values())}")
+            
+            try:
+                await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+            except Exception:
+                pass
+            
+            # Scrape this site in thread
+            scrape_method = getattr(scraper, f"scrape_{site}", None)
+            if scrape_method:
+                site_courses = await asyncio.to_thread(scrape_method)
+                valid = [c for c in site_courses if c.is_valid()]
+                results[site] = valid
+                if valid:
+                    log_scrape_history(user_id, site, len(valid))
+            else:
+                results[site] = []
+        
+        # Final result
+        total_courses = sum(len(c) for c in results.values())
+        bar = _progress_bar(total_sites, total_sites)
         
         if total_courses == 0:
-            message_text = (
-                "❌ No courses found.\n"
-                "Sites may be blocking or coupons expired."
+            await msg.edit_text(
+                f"{bar}\n\n❌ No courses found.\nSites may be blocking or coupons expired.",
+                parse_mode="Markdown"
             )
-            keyboard = None
         else:
-            lines = [f"✅ **Found {total_courses} Courses!**\n"]
-            
+            lines = [f"{bar}\n", f"✅ **Found {total_courses} Courses!**\n"]
             for site, courses in results.items():
                 if courses:
                     site_label = AVAILABLE_SITES.get(site, site)
                     lines.append(f"• {site_label}: {len(courses)} courses")
-                    log_scrape_history(user_id, site, len(courses))
-            
             lines.append(f"\n🚀 Click below to auto-enroll in all {total_courses} courses!")
-            message_text = "\n".join(lines)
             
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("🚀 Auto-Enroll Now", callback_data="enroll_auto_start"),
                 InlineKeyboardButton("❌ Skip", callback_data="enroll_auto_skip"),
             ]])
-        
-        if update.callback_query and update.callback_query.message:
-            await update.callback_query.edit_message_text(
-                message_text, parse_mode="Markdown", reply_markup=keyboard
-            )
-        else:
-            await update.effective_message.reply_text(
-                message_text, parse_mode="Markdown", reply_markup=keyboard
-            )
+            await msg.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=keyboard)
         
         context.user_data["enroll_results"] = results
         
@@ -412,62 +443,91 @@ async def _run_scraper_multiuser(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _run_auto_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-enroll user in all scraped courses using their credentials"""
+    """Auto-enroll user in all scraped courses with live progress bar"""
     try:
         user_id = update.effective_user.id
+        msg = update.callback_query.message if update.callback_query else update.effective_message
         
         # Get user credentials
         creds = get_user_credentials(user_id)
         if not creds or not creds.get("access_token") or not creds.get("client_id"):
-            if update.callback_query and update.callback_query.message:
-                await update.callback_query.edit_message_text(
-                    "❌ Credentials not found. Run `/enroll_setup` first."
-                )
+            await msg.edit_text("❌ Credentials not found. Run `/enroll_setup` first.")
             return
         
         # Get scraped courses
         results = context.user_data.get("enroll_results", {})
         if not results:
-            if update.callback_query and update.callback_query.message:
-                await update.callback_query.edit_message_text(
-                    "❌ No courses to enroll in. Run `/enroll` first."
-                )
+            await msg.edit_text("❌ No courses to enroll in. Run `/enroll` first.")
             return
         
-        # Flatten all courses into one list
+        # Flatten all courses
         all_courses = []
         for site_courses in results.values():
             all_courses.extend(site_courses)
         
         if not all_courses:
-            if update.callback_query and update.callback_query.message:
-                await update.callback_query.edit_message_text("❌ No courses found.")
+            await msg.edit_text("❌ No courses found.")
             return
         
-        # Create enroller instance
+        total = len(all_courses)
         enroller = UdemyAutoEnroller(
             access_token=creds["access_token"],
             client_id=creds["client_id"]
         )
         
-        # Run enrollment in thread
-        enrollment_result = await asyncio.to_thread(
-            enroller.enroll_in_courses, all_courses
-        )
+        enrolled = []
+        already_enrolled = []
+        failed = []
+        expired = []
+        last_update = 0
         
-        # Format results
-        enrolled = enrollment_result.get("enrolled", [])
-        already = enrollment_result.get("already_enrolled", [])
-        failed = enrollment_result.get("failed", [])
-        expired = enrollment_result.get("expired", [])
-        total = enrollment_result.get("total", 0)
+        for i, course in enumerate(all_courses):
+            # Update progress every 5 courses or at start/end
+            if i - last_update >= 5 or i == 0:
+                last_update = i
+                bar = _progress_bar(i, total)
+                lines = [
+                    f"🚀 **Auto-Enrolling...**\n",
+                    f"{bar}  ({i}/{total})\n",
+                    f"✅ Enrolled: {len(enrolled)}",
+                    f"📚 Already had: {len(already_enrolled)}",
+                    f"⏰ Skipped: {len(expired)}",
+                    f"❌ Failed: {len(failed)}",
+                ]
+                if enrolled and enrolled[-1]:
+                    short = enrolled[-1][:40] + "..." if len(enrolled[-1]) > 40 else enrolled[-1]
+                    lines.append(f"\n🆕 Last: {short}")
+                
+                try:
+                    await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+                except Exception:
+                    pass
+            
+            # Process this course in thread
+            result = await asyncio.to_thread(
+                _enroll_single_course, enroller, course
+            )
+            
+            if result["status"] == "enrolled":
+                enrolled.append(course.title)
+            elif result["status"] == "already":
+                already_enrolled.append(course.title)
+            elif result["status"] == "expired":
+                expired.append({"title": course.title, "reason": result.get("reason", "")})
+            else:
+                failed.append({"title": course.title, "reason": result.get("reason", "Unknown")})
         
-        lines = ["🎉 **Auto-Enrollment Complete!**\n"]
-        lines.append(f"📊 Total processed: {total}")
-        lines.append(f"✅ Enrolled: {len(enrolled)}")
-        lines.append(f"📚 Already had: {len(already)}")
-        lines.append(f"⏰ Expired/Not free: {len(expired)}")
-        lines.append(f"❌ Failed: {len(failed)}")
+        # Final summary
+        bar = _progress_bar(total, total)
+        lines = [
+            f"🎉 **Auto-Enrollment Complete!**\n",
+            f"{bar}\n",
+            f"📊 Total processed: {total}",
+            f"✅ Enrolled: {len(enrolled)}",
+            f"📚 Already had: {len(already_enrolled)}",
+            f"⏰ Expired/Not free: {len(expired)}",
+            f"❌ Failed: {len(failed)}",
+        ]
         
         if enrolled:
             lines.append("\n**✅ Newly Enrolled:**")
@@ -478,26 +538,57 @@ async def _run_auto_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 lines.append(f"  ...and {len(enrolled) - 10} more!")
         
         if expired:
-            lines.append(f"\n**⏰ Skipped (expired/paid):** {len(expired)}")
+            lines.append(f"\n⏰ Skipped {len(expired)} expired/paid courses")
         
         if failed and len(failed) <= 5:
             lines.append("\n**❌ Failed:**")
             for item in failed[:5]:
                 short = item['title'][:40] + "..." if len(item['title']) > 40 else item['title']
                 lines.append(f"• {short} — {item['reason']}")
+        elif failed:
+            lines.append(f"\n❌ {len(failed)} courses failed (API errors)")
         
-        message_text = "\n".join(lines)
-        
-        if update.callback_query and update.callback_query.message:
-            await update.callback_query.edit_message_text(message_text, parse_mode="Markdown")
-        elif update.effective_message:
-            await update.effective_message.reply_text(message_text, parse_mode="Markdown")
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
         
     except Exception as e:
         log.error(f"Auto-enroll error: {e}")
-        error_msg = f"❌ Auto-enrollment error: {str(e)[:100]}"
         if update.callback_query and update.callback_query.message:
-            await update.callback_query.edit_message_text(error_msg)
+            await update.callback_query.edit_message_text(f"❌ Error: {str(e)[:100]}")
+
+
+def _enroll_single_course(enroller: UdemyAutoEnroller, course) -> dict:
+    """Enroll in a single course (runs in thread)"""
+    try:
+        slug = enroller._extract_course_slug(course.url)
+        if not slug:
+            return {"status": "failed", "reason": "Invalid URL"}
+        
+        coupon = course.coupon_code or enroller._extract_coupon(course.url)
+        
+        info = enroller._get_course_info(slug)
+        if not info:
+            return {"status": "failed", "reason": "Course not found"}
+        
+        course_id = info.get("id")
+        if not course_id:
+            return {"status": "failed", "reason": "No course ID"}
+        
+        if enroller._check_already_enrolled(course_id):
+            return {"status": "already"}
+        
+        if coupon:
+            coupon_check = enroller._check_coupon_valid(slug, coupon)
+            if coupon_check and not coupon_check.get("free", False):
+                return {"status": "expired", "reason": "Coupon not 100% off"}
+        
+        success = enroller._enroll_free_course(course_id, slug, coupon)
+        if success:
+            return {"status": "enrolled"}
+        else:
+            return {"status": "failed", "reason": "Enrollment API failed"}
+            
+    except Exception as e:
+        return {"status": "failed", "reason": str(e)[:50]}
 
 
 async def cmd_enroll_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
