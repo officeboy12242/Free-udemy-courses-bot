@@ -18,7 +18,7 @@ import requests
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from aiohttp import web
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +45,19 @@ from news_service import (
     mark_news_posted,
     cleanup_old_news,
     clear_queue,
+)
+from udemy_enroller import UdemyScraper
+from multiuser_enroller_bot import (
+    cmd_enroll_setup,
+    cmd_set_token,
+    cmd_set_client_id,
+    cmd_enroll,
+    cmd_enroll_status,
+    cmd_myprofile,
+    enroll_callback,
+    setup_callback,
+    profile_callback,
+    handle_setup_message,
 )
 from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
@@ -80,6 +93,18 @@ def _get_endpoint(): return ''.join(chr(c) for c in _X)
 
 DB_FILE     = "posted_courses.db"
 CHECK_EVERY = 180   # seconds between polls (3 min)
+
+# ─── Udemy Enroller Configuration ────────────────────────────────────────
+AVAILABLE_SITES = {
+    "discudemy": "🎓 DiscUdemy",
+    "udemyfreebies": "📚 Udemy Freebies",
+    "tutorialbar": "📖 Tutorial Bar",
+    "realdiscount": "💰 Real Discount",
+    "coursevania": "🏫 CourseVania",
+    "enext": "💼 E-Next",
+    "coursejoiner": "🔗 CourseJoiner",
+    "courson": "🎯 Courson",
+}
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -188,21 +213,45 @@ WELCOME_HTML = """<b>Welcome!</b> 👋
 Here's what I can do:
 
 • <b>Course alerts</b> — free-course picks posted to the channel on a timer.
-
 • <b>Market dip heads-up</b> — alerts when Nifty 50, Sensex, or Nifty BeES fall by your dip threshold vs previous close.
-
 • <b>Tech news</b> — latest tech headlines auto-posted daily at 10 AM &amp; 10 PM IST.
+• <b>🆕 Udemy Auto-Enroller</b> — scrape 600+ free Udemy courses from 8 coupon sites!
 
-<b>Commands:</b>
-/start — this menu
-/movies — browse latest movies (4KHDHub &amp; MoviesDrive)
-/search &lt;title&gt; — search both sites for any movie
+<b>📽️ Movie Commands:</b>
+/movies — browse latest movies from 10+ sites
+/search &lt;title&gt; — search all movie sites
+/movietest — quick test with popular movies
+
+<b>📰 News Commands:</b>
 /news — preview latest tech news (Post / Skip)
+
+<b>📈 Market Commands:</b>
 /market — live market snapshot + dip status
 /testdip — sample dip alert (not real data)
-/testalert — check if dip alerts can reach their destination
+/testalert — check if dip alerts can reach destination
 
-<i>Market data is unofficial/delayed (Yahoo). Not financial advice.</i>
+<b>🎓 Udemy Enroller Commands:</b>
+/enroll_setup — 🔐 Setup your Udemy credentials (one-time)
+/set_token &lt;token&gt; — set access_token directly
+/set_client_id &lt;id&gt; — set client_id directly
+/enroll — 📚 scrape 600+ free courses from 8 sites
+/enroll_status — view your scrape results &amp; statistics
+/myprofile — view your profile, stats, manage credentials
+
+<b>🔧 Utility Commands:</b>
+/start — this menu
+/myid — your Telegram ID
+/updateapi — update API settings (admin only)
+
+<b>ℹ️ How to use Udemy Enroller:</b>
+1. Send /enroll_setup
+2. Get your Udemy cookies (see instructions)
+3. Send access_token &amp; client_id
+4. Use /enroll anytime to scrape courses
+5. View results with /enroll_status
+
+<i>Market data is unofficial/delayed (Yahoo). Not financial advice.
+Each user has their own secure credential storage. See /myprofile for details.</i>
 
 ⚡ Powered by <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
 
@@ -223,6 +272,132 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         con.close()
         
     await update.effective_message.reply_html(WELCOME_HTML)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show detailed help for all commands"""
+    if not update.effective_message:
+        return
+    
+    help_text = """<b>📖 DETAILED COMMAND HELP</b>
+
+<b>🎓 UDEMY ENROLLER (New!)</b>
+
+<b>/enroll_setup</b>
+Start interactive setup to add your Udemy credentials.
+One-time setup, then use /enroll anytime.
+Bot will ask for access_token and client_id from your browser cookies.
+
+<b>/set_token &lt;token&gt;</b>
+Alternative way to set access_token directly.
+Usage: /set_token eyJhbGc...
+
+<b>/set_client_id &lt;id&gt;</b>
+Alternative way to set client_id directly.
+Usage: /set_client_id 6U...
+
+<b>/enroll</b>
+Scrape free Udemy courses from 8 coupon sites:
+🎓 DiscUdemy | 📚 Udemy Freebies | 📖 Tutorial Bar | 💰 Real Discount
+🏫 CourseVania | 💼 E-Next | 🔗 CourseJoiner | 🎯 Courson
+
+Select which sites, click "Start", wait 1-2 minutes for results.
+Finds 600+ free courses typically.
+⚠️ Requires: /enroll_setup first
+
+<b>/enroll_status</b>
+View your latest scrape results and statistics.
+Shows: Total courses found, breakdown per site, sample titles.
+⚠️ Requires: /enroll_setup first
+
+<b>/myprofile</b>
+View your profile, setup status, and lifetime statistics.
+Shows: Total scrapes, total courses, last scrape time.
+Can update credentials or delete all your data here.
+
+<b>📽️ MOVIE COMMANDS</b>
+
+<b>/movies</b>
+Browse latest movies from multiple sources:
+⭐ HDHub4u | 🎬 4KHDHub | 🎥 MoviesDrive | 🎞️ HDMovie2
+🌟 Vegamovies | 📀 SDMoviesPoint | 🎞️ BollyFlix | 🚜 MoviesMod
+🅰️ AtoZ Cinemas | 🎬 ZeeFliz
+Click a source, select quality, browse latest movies.
+
+<b>/search &lt;title&gt;</b>
+Search all 10+ movie sites for a specific title.
+Usage: /search Project Hail Mary
+Shows results from each site with direct download links.
+
+<b>/movietest</b>
+Quick test - shows latest movies from popular sources.
+Good for checking if all sites are working.
+
+<b>📰 NEWS COMMANDS</b>
+
+<b>/news</b>
+Preview latest tech news from Inshorts.
+Choose to Post (to channel) or Skip each article.
+Auto-posts daily at 10 AM and 10 PM IST.
+
+<b>📈 MARKET COMMANDS</b>
+
+<b>/market</b>
+Live market snapshot for:
+• Nifty 50 | Sensex | Nifty BeES
+Shows: Current value, change %, dip status.
+Market updates every 2 minutes.
+
+<b>/testdip</b>
+Send a sample dip alert (simulated, not real data).
+Shows what alerts look like when markets fall.
+
+<b>/testalert</b>
+Test if dip alerts can reach the channel.
+Useful for debugging alert delivery.
+
+<b>🔧 UTILITY COMMANDS</b>
+
+<b>/start</b>
+Show welcome menu with quick command overview.
+
+<b>/myid</b>
+Show your Telegram user ID.
+Useful for debugging and permissions.
+
+<b>/updateapi</b>
+Update API configuration (admin only).
+For updating scraper settings.
+
+<b>💡 TIPS</b>
+
+• Setup takes 2 minutes (one-time)
+• Each user has separate secure storage
+• Credentials never in logs/visible to others
+• Delete your data anytime: /myprofile → Clear Data
+• Most commands have short alternatives
+
+<b>❓ FAQ</b>
+
+<b>Q: How do I get Udemy cookies?</b>
+A: See /enroll_setup - it shows step-by-step instructions.
+
+<b>Q: Can I use this with my friend?</b>
+A: Yes! Each user runs /enroll_setup with their own credentials.
+Each gets independent scraping with their own stats.
+
+<b>Q: What if I forget my cookies?</b>
+A: Run /enroll_setup again to update them anytime.
+
+<b>Q: Is my data private?</b>
+A: Yes! Only you can see your credentials and stats.
+Other users cannot access your data.
+
+<b>Q: Can I delete my data?</b>
+A: Yes! Run /myprofile → Clear Data (GDPR compliant).
+"""
+    
+    await update.effective_message.reply_html(help_text)
 
 
 async def cmd_testdip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -661,6 +836,203 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # Run scraping as a background task so bot stays responsive
         asyncio.create_task(_do_scrape())
+
+
+# ─── Udemy Auto-Enroller Commands ────────────────────────────────────────
+
+async def cmd_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show Udemy auto-enroller site selection menu"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+        return
+    
+    # Store user's selected sites (default: all enabled)
+    if "enroll_sites" not in context.user_data:
+        context.user_data["enroll_sites"] = set(AVAILABLE_SITES.keys())
+    
+    await _show_enroll_menu(update, context)
+
+
+async def _show_enroll_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the site selection menu"""
+    selected = context.user_data.get("enroll_sites", set(AVAILABLE_SITES.keys()))
+    
+    keyboard = []
+    
+    # Create button for each site
+    for site_key, site_label in AVAILABLE_SITES.items():
+        is_selected = site_key in selected
+        emoji = "✅" if is_selected else "⭕"
+        button_text = f"{emoji} {site_label}"
+        keyboard.append([
+            InlineKeyboardButton(button_text, callback_data=f"enroll_toggle_{site_key}")
+        ])
+    
+    # Add Start and Cancel buttons
+    keyboard.append([
+        InlineKeyboardButton("🚀 Start Auto-Enroll", callback_data="enroll_start"),
+        InlineKeyboardButton("❌ Cancel", callback_data="enroll_cancel"),
+    ])
+    
+    text = (
+        "🎓 **Udemy Auto-Enroller**\n\n"
+        "Select which coupon sites to scrape:\n"
+        f"(Selected: {len(selected)}/{len(AVAILABLE_SITES)})\n\n"
+        "💡 Tip: Tap sites to toggle them on/off"
+    )
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        await update.effective_message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+
+
+async def enroll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle enroll menu callbacks"""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await query.answer("⛔ You do not have permission.", show_alert=True)
+        return
+    
+    data = query.data
+    selected = context.user_data.get("enroll_sites", set(AVAILABLE_SITES.keys()))
+    
+    # Toggle site selection
+    if data.startswith("enroll_toggle_"):
+        site = data.replace("enroll_toggle_", "")
+        if site in selected:
+            selected.discard(site)
+        else:
+            selected.add(site)
+        context.user_data["enroll_sites"] = selected
+        await _show_enroll_menu(update, context)
+        await query.answer()
+        return
+    
+    # Cancel
+    elif data == "enroll_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return
+    
+    # Start enrollment
+    elif data == "enroll_start":
+        if not selected:
+            await query.answer("⚠️ Please select at least one site!", show_alert=True)
+            return
+        
+        await query.answer("🔄 Starting scraper... This may take a minute.")
+        await query.edit_message_text(
+            "🔄 Scraping courses...\n\n"
+            "This will take 1-2 minutes depending on selected sites.\n"
+            "You'll receive results shortly."
+        )
+        
+        # Run scraper in background
+        asyncio.create_task(_run_scraper(update, context, list(selected)))
+
+
+async def _run_scraper(update: Update, context: ContextTypes.DEFAULT_TYPE, sites: list) -> None:
+    """Run the scraper and post results"""
+    try:
+        scraper = UdemyScraper()
+        
+        # Run scraper in thread to avoid blocking
+        results = await asyncio.to_thread(scraper.scrape_all, sites)
+        
+        # Count total courses
+        total_courses = sum(len(courses) for courses in results.values())
+        total_valid = total_courses  # Already filtered for validity
+        
+        if total_valid == 0:
+            message_text = (
+                "❌ No valid courses found.\n\n"
+                "This could mean:\n"
+                "• All coupons have expired\n"
+                "• Sites are blocking requests\n"
+                "Try again later or select different sites."
+            )
+        else:
+            # Build results summary
+            lines = [f"✅ **Found {total_valid} Valid Courses!**\n"]
+            
+            for site, courses in results.items():
+                if courses:
+                    site_label = AVAILABLE_SITES.get(site, site)
+                    lines.append(f"• {site_label}: {len(courses)} courses")
+            
+            lines.append("\n📋 **Next Steps:**")
+            lines.append("1. Copy your Udemy `access_token` and `client_id` from browser cookies")
+            lines.append("2. Set them in your environment (local: `.env`, Render: Dashboard)")
+            lines.append("3. Run `/enroll_status` to view all courses\n")
+            lines.append("⏱️ Coupon expiry checking already filtered invalid coupons!")
+            
+            message_text = "\n".join(lines)
+        
+        # Post results
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.edit_message_text(message_text, parse_mode="Markdown")
+        else:
+            await update.effective_message.reply_text(message_text, parse_mode="Markdown")
+        
+        # Store results for viewing
+        context.user_data["enroll_results"] = results
+        context.user_data["enroll_sites_selected"] = sites
+        
+    except Exception as e:
+        log.error(f"Scraper error: {e}")
+        error_message = f"❌ Scraper error: {str(e)[:100]}\n\nPlease try again later."
+        
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.edit_message_text(error_message)
+        else:
+            await update.effective_message.reply_text(error_message)
+
+
+async def cmd_enroll_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show enrollment status and scraped courses"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
+        await update.effective_message.reply_text("⛔ You do not have permission.")
+        return
+    
+    results = context.user_data.get("enroll_results", {})
+    
+    if not results:
+        await update.effective_message.reply_text(
+            "No scrape results yet.\nRun `/enroll` to scrape courses first.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    total = sum(len(courses) for courses in results.values())
+    
+    message = f"📊 **Enrollment Status**\n\nTotal Valid Courses: {total}\n\n"
+    
+    for site, courses in results.items():
+        if courses:
+            site_label = AVAILABLE_SITES.get(site, site)
+            message += f"✅ {site_label}: {len(courses)}\n"
+            # Show first 3 courses
+            for course in courses[:3]:
+                title = course.title[:50] + "..." if len(course.title) > 50 else course.title
+                message += f"   • {title}\n"
+            if len(courses) > 3:
+                message += f"   ... and {len(courses) - 3} more\n"
+    
+    await update.effective_message.reply_text(message, parse_mode="Markdown")
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1401,6 +1773,7 @@ async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_telegram_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("testdip", cmd_testdip))
     app.add_handler(CommandHandler("testalert", cmd_testalert))
@@ -1415,6 +1788,18 @@ def build_telegram_application() -> Application:
     app.add_handler(CallbackQueryHandler(search_source_callback,   pattern=r"^msrc_"))
     app.add_handler(CallbackQueryHandler(search_result_callback,   pattern=r"^msres_|^msearch_noop$"))
     app.add_handler(CallbackQueryHandler(post_to_channel_callback, pattern=r"^mpost_"))
+    # Multi-user Udemy enroller handlers
+    app.add_handler(CommandHandler("enroll_setup", cmd_enroll_setup))
+    app.add_handler(CommandHandler("set_token", cmd_set_token))
+    app.add_handler(CommandHandler("set_client_id", cmd_set_client_id))
+    app.add_handler(CommandHandler("enroll", cmd_enroll))
+    app.add_handler(CommandHandler("enroll_status", cmd_enroll_status))
+    app.add_handler(CommandHandler("myprofile", cmd_myprofile))
+    app.add_handler(CallbackQueryHandler(enroll_callback, pattern=r"^enroll_"))
+    app.add_handler(CallbackQueryHandler(setup_callback, pattern=r"^setup_"))
+    app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete)$"))
+    # Message handler for setup input (must be last to not interfere with commands)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
     return app
 
 
@@ -1977,7 +2362,7 @@ async def run_news_autopost(bot: Bot):
                     log.error("📰 News post failed: %s", e)
             else:
                 log.info("📰 No new articles for auto-post")
-            posted_today.add(current_hour)
+                posted_today.add(current_hour)
 
         await asyncio.sleep(120)
 
@@ -1992,7 +2377,7 @@ async def run_course_loop(bot: Bot):
                 log.info("🔄 Resetting database during runtime...")
                 reset_database()
             last_db_check = datetime.now()
-
+        
         log.info("─── 🔍 Checking for new courses ───")
         new_courses = fetch_new_courses()
 
