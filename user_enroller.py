@@ -1,312 +1,358 @@
 """
-Multi-User Udemy Enroller - Database and credential management
-Stores per-user access tokens and client IDs for automatic enrollment
+Multi-Account Udemy Enroller - Database and credential management
+Supports multiple Udemy accounts per user with auto-enrollment tracking
 """
 
 import sqlite3
-import os
 import logging
 from pathlib import Path
 from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-# Database file
 ENROLL_DB_FILE = "user_enroller.db"
 
-# ─── Database Schema ─────────────────────────────────────────────────────────
+
+def _conn():
+    return sqlite3.connect(ENROLL_DB_FILE)
+
 
 def init_enroller_db():
-    """Initialize enroller database with tables for user credentials"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
+    """Initialize enroller database with multi-account support"""
+    conn = _conn()
     c = conn.cursor()
     
-    # User credentials table
     c.execute("""
-        CREATE TABLE IF NOT EXISTS user_credentials (
-            user_id INTEGER PRIMARY KEY,
-            access_token TEXT,
-            client_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_verified INTEGER DEFAULT 0
-        )
-    """)
-    
-    # User setup state tracking
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_setup_state (
-            user_id INTEGER PRIMARY KEY,
-            setup_step TEXT,
+        CREATE TABLE IF NOT EXISTS user_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_name TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            auto_enroll INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    # Scrape history (for reference)
     c.execute("""
-        CREATE TABLE IF NOT EXISTS scrape_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            site_name TEXT,
-            course_count INTEGER,
-            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES user_credentials(user_id)
+        CREATE TABLE IF NOT EXISTS user_setup_state (
+            user_id INTEGER PRIMARY KEY,
+            setup_step TEXT,
+            extra_data TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    conn.commit()
-    conn.close()
-    log.info("✅ Enroller database initialized")
-
-
-# ─── User Credential Management ──────────────────────────────────────────────
-
-def set_user_setup_state(user_id: int, step: str) -> None:
-    """Set user's current setup step (waiting_token, waiting_client_id, etc.)"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS enrolled_courses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            course_url TEXT NOT NULL,
+            course_title TEXT,
+            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
     c.execute("""
-        INSERT OR REPLACE INTO user_setup_state (user_id, setup_step, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-    """, (user_id, step))
+        CREATE TABLE IF NOT EXISTS auto_enroll_state (
+            user_id INTEGER PRIMARY KEY,
+            enabled INTEGER DEFAULT 0,
+            last_check TIMESTAMP,
+            last_course_id TEXT,
+            total_auto_enrolled INTEGER DEFAULT 0
+        )
+    """)
     
+    # Migrate from old schema if needed
+    try:
+        c.execute("SELECT user_id, access_token, client_id FROM user_credentials")
+        rows = c.fetchall()
+        for user_id, token, client in rows:
+            if token and client:
+                c.execute("""
+                    INSERT OR IGNORE INTO user_accounts (user_id, account_name, access_token, client_id, is_active, auto_enroll)
+                    VALUES (?, ?, ?, ?, 1, 0)
+                """, (user_id, "Account 1", token, client))
+        if rows:
+            log.info(f"Migrated {len(rows)} accounts from old schema")
+    except sqlite3.OperationalError:
+        pass
+    
+    conn.commit()
+    conn.close()
+    log.info("Enroller database initialized")
+
+
+# ─── Account Management ──────────────────────────────────────────────────────
+
+def add_account(user_id: int, account_name: str, access_token: str, client_id: str) -> int:
+    """Add a new Udemy account for user. Returns account ID."""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO user_accounts (user_id, account_name, access_token, client_id, is_active, auto_enroll)
+        VALUES (?, ?, ?, ?, 1, 1)
+    """, (user_id, account_name, access_token, client_id))
+    account_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return account_id
+
+
+def get_user_accounts(user_id: int) -> list:
+    """Get all accounts for a user. Returns list of dicts."""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, account_name, access_token, client_id, is_active, auto_enroll
+        FROM user_accounts WHERE user_id = ? ORDER BY id
+    """, (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "name": r[1], "access_token": r[2], "client_id": r[3],
+         "is_active": bool(r[4]), "auto_enroll": bool(r[5])}
+        for r in rows
+    ]
+
+
+def get_account(account_id: int) -> dict:
+    """Get a specific account by ID"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, user_id, account_name, access_token, client_id, is_active, auto_enroll
+        FROM user_accounts WHERE id = ?
+    """, (account_id,))
+    r = c.fetchone()
+    conn.close()
+    if r:
+        return {"id": r[0], "user_id": r[1], "name": r[2], "access_token": r[3],
+                "client_id": r[4], "is_active": bool(r[5]), "auto_enroll": bool(r[6])}
+    return None
+
+
+def remove_account(account_id: int) -> bool:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM user_accounts WHERE id = ?", (account_id,))
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def toggle_auto_enroll(account_id: int, enabled: bool) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE user_accounts SET auto_enroll = ? WHERE id = ?", (int(enabled), account_id))
     conn.commit()
     conn.close()
 
 
-def get_user_setup_state(user_id: int) -> str:
-    """Get user's current setup step"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
+def get_all_auto_enroll_accounts() -> list:
+    """Get all accounts with auto_enroll enabled (across all users)"""
+    conn = _conn()
     c = conn.cursor()
-    
-    c.execute("SELECT setup_step FROM user_setup_state WHERE user_id = ?", (user_id,))
+    c.execute("""
+        SELECT id, user_id, account_name, access_token, client_id
+        FROM user_accounts WHERE is_active = 1 AND auto_enroll = 1
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "user_id": r[1], "name": r[2], "access_token": r[3], "client_id": r[4]}
+        for r in rows
+    ]
+
+
+# ─── Auto-Enroll State ───────────────────────────────────────────────────────
+
+def get_auto_enroll_state(user_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT enabled, last_check, last_course_id, total_auto_enrolled FROM auto_enroll_state WHERE user_id = ?", (user_id,))
+    r = c.fetchone()
+    conn.close()
+    if r:
+        return {"enabled": bool(r[0]), "last_check": r[1], "last_course_id": r[2], "total": r[3]}
+    return {"enabled": False, "last_check": None, "last_course_id": None, "total": 0}
+
+
+def set_auto_enroll_enabled(user_id: int, enabled: bool) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO auto_enroll_state (user_id, enabled) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET enabled = ?
+    """, (user_id, int(enabled), int(enabled)))
+    conn.commit()
+    conn.close()
+
+
+def update_auto_enroll_state(user_id: int, last_course_id: str = None, enrolled_count: int = 0) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO auto_enroll_state (user_id, enabled, last_check, last_course_id, total_auto_enrolled)
+        VALUES (?, 1, CURRENT_TIMESTAMP, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET 
+            last_check = CURRENT_TIMESTAMP,
+            last_course_id = COALESCE(?, last_course_id),
+            total_auto_enrolled = total_auto_enrolled + ?
+    """, (user_id, last_course_id, enrolled_count, last_course_id, enrolled_count))
+    conn.commit()
+    conn.close()
+
+
+# ─── Enrolled Course Tracking ────────────────────────────────────────────────
+
+def log_enrollment(user_id: int, account_id: int, course_url: str, course_title: str) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO enrolled_courses (user_id, account_id, course_url, course_title)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, account_id, course_url, course_title))
+    conn.commit()
+    conn.close()
+
+
+def get_recently_enrolled(user_id: int, limit: int = 20) -> list:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT course_title, enrolled_at, account_id FROM enrolled_courses
+        WHERE user_id = ? ORDER BY enrolled_at DESC LIMIT ?
+    """, (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return [{"title": r[0], "enrolled_at": r[1], "account_id": r[2]} for r in rows]
+
+
+def is_course_enrolled(user_id: int, course_url: str) -> bool:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM enrolled_courses WHERE user_id = ? AND course_url = ?", (user_id, course_url))
+    exists = c.fetchone() is not None
+    conn.close()
+    return exists
+
+
+# ─── Setup State ─────────────────────────────────────────────────────────────
+
+def set_user_setup_state(user_id: int, step: str, extra: str = None) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO user_setup_state (user_id, setup_step, extra_data, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+    """, (user_id, step, extra))
+    conn.commit()
+    conn.close()
+
+
+def get_user_setup_state(user_id: int) -> tuple:
+    """Returns (step, extra_data)"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT setup_step, extra_data FROM user_setup_state WHERE user_id = ?", (user_id,))
     result = c.fetchone()
     conn.close()
-    
-    return result[0] if result else None
+    return (result[0], result[1]) if result else (None, None)
 
 
 def clear_user_setup_state(user_id: int) -> None:
-    """Clear user's setup state"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
+    conn = _conn()
     c = conn.cursor()
     c.execute("DELETE FROM user_setup_state WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 
-def store_user_credentials(user_id: int, access_token: str = None, client_id: str = None) -> None:
-    """Store or update user's Udemy credentials"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    # Get existing credentials
-    c.execute("SELECT access_token, client_id FROM user_credentials WHERE user_id = ?", (user_id,))
-    existing = c.fetchone()
-    
-    if existing:
-        # Update existing
-        token = access_token if access_token else existing[0]
-        client = client_id if client_id else existing[1]
-        verified = 1 if (token and client) else 0
-        
-        c.execute("""
-            UPDATE user_credentials 
-            SET access_token = ?, client_id = ?, is_verified = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?
-        """, (token, client, verified, user_id))
-    else:
-        # Create new
-        c.execute("""
-            INSERT INTO user_credentials (user_id, access_token, client_id, is_verified)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, access_token, client_id, 1 if (access_token and client_id) else 0))
-    
-    conn.commit()
-    conn.close()
-    log.info(f"✅ Credentials stored for user {user_id}")
+# ─── Legacy Compatibility ────────────────────────────────────────────────────
+
+def user_has_credentials(user_id: int) -> bool:
+    accounts = get_user_accounts(user_id)
+    return len(accounts) > 0
 
 
 def get_user_credentials(user_id: int) -> dict:
-    """Get user's Udemy credentials"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    c.execute("""
-        SELECT access_token, client_id, is_verified 
-        FROM user_credentials 
-        WHERE user_id = ?
-    """, (user_id,))
-    
-    result = c.fetchone()
-    conn.close()
-    
-    if result:
-        return {
-            "access_token": result[0],
-            "client_id": result[1],
-            "is_verified": bool(result[2])
-        }
+    """Legacy: get first active account credentials"""
+    accounts = get_user_accounts(user_id)
+    if accounts:
+        return {"access_token": accounts[0]["access_token"], "client_id": accounts[0]["client_id"]}
     return None
 
 
-def user_has_credentials(user_id: int) -> bool:
-    """Check if user has stored credentials"""
-    creds = get_user_credentials(user_id)
-    return creds and creds.get("access_token") and creds.get("client_id")
+def store_user_credentials(user_id: int, access_token: str = None, client_id: str = None) -> None:
+    """Legacy: store credentials as Account 1"""
+    accounts = get_user_accounts(user_id)
+    if accounts:
+        conn = _conn()
+        c = conn.cursor()
+        if access_token:
+            c.execute("UPDATE user_accounts SET access_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                      (access_token, accounts[0]["id"]))
+        if client_id:
+            c.execute("UPDATE user_accounts SET client_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                      (client_id, accounts[0]["id"]))
+        conn.commit()
+        conn.close()
+    else:
+        add_account(user_id, "Account 1", access_token or "", client_id or "")
 
 
 def log_scrape_history(user_id: int, site_name: str, course_count: int) -> None:
-    """Log scrape history for analytics"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    c.execute("""
-        INSERT INTO scrape_history (user_id, site_name, course_count)
-        VALUES (?, ?, ?)
-    """, (user_id, site_name, course_count))
-    
-    conn.commit()
-    conn.close()
+    pass
 
 
 def get_user_stats(user_id: int) -> dict:
-    """Get user's scraping statistics"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    # Get total scrapes
-    c.execute("""
-        SELECT COUNT(*) FROM scrape_history WHERE user_id = ?
-    """, (user_id,))
-    total_scrapes = c.fetchone()[0]
-    
-    # Get total courses scraped
-    c.execute("""
-        SELECT SUM(course_count) FROM scrape_history WHERE user_id = ?
-    """, (user_id,))
-    total_courses = c.fetchone()[0] or 0
-    
-    # Get last scrape time
-    c.execute("""
-        SELECT MAX(scraped_at) FROM scrape_history WHERE user_id = ?
-    """, (user_id,))
-    last_scrape = c.fetchone()[0]
-    
-    conn.close()
-    
+    accounts = get_user_accounts(user_id)
+    state = get_auto_enroll_state(user_id)
     return {
-        "total_scrapes": total_scrapes,
-        "total_courses": total_courses,
-        "last_scrape": last_scrape
+        "total_accounts": len(accounts),
+        "auto_enroll_total": state["total"],
+        "last_check": state["last_check"],
     }
 
 
-# ─── User Setup Flow ─────────────────────────────────────────────────────────
-
-SETUP_STEPS = {
-    "not_started": "Setup not started",
-    "waiting_token": "Waiting for access_token",
-    "waiting_client_id": "Waiting for client_id",
-    "complete": "Setup complete",
-}
-
-
-def get_setup_instructions() -> str:
-    """Get instructions for getting Udemy cookies"""
-    return """
-🔐 **Setup Instructions:**
-
-To enable automatic course enrollment, you need your Udemy cookies:
-
-**Steps:**
-1. Open https://www.udemy.com in your browser
-2. Log in with your Udemy account
-3. Press **F12** to open Developer Tools
-4. Go to **Application** tab
-5. Select **Cookies** → `udemy.com`
-6. Find these cookies:
-   - `access_token` → Copy the value
-   - `client_id` → Copy the value
-
-**Example values:**
-- access_token: `eyJhbGc...` (long string)
-- client_id: `6U...` (short string)
-
-Send them to me one by one:
-1. `/set_token <your_access_token>`
-2. `/set_client_id <your_client_id>`
-
-Or type them directly when I ask!
-"""
-
-
-# ─── Validate Credentials ────────────────────────────────────────────────────
-
 def validate_token_format(token: str) -> bool:
-    """Basic validation for access token format"""
-    if not token or len(token) < 20:
-        return False
-    # Access tokens usually start with certain patterns or are base64-like
-    return len(token) > 50
+    return bool(token) and len(token) > 20
 
 
 def validate_client_id_format(client_id: str) -> bool:
-    """Basic validation for client ID format"""
-    if not client_id or len(client_id) < 2:
-        return False
-    return True
+    return bool(client_id) and len(client_id) >= 2
 
 
-# ─── Database Utilities ──────────────────────────────────────────────────────
+def get_setup_instructions() -> str:
+    return """
+🔐 **How to get Udemy cookies:**
 
-def cleanup_old_setup_states(days: int = 7) -> int:
-    """Remove setup states older than specified days"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    c.execute("""
-        DELETE FROM user_setup_state 
-        WHERE updated_at < datetime('now', '-' || ? || ' days')
-    """, (days,))
-    
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
-    
-    return deleted
+1. Open https://www.udemy.com in your browser
+2. Log in with your Udemy account
+3. Press **F12** → **Application** tab
+4. Select **Cookies** → `udemy.com`
+5. Copy these values:
+   - `access_token` (long string)
+   - `client_id` (short hex string)
 
-
-def get_all_verified_users() -> list:
-    """Get all users with complete setup"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
-    c = conn.cursor()
-    
-    c.execute("""
-        SELECT user_id, access_token, client_id 
-        FROM user_credentials 
-        WHERE is_verified = 1
-    """)
-    
-    results = c.fetchall()
-    conn.close()
-    
-    return results
+Send them when asked!
+"""
 
 
 def delete_user_data(user_id: int) -> bool:
-    """Delete all data for a user (GDPR compliance)"""
-    conn = sqlite3.connect(ENROLL_DB_FILE)
+    conn = _conn()
     c = conn.cursor()
-    
     try:
-        c.execute("DELETE FROM user_credentials WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM user_accounts WHERE user_id = ?", (user_id,))
         c.execute("DELETE FROM user_setup_state WHERE user_id = ?", (user_id,))
-        c.execute("DELETE FROM scrape_history WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM enrolled_courses WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM auto_enroll_state WHERE user_id = ?", (user_id,))
         conn.commit()
-        log.info(f"🗑️ All data deleted for user {user_id}")
         return True
     except Exception as e:
         log.error(f"Error deleting user data: {e}")
@@ -315,6 +361,5 @@ def delete_user_data(user_id: int) -> bool:
         conn.close()
 
 
-# Initialize database on module load
-if not Path(ENROLL_DB_FILE).exists():
-    init_enroller_db()
+# Initialize
+init_enroller_db()

@@ -53,10 +53,13 @@ from multiuser_enroller_bot import (
     cmd_enroll,
     cmd_enroll_status,
     cmd_myprofile,
+    cmd_accounts,
+    cmd_autoenroll,
     enroll_callback,
     setup_callback,
     profile_callback,
     handle_setup_message,
+    auto_enroll_job,
 )
 from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
@@ -203,7 +206,7 @@ Here's what I can do:
 • <b>Course alerts</b> — free-course picks posted to the channel on a timer.
 • <b>Market dip heads-up</b> — alerts when Nifty 50, Sensex, or Nifty BeES fall by your dip threshold vs previous close.
 • <b>Tech news</b> — latest tech headlines auto-posted daily at 10 AM &amp; 10 PM IST.
-• <b>🆕 Udemy Auto-Enroller</b> — auto-enroll in latest 50 free Udemy courses!
+• <b>🆕 Udemy Auto-Enroller</b> — multi-account auto-enrollment with background checks!
 
 <b>📽️ Movie Commands:</b>
 /movies — browse latest movies from 10+ sites
@@ -218,28 +221,31 @@ Here's what I can do:
 /testdip — sample dip alert (not real data)
 /testalert — check if dip alerts can reach destination
 
-<b>🎓 Udemy Enroller Commands:</b>
-/enroll_setup — 🔐 Setup your Udemy credentials (one-time)
-/set_token &lt;token&gt; — set access_token directly
-/set_client_id &lt;id&gt; — set client_id directly
-/enroll — 📚 auto-enroll in latest 50 free courses
-/enroll_status — view your scrape results &amp; statistics
-/myprofile — view your profile, stats, manage credentials
+<b>🎓 Udemy Multi-Account Enroller:</b>
+/enroll_setup — add a new Udemy account (multi-account!)
+/set_token &lt;token&gt; — set access_token
+/set_client_id &lt;id&gt; — set client_id
+/enroll — enroll now (all accounts or latest)
+/accounts — manage your Udemy accounts
+/autoenroll — toggle auto-enrollment (checks every 3 min)
+/enroll_status — view enrollment stats
+/myprofile — profile &amp; data management
 
 <b>🔧 Utility Commands:</b>
 /start — this menu
+/help — detailed help
 /myid — your Telegram ID
-/updateapi — update API settings (admin only)
 
-<b>ℹ️ How to use Udemy Enroller:</b>
-1. Send /enroll_setup
-2. Get your Udemy cookies (see instructions)
-3. Send access_token &amp; client_id
-4. Use /enroll anytime to scrape courses
-5. View results with /enroll_status
+<b>ℹ️ How Auto-Enroller works:</b>
+1. /enroll_setup → add 1 or more Udemy accounts
+2. /enroll → manually enroll in 50 latest free courses
+3. /autoenroll → turn on background auto-enrollment
+   → Bot checks every 3 min for new courses
+   → Auto-enrolls all your accounts
+   → Sends you notification when courses are enrolled
 
-<i>Market data is unofficial/delayed (Yahoo). Not financial advice.
-Each user has their own secure credential storage. See /myprofile for details.</i>
+<i>Each user can add multiple Udemy accounts.
+Auto-enrollment runs in background and notifies you.</i>
 
 ⚡ Powered by <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
 
@@ -269,35 +275,40 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     help_text = """<b>📖 DETAILED COMMAND HELP</b>
 
-<b>🎓 UDEMY ENROLLER (New!)</b>
+<b>🎓 UDEMY MULTI-ACCOUNT ENROLLER</b>
 
 <b>/enroll_setup</b>
-Start interactive setup to add your Udemy credentials.
-One-time setup, then use /enroll anytime.
-Bot will ask for access_token and client_id from your browser cookies.
+Add a new Udemy account. You can add multiple accounts!
+Bot asks for access_token and client_id from browser cookies.
 
 <b>/set_token &lt;token&gt;</b>
-Alternative way to set access_token directly.
-Usage: /set_token eyJhbGc...
+Set access_token directly. Usage: /set_token eyJhbGc...
 
 <b>/set_client_id &lt;id&gt;</b>
-Alternative way to set client_id directly.
-Usage: /set_client_id 6U...
+Set client_id directly. Usage: /set_client_id 6U...
 
 <b>/enroll</b>
-Fetches latest 50 free Udemy courses and auto-enrolls you directly.
-Source: Real.Discount API (same as channel posts).
-Takes ~2-4 minutes. Skips expired coupons automatically.
-⚠️ Requires: /enroll_setup first
+Fetches latest 50 free courses and enrolls.
+Choose: All accounts or latest account only.
+Source: Real.Discount API. Takes ~2-4 min per account.
+
+<b>/accounts</b>
+Manage your Udemy accounts:
+• View all accounts with auto-enroll status
+• Toggle auto-enroll per account
+• Add or remove accounts
+
+<b>/autoenroll</b>
+Toggle background auto-enrollment ON/OFF.
+When ON: Bot checks every 3 min for new free courses
+and auto-enrolls all your enabled accounts.
+You get notified when courses are enrolled!
 
 <b>/enroll_status</b>
-View your enrollment stats (total runs, courses processed).
-⚠️ Requires: /enroll_setup first
+View enrollment stats and recent enrollments.
 
 <b>/myprofile</b>
-View your profile, setup status, and lifetime statistics.
-Shows: Total scrapes, total courses, last scrape time.
-Can update credentials or delete all your data here.
+View profile, account count, and manage data.
 
 <b>📽️ MOVIE COMMANDS</b>
 
@@ -355,30 +366,25 @@ For updating scraper settings.
 
 <b>💡 TIPS</b>
 
-• Setup takes 2 minutes (one-time)
-• Each user has separate secure storage
-• Credentials never in logs/visible to others
-• Delete your data anytime: /myprofile → Clear Data
-• Most commands have short alternatives
+• Add multiple Udemy accounts for multi-enrollment
+• Enable /autoenroll so you never miss free courses
+• Each user's data is private and separate
+• Delete all data anytime: /myprofile → Delete
 
 <b>❓ FAQ</b>
 
-<b>Q: How do I get Udemy cookies?</b>
-A: See /enroll_setup - it shows step-by-step instructions.
+<b>Q: Can I add multiple Udemy accounts?</b>
+A: Yes! Run /enroll_setup multiple times to add more accounts.
+Use /accounts to manage them.
 
-<b>Q: Can I use this with my friend?</b>
-A: Yes! Each user runs /enroll_setup with their own credentials.
-Each gets independent scraping with their own stats.
+<b>Q: How does auto-enroll work?</b>
+A: Enable via /autoenroll. Bot checks API every 3 minutes
+for new free courses and enrolls all your enabled accounts.
+You get a Telegram notification for each batch enrolled.
 
-<b>Q: What if I forget my cookies?</b>
-A: Run /enroll_setup again to update them anytime.
-
-<b>Q: Is my data private?</b>
-A: Yes! Only you can see your credentials and stats.
-Other users cannot access your data.
-
-<b>Q: Can I delete my data?</b>
-A: Yes! Run /myprofile → Clear Data (GDPR compliant).
+<b>Q: Token expired?</b>
+A: Run /enroll_setup → Add Account with fresh cookies.
+Remove old account from /accounts if needed.
 """
     
     await update.effective_message.reply_html(help_text)
@@ -1585,9 +1591,11 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("enroll", cmd_enroll))
     app.add_handler(CommandHandler("enroll_status", cmd_enroll_status))
     app.add_handler(CommandHandler("myprofile", cmd_myprofile))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
+    app.add_handler(CommandHandler("autoenroll", cmd_autoenroll))
     app.add_handler(CallbackQueryHandler(enroll_callback, pattern=r"^enroll_"))
     app.add_handler(CallbackQueryHandler(setup_callback, pattern=r"^setup_"))
-    app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete)$"))
+    app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete|acc_toggle_|acc_remove_|autoenroll_toggle|show_accounts)"))
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
     return app
@@ -2214,6 +2222,7 @@ async def main():
     tasks = [
         asyncio.create_task(run_course_loop(bot)),
         asyncio.create_task(run_news_autopost(bot)),
+        asyncio.create_task(auto_enroll_job(tg_app)),
     ]
     if MARKET_FEATURES_ENABLED:
         log.info(
