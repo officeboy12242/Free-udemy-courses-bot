@@ -745,6 +745,7 @@ async def auto_enroll_job(app: Application) -> None:
             
             for user_id, user_accs in user_accounts.items():
                 all_enrolled = []
+                failed_accounts = []
                 
                 for acc in user_accs:
                     try:
@@ -753,10 +754,12 @@ async def auto_enroll_job(app: Application) -> None:
                         )
                     except Exception as e:
                         log.error(f"Auto-enroll error acc {acc['id']}: {e}")
+                        failed_accounts.append(acc["name"])
                         continue
                     
                     if result["error"]:
                         log.warning(f"Auto-enroll login failed user {user_id} acc {acc['id']}: {result['error']}")
+                        failed_accounts.append(acc["name"])
                         continue
                     
                     for title in result["enrolled"]:
@@ -789,6 +792,25 @@ async def auto_enroll_job(app: Application) -> None:
                         log.debug(f"Notify user {user_id} failed: {e}")
                     
                     log.info(f"Auto-enroll: user {user_id} got {len(all_enrolled)} new courses")
+                
+                # Notify user if ALL accounts failed login (token expired)
+                if failed_accounts and not all_enrolled:
+                    try:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                f"⚠️ **Auto-Enroll: Token Expired**\n\n"
+                                f"Failed accounts: {', '.join(failed_accounts)}\n\n"
+                                "Your Udemy cookies have expired.\n"
+                                "Please update with fresh cookies:\n"
+                                "1. Login to udemy.com\n"
+                                "2. Copy new `access_token` & `client_id`\n"
+                                "3. Run `/enroll_setup` to update"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
         
         except Exception as e:
             log.error(f"Auto-enroll job error: {e}")
