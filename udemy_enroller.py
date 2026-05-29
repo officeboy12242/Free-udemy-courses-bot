@@ -119,7 +119,7 @@ class UdemyScraper:
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 futures = []
                 for item in all_items:
-                title = item.string
+                    title = item.string
                     url_slug = item.get("href", "").split("/")[-1]
                     futures.append((title, executor.submit(
                         self._fetch_page,
@@ -436,7 +436,7 @@ class UdemyScraper:
                         if resp and resp.status_code == 200:
                             data = resp.json().get("coupons", [])
                             if not data:
-                break
+                                continue
                             
                             for item in data:
                                 title = item.get("headline", "").strip(' "')
@@ -444,12 +444,12 @@ class UdemyScraper:
                                 link = f"https://www.udemy.com/course/{item.get('id_name', '')}/?" \
                                        f"couponCode={coupon_code}"
                                 courses.append(Course(title, link, coupon_code=coupon_code))
-            except Exception as e:
+                    except Exception as e:
                         log.debug(f"Error parsing Courson response: {e}")
             
             log.info(f"Courson: Found {len(courses)} courses")
             return courses
-            except Exception as e:
+        except Exception as e:
             log.error(f"Courson scraping failed: {e}")
             return courses
     
@@ -477,10 +477,9 @@ class UdemyScraper:
                 site = futures[future]
                 try:
                     courses = future.result()
-                    # Filter out expired courses
                     valid_courses = [c for c in courses if c.is_valid()]
                     all_courses[site] = valid_courses
-            except Exception as e:
+                except Exception as e:
                     log.error(f"Error scraping {site}: {e}")
         
         return all_courses
