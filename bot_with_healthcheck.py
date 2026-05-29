@@ -203,7 +203,7 @@ Here's what I can do:
 • <b>Course alerts</b> — free-course picks posted to the channel on a timer.
 • <b>Market dip heads-up</b> — alerts when Nifty 50, Sensex, or Nifty BeES fall by your dip threshold vs previous close.
 • <b>Tech news</b> — latest tech headlines auto-posted daily at 10 AM &amp; 10 PM IST.
-• <b>🆕 Udemy Auto-Enroller</b> — scrape 600+ free Udemy courses from 8 coupon sites!
+• <b>🆕 Udemy Auto-Enroller</b> — auto-enroll in latest 50 free Udemy courses!
 
 <b>📽️ Movie Commands:</b>
 /movies — browse latest movies from 10+ sites
@@ -222,7 +222,7 @@ Here's what I can do:
 /enroll_setup — 🔐 Setup your Udemy credentials (one-time)
 /set_token &lt;token&gt; — set access_token directly
 /set_client_id &lt;id&gt; — set client_id directly
-/enroll — 📚 scrape 600+ free courses from 8 sites
+/enroll — 📚 auto-enroll in latest 50 free courses
 /enroll_status — view your scrape results &amp; statistics
 /myprofile — view your profile, stats, manage credentials
 
@@ -285,17 +285,13 @@ Alternative way to set client_id directly.
 Usage: /set_client_id 6U...
 
 <b>/enroll</b>
-Scrape free Udemy courses from 8 coupon sites:
-🎓 DiscUdemy | 📚 Udemy Freebies | 📖 Tutorial Bar | 💰 Real Discount
-🏫 CourseVania | 💼 E-Next | 🔗 CourseJoiner | 🎯 Courson
-
-Select which sites, click "Start", wait 1-2 minutes for results.
-Finds 600+ free courses typically.
+Fetches latest 50 free Udemy courses and auto-enrolls you directly.
+Source: Real.Discount API (same as channel posts).
+Takes ~2-4 minutes. Skips expired coupons automatically.
 ⚠️ Requires: /enroll_setup first
 
 <b>/enroll_status</b>
-View your latest scrape results and statistics.
-Shows: Total courses found, breakdown per site, sample titles.
+View your enrollment stats (total runs, courses processed).
 ⚠️ Requires: /enroll_setup first
 
 <b>/myprofile</b>
