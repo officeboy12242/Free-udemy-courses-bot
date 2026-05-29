@@ -362,12 +362,22 @@ async def enroll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def _progress_bar(current: int, total: int, width: int = 15) -> str:
-    """Generate a text progress bar"""
+    """Generate a text progress bar using ░ ▒ ▓ █"""
     if total == 0:
         return "░" * width
     pct = current / total
-    filled = int(width * pct)
-    bar = "█" * filled + "░" * (width - filled)
+    filled_full = int(width * pct)
+    remainder = (width * pct) - filled_full
+    
+    bar = "█" * filled_full
+    if remainder > 0.66:
+        bar += "▓"
+    elif remainder > 0.33:
+        bar += "▒"
+    elif filled_full < width:
+        bar += "░"
+    
+    bar = bar.ljust(width, "░")[:width]
     return f"{bar} {int(pct * 100)}%"
 
 
