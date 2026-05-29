@@ -483,3 +483,255 @@ class UdemyScraper:
                     log.error(f"Error scraping {site}: {e}")
         
         return all_courses
+
+
+class UdemyAutoEnroller:
+    """Enrolls user in Udemy courses using their access_token and client_id"""
+    
+    UDEMY_API = "https://www.udemy.com/api-2.0"
+    
+    def __init__(self, access_token: str, client_id: str):
+        self.access_token = access_token
+        self.client_id = client_id
+        self.headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "X-Udemy-Authorization": f"Bearer {access_token}",
+            "Origin": "https://www.udemy.com",
+            "Referer": "https://www.udemy.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        self.cookies = {
+            "access_token": access_token,
+            "client_id": client_id,
+        }
+        self.enrolled = []
+        self.already_enrolled = []
+        self.failed = []
+        self.expired = []
+    
+    def _api_get(self, endpoint: str) -> dict:
+        """Make authenticated GET request to Udemy API"""
+        url = f"{self.UDEMY_API}/{endpoint}"
+        try:
+            if CURL_CFFI_AVAILABLE:
+                resp = cffi_requests.get(
+                    url,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    impersonate="chrome",
+                    timeout=15,
+                    verify=False,
+                )
+            else:
+                resp = requests.get(url, headers=self.headers, cookies=self.cookies, timeout=15)
+            
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception as e:
+            log.debug(f"API GET failed for {endpoint}: {e}")
+            return None
+    
+    def _api_post(self, endpoint: str, data: dict) -> dict:
+        """Make authenticated POST request to Udemy API"""
+        url = f"{self.UDEMY_API}/{endpoint}"
+        try:
+            if CURL_CFFI_AVAILABLE:
+                resp = cffi_requests.post(
+                    url,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    json=data,
+                    impersonate="chrome",
+                    timeout=15,
+                    verify=False,
+                )
+            else:
+                resp = requests.post(
+                    url, headers=self.headers, cookies=self.cookies, json=data, timeout=15
+                )
+            
+            if resp.status_code in (200, 201, 204):
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"status": "ok"}
+            return None
+        except Exception as e:
+            log.debug(f"API POST failed for {endpoint}: {e}")
+            return None
+    
+    def _extract_course_slug(self, url: str) -> str:
+        """Extract course slug from Udemy URL"""
+        try:
+            # https://www.udemy.com/course/course-slug/?couponCode=XXX
+            parts = url.rstrip("/").split("/")
+            for i, part in enumerate(parts):
+                if part == "course" and i + 1 < len(parts):
+                    slug = parts[i + 1].split("?")[0]
+                    return slug
+        except Exception:
+            pass
+        return None
+    
+    def _extract_coupon(self, url: str) -> str:
+        """Extract coupon code from URL"""
+        try:
+            if "couponCode=" in url:
+                return url.split("couponCode=")[1].split("&")[0]
+        except Exception:
+            pass
+        return None
+    
+    def _get_course_info(self, slug: str) -> dict:
+        """Get course details from API"""
+        data = self._api_get(
+            f"courses/{slug}/?fields[course]=id,title,url,is_paid,price"
+        )
+        return data
+    
+    def _check_already_enrolled(self, course_id: int) -> bool:
+        """Check if user is already enrolled in this course"""
+        data = self._api_get(f"users/me/subscribed-courses/{course_id}/")
+        return data is not None
+    
+    def _check_coupon_valid(self, slug: str, coupon: str) -> dict:
+        """Check if coupon is still valid and gives 100% off"""
+        data = self._api_get(
+            f"course-landing-components/{slug}/me/"
+            f"?couponCode={coupon}&components=buy_button,deal_badge,price_text"
+        )
+        if not data:
+            return None
+        
+        # Check price from buy_button component
+        buy_button = data.get("buy_button", {}).get("button", {})
+        price_data = data.get("price_text", {}).get("data", {})
+        
+        # Check if it's free with coupon
+        pricing = price_data.get("pricing_result", {})
+        if pricing:
+            price_amount = pricing.get("price", {}).get("amount", -1)
+            if price_amount == 0:
+                return {"valid": True, "free": True}
+            else:
+                return {"valid": True, "free": False, "price": price_amount}
+        
+        return {"valid": True, "free": True}
+    
+    def _enroll_free_course(self, course_id: int, slug: str, coupon: str = None) -> bool:
+        """Enroll in a free course using checkout API"""
+        # Method 1: Direct subscribe (for free courses)
+        checkout_data = {
+            "checkout_event": "Submit",
+            "shopping_info": {
+                "items": [
+                    {
+                        "buyableType": "course",
+                        "buyableId": course_id,
+                        "discountInfo": {"code": coupon} if coupon else {},
+                    }
+                ]
+            },
+            "payment_info": {"payment_method": "free"},
+        }
+        
+        # Try checkout submit
+        url = "https://www.udemy.com/payment/checkout-submit/"
+        try:
+            if CURL_CFFI_AVAILABLE:
+                resp = cffi_requests.post(
+                    url,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                    json=checkout_data,
+                    impersonate="chrome",
+                    timeout=20,
+                    verify=False,
+                )
+            else:
+                resp = requests.post(
+                    url, headers=self.headers, cookies=self.cookies, json=checkout_data, timeout=20
+                )
+            
+            if resp.status_code in (200, 201, 204):
+                return True
+            
+            # Try alternate enrollment endpoint
+            subscribe_data = {"coupon_code": coupon} if coupon else {}
+            sub_resp = self._api_post(
+                f"users/me/subscribed-courses/{course_id}/",
+                subscribe_data
+            )
+            return sub_resp is not None
+            
+        except Exception as e:
+            log.debug(f"Enrollment failed for course {course_id}: {e}")
+            return False
+    
+    def enroll_in_courses(self, courses: list, progress_callback=None) -> dict:
+        """
+        Enroll in a list of Course objects.
+        Returns dict with results: enrolled, already_enrolled, failed, expired
+        """
+        self.enrolled = []
+        self.already_enrolled = []
+        self.failed = []
+        self.expired = []
+        
+        total = len(courses)
+        
+        for i, course in enumerate(courses):
+            if progress_callback and i % 5 == 0:
+                progress_callback(i, total)
+            
+            try:
+                slug = self._extract_course_slug(course.url)
+                if not slug:
+                    self.failed.append({"title": course.title, "reason": "Invalid URL"})
+                    continue
+                
+                coupon = course.coupon_code or self._extract_coupon(course.url)
+                
+                # Get course info
+                info = self._get_course_info(slug)
+                if not info:
+                    self.failed.append({"title": course.title, "reason": "Course not found"})
+                    continue
+                
+                course_id = info.get("id")
+                if not course_id:
+                    self.failed.append({"title": course.title, "reason": "No course ID"})
+                    continue
+                
+                # Check if already enrolled
+                if self._check_already_enrolled(course_id):
+                    self.already_enrolled.append(course.title)
+                    continue
+                
+                # Check coupon validity if we have one
+                if coupon:
+                    coupon_check = self._check_coupon_valid(slug, coupon)
+                    if coupon_check and not coupon_check.get("free", False):
+                        self.expired.append({"title": course.title, "reason": "Coupon not 100% off"})
+                        continue
+                
+                # Enroll
+                success = self._enroll_free_course(course_id, slug, coupon)
+                if success:
+                    self.enrolled.append(course.title)
+                else:
+                    self.failed.append({"title": course.title, "reason": "Enrollment API failed"})
+                    
+            except Exception as e:
+                self.failed.append({"title": course.title, "reason": str(e)[:50]})
+        
+        return {
+            "enrolled": self.enrolled,
+            "already_enrolled": self.already_enrolled,
+            "failed": self.failed,
+            "expired": self.expired,
+            "total": total,
+        }
