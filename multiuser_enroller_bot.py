@@ -796,18 +796,19 @@ async def auto_enroll_job(app: Application) -> None:
                 # Notify user if ALL accounts failed login (token expired)
                 if failed_accounts and not all_enrolled:
                     try:
+                        keyboard = InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔄 Update Token", callback_data="setup_add_new"),
+                        ]])
                         await bot.send_message(
                             chat_id=user_id,
                             text=(
                                 f"⚠️ **Auto-Enroll: Token Expired**\n\n"
-                                f"Failed accounts: {', '.join(failed_accounts)}\n\n"
+                                f"Failed: {', '.join(failed_accounts)}\n\n"
                                 "Your Udemy cookies have expired.\n"
-                                "Please update with fresh cookies:\n"
-                                "1. Login to udemy.com\n"
-                                "2. Copy new `access_token` & `client_id`\n"
-                                "3. Run `/enroll_setup` to update"
+                                "Click below to update with fresh cookies:"
                             ),
-                            parse_mode="Markdown"
+                            parse_mode="Markdown",
+                            reply_markup=keyboard,
                         )
                     except Exception:
                         pass
