@@ -683,23 +683,96 @@ class UdemyAutoEnroller:
             return True
         return False
     
+    def _ensure_csrf(self):
+        """Ensure we have a CSRF token by visiting checkout page if needed"""
+        csrf = self.session.cookies.get("csrftoken", default="")
+        if not csrf:
+            self._get("https://www.udemy.com/payment/checkout/")
+            csrf = self.session.cookies.get("csrftoken", default="")
+        return csrf
+    
+    def _checkout_single(self, course_id: str, coupon_code: str) -> str:
+        """
+        Enroll in a single paid course via checkout API.
+        Returns: "enrolled", "already", or "failed"
+        """
+        import time as _time
+        
+        csrf = self._ensure_csrf()
+        payload = {
+            "checkout_environment": "Marketplace",
+            "checkout_event": "Submit",
+            "payment_info": {
+                "method_id": "0",
+                "payment_method": "free-method",
+                "payment_vendor": "Free",
+            },
+            "shopping_info": {
+                "items": [{
+                    "buyable": {"id": str(course_id), "type": "course"},
+                    "discountInfo": {"code": coupon_code},
+                    "price": {"amount": 0, "currency": self.currency.upper()},
+                }],
+                "is_cart": True,
+            },
+        }
+        checkout_headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://www.udemy.com/payment/checkout/",
+            "Origin": "https://www.udemy.com",
+            "Host": "www.udemy.com",
+            "x-checkout-is-mobile-app": "false",
+            "X-CSRF-Token": csrf,
+        }
+        
+        for attempt in range(2):
+            r = self._post(
+                "https://www.udemy.com/payment/checkout-submit/",
+                json=payload,
+                headers=checkout_headers,
+            )
+            if not r:
+                continue
+            if r.status_code == 504:
+                return "enrolled"
+            try:
+                data = r.json()
+                if data.get("status") == "succeeded":
+                    return "enrolled"
+            except Exception:
+                pass
+            _time.sleep(2)
+        
+        # Check if already enrolled (race condition)
+        check = self._get(
+            f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/"
+        )
+        if check and check.status_code == 200:
+            return "already"
+        
+        return "failed"
+    
     def _bulk_checkout(self, courses_to_enroll: list) -> list:
         """
         Bulk enroll using checkout-submit endpoint.
         courses_to_enroll: list of (course_id, coupon_code, title) tuples
+        Falls back to one-by-one if batch fails.
         Returns list of titles that were successfully enrolled.
         """
+        import time as _time
+        
+        if not courses_to_enroll:
+            return []
+        
+        csrf = self._ensure_csrf()
+        
         items = []
         for course_id, coupon_code, title in courses_to_enroll:
-            item = {
+            items.append({
                 "buyable": {"id": str(course_id), "type": "course"},
                 "discountInfo": {"code": coupon_code} if coupon_code else {},
                 "price": {"amount": 0, "currency": self.currency.upper()},
-            }
-            items.append(item)
-        
-        if not items:
-            return []
+            })
         
         payload = {
             "checkout_environment": "Marketplace",
@@ -718,13 +791,11 @@ class UdemyAutoEnroller:
             "Origin": "https://www.udemy.com",
             "Host": "www.udemy.com",
             "x-checkout-is-mobile-app": "false",
-            "X-CSRF-Token": self.session.cookies.get("csrftoken", default=""),
+            "X-CSRF-Token": csrf,
         }
         
-        enrolled_titles = []
-        import time as _time
-        
-        for attempt in range(3):
+        # Try bulk first
+        for attempt in range(2):
             r = self._post(
                 "https://www.udemy.com/payment/checkout-submit/",
                 json=payload,
@@ -734,23 +805,28 @@ class UdemyAutoEnroller:
                 continue
             
             if r.status_code == 504:
-                enrolled_titles = [t for _, _, t in courses_to_enroll]
-                return enrolled_titles
+                return [t for _, _, t in courses_to_enroll]
             
             try:
                 resp_data = r.json()
             except Exception:
-                log.debug(f"Bulk checkout non-JSON response: {r.text[:200]}")
                 continue
             
             if resp_data.get("status") == "succeeded":
-                enrolled_titles = [t for _, _, t in courses_to_enroll]
-                return enrolled_titles
+                return [t for _, _, t in courses_to_enroll]
             
             log.debug(f"Bulk checkout attempt {attempt+1} failed: {resp_data}")
-            # Visit checkout page before retry (like the reference impl)
             self._get("https://www.udemy.com/payment/checkout/")
             _time.sleep(3 + attempt)
+        
+        # Bulk failed - fall back to one-by-one
+        log.info("Bulk checkout failed, trying one-by-one...")
+        enrolled_titles = []
+        for course_id, coupon_code, title in courses_to_enroll:
+            result = self._checkout_single(course_id, coupon_code)
+            if result in ("enrolled", "already"):
+                enrolled_titles.append(title)
+            _time.sleep(1)
         
         return enrolled_titles
     
