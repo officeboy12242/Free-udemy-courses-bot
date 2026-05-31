@@ -588,8 +588,11 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
             continue
         
         if is_free:
-            if enroller._free_checkout(course_id):
+            free_result = enroller._free_checkout(course_id)
+            if free_result == "enrolled":
                 enrolled.append(course.title)
+            elif free_result == "already":
+                already += 1
             else:
                 failed += 1
             continue
@@ -600,6 +603,12 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         
         if not enroller._check_coupon(course_id, coupon):
             expired += 1
+            continue
+        
+        # Double-check not already enrolled before batching
+        check = enroller._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
+        if check and check.status_code == 200:
+            already += 1
             continue
         
         batch.append((course_id, coupon, course.title))

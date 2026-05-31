@@ -201,14 +201,21 @@ class UdemyAutoEnroller:
         except Exception:
             return False
     
-    def _free_checkout(self, course_id: str) -> bool:
-        """Enroll in a naturally free course"""
+    def _free_checkout(self, course_id: str) -> str:
+        """Enroll in a naturally free course. Returns 'enrolled', 'already', or 'failed'."""
+        # Check if already enrolled first
+        check = self._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
+        if check and check.status_code == 200:
+            return "already"
+        
         self._get(f"https://www.udemy.com/course/subscribe/?courseId={course_id}")
         r = self._get(
             f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/"
             f"?fields%5Bcourse%5D=%40default%2Cbuyable_object_type%2Cprimary_subcategory%2Cis_private"
         )
-        return r is not None and r.status_code == 200
+        if r and r.status_code == 200:
+            return "enrolled"
+        return "failed"
     
     def _ensure_csrf(self):
         csrf = self.session.cookies.get("csrftoken", default="")
@@ -316,7 +323,7 @@ class UdemyAutoEnroller:
         enrolled = []
         for cid, coup, title in courses_to_enroll:
             result = self._checkout_single(cid, coup)
-            if result in ("enrolled", "already"):
+            if result == "enrolled":
                 enrolled.append(title)
             _time.sleep(1)
         return enrolled
