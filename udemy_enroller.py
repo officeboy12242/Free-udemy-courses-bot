@@ -224,7 +224,7 @@ class UdemyAutoEnroller:
             csrf = self.session.cookies.get("csrftoken", default="")
         return csrf
     
-    def _checkout_single(self, course_id: str, coupon_code: str) -> str:
+    def _checkout_single(self, course_id: str, coupon_code: str, was_enrolled_before: bool = False) -> str:
         """Enroll single course. Returns 'enrolled', 'already', or 'failed'."""
         import time as _time
         
@@ -264,9 +264,11 @@ class UdemyAutoEnroller:
                 pass
             _time.sleep(2)
         
+        # Check if now subscribed - if we weren't before, this means checkout worked
         check = self._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
         if check and check.status_code == 200:
-            return "already"
+            # If wasn't enrolled before checkout attempt, it means we enrolled it now
+            return "enrolled" if not was_enrolled_before else "already"
         return "failed"
     
     def _bulk_checkout(self, courses_to_enroll: list) -> list:
@@ -319,10 +321,10 @@ class UdemyAutoEnroller:
             self._get("https://www.udemy.com/payment/checkout/")
             _time.sleep(3 + attempt)
         
-        # Fallback: one-by-one
+        # Fallback: one-by-one (we know these weren't enrolled before)
         enrolled = []
         for cid, coup, title in courses_to_enroll:
-            result = self._checkout_single(cid, coup)
+            result = self._checkout_single(cid, coup, was_enrolled_before=False)
             if result == "enrolled":
                 enrolled.append(title)
             _time.sleep(1)

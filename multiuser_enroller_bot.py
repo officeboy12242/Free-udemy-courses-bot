@@ -567,6 +567,7 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         return {"enrolled": [], "already": 0, "expired": 0, "failed": 0, "error": "Login failed"}
     
     enroller._get_enrolled_courses()
+    log.info(f"Pre-fetched {len(enroller.enrolled_slugs)} enrolled courses")
     
     enrolled = []
     already = 0
@@ -576,7 +577,10 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
     
     for course in courses:
         slug = enroller._extract_slug(course.url)
-        if not slug or slug in enroller.enrolled_slugs:
+        if not slug:
+            failed += 1
+            continue
+        if slug in enroller.enrolled_slugs:
             already += 1
             continue
         
@@ -584,6 +588,7 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         course_id, is_free = enroller._get_course_id_from_page(slug)
         
         if not course_id:
+            log.debug(f"No course_id for {slug}")
             failed += 1
             continue
         
@@ -591,6 +596,7 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
             free_result = enroller._free_checkout(course_id)
             if free_result == "enrolled":
                 enrolled.append(course.title)
+                log.info(f"Free enrolled: {course.title[:40]}")
             elif free_result == "already":
                 already += 1
             else:
@@ -605,25 +611,27 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
             expired += 1
             continue
         
-        # Double-check not already enrolled before batching
-        check = enroller._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
-        if check and check.status_code == 200:
-            already += 1
-            continue
-        
         batch.append((course_id, coupon, course.title))
+        log.debug(f"Added to batch: {course.title[:30]}")
         
         if len(batch) >= 5:
+            log.info(f"Processing batch of {len(batch)} courses")
             titles = enroller._bulk_checkout(batch)
             enrolled.extend(titles)
+            if titles:
+                log.info(f"Batch enrolled {len(titles)}: {titles}")
             failed += len(batch) - len(titles)
             batch.clear()
     
     if batch:
+        log.info(f"Processing final batch of {len(batch)} courses")
         titles = enroller._bulk_checkout(batch)
         enrolled.extend(titles)
+        if titles:
+            log.info(f"Final batch enrolled {len(titles)}: {titles}")
         failed += len(batch) - len(titles)
     
+    log.info(f"Result: enrolled={len(enrolled)}, already={already}, expired={expired}, failed={failed}")
     return {"enrolled": enrolled, "already": already, "expired": expired, "failed": failed, "error": None}
 
 
