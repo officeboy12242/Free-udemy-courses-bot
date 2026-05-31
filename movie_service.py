@@ -3024,8 +3024,20 @@ def _atoz_button_label(btn: Any) -> str:
     return name_el.get_text(strip=True) if name_el else btn.get_text(strip=True)
 
 
+def _format_size(size_bytes: int) -> str:
+    """Format bytes to human readable size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
 def atoz_movie_links(movie_url: str) -> dict[str, Any]:
-    """Fetch download links for an AtoZ movie page."""
+    """Fetch download links for an AtoZ movie page (Next.js React site)."""
     movie_url = _atoz_abs_url(movie_url)
     result: dict[str, Any] = {
         "poster": "",
@@ -3041,9 +3053,10 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
         log.error("atoz_movie_links %s failed: %s", movie_url, exc)
         return result
 
+    # Get poster from TMDB image
     for img in soup.find_all("img"):
         src = img.get("src", "") or ""
-        if "tmdb" in src or (img.get("class") and "poster" in " ".join(img.get("class", []))):
+        if "tmdb" in src or "image.tmdb.org" in src:
             result["poster"] = src
             break
     if not result["poster"]:
@@ -3051,38 +3064,75 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
         if img:
             result["poster"] = img.get("src", "") or img.get("data-src", "") or ""
 
-    buttons = soup.find_all("button", attrs={"data-id": True})
-    if len(buttons) > 1:
-        result["is_series"] = True
-
-    seen_ids: set[str] = set()
-    for btn in buttons:
-        data_id = btn.get("data-id", "").strip()
-        if not data_id or data_id in seen_ids:
-            continue
-        seen_ids.add(data_id)
-
+    # Parse Next.js embedded data from script tags
+    # The data is double-escaped in the HTML: \\"files\\":{...}
+    html_text = resp.text
+    
+    # Find the escaped JSON block containing files
+    # Pattern: \"files\":{...},\"kind\":\"...\",\"baseUrl\":\"...\"
+    files_pattern = re.search(
+        r'\\"files\\":\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*,\s*\\"kind\\":\s*\\"([^"\\]+)\\"\s*,\s*\\"baseUrl\\":\s*\\"([^"\\]+)\\"',
+        html_text
+    )
+    
+    if files_pattern:
         try:
-            gen_resp = _get(f"{ATOZ_BASE}/generate_links?id={data_id}", timeout=25)
-            data = gen_resp.json()
-        except Exception as exc:
-            log.warning("atoz generate_links id=%s failed: %s", data_id, exc)
-            continue
-
-        final_url = data.get("url", "")
-        if not final_url:
-            continue
-
-        file_name = data.get("file_name", "") or _atoz_button_label(btn)
-        
-        # Clean up the file name to remove @AtoZ_Files and extensions
-        file_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
-        file_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', file_name)
-        file_name = file_name.strip()
-        
-        file_size = data.get("file_size", "")
-        label = f"{file_name} ({file_size})" if file_size else file_name
-        result["links"].append({"label": label, "url": final_url})
+            files_escaped = files_pattern.group(1)
+            kind = files_pattern.group(2)
+            base_url = files_pattern.group(3).replace('\\/', '/')
+            
+            if kind == "series":
+                result["is_series"] = True
+            
+            # Unescape the JSON: \\" -> "
+            files_json = files_escaped.replace('\\"', '"')
+            files_data = json.loads(files_json)
+            
+            for quality, file_info in files_data.items():
+                if isinstance(file_info, dict):
+                    file_name = file_info.get("file_name", quality)
+                    file_id = file_info.get("file_id", "")
+                    file_size = file_info.get("file_size", 0)
+                    
+                    if file_id:
+                        # Construct Telegram bot link
+                        final_url = f"{base_url}{file_id}"
+                        
+                        # Clean up file name
+                        clean_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
+                        clean_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', clean_name)
+                        clean_name = clean_name.strip()
+                        
+                        # Format size
+                        size_str = _format_size(file_size) if file_size else ""
+                        label = f"{clean_name} ({size_str})" if size_str else clean_name
+                        
+                        result["links"].append({"label": label, "url": final_url})
+        except json.JSONDecodeError as e:
+            log.warning("atoz_movie_links JSON parse failed: %s", e)
+        except Exception as e:
+            log.warning("atoz_movie_links parse error: %s", e)
+    
+    # Fallback: try old button method if no links found
+    if not result["links"]:
+        buttons = soup.find_all("button", attrs={"data-id": True})
+        for btn in buttons:
+            data_id = btn.get("data-id", "").strip()
+            if not data_id:
+                continue
+            try:
+                gen_resp = _get(f"{ATOZ_BASE}/generate_links?id={data_id}", timeout=25)
+                data = gen_resp.json()
+                final_url = data.get("url", "")
+                if final_url:
+                    file_name = data.get("file_name", "") or _atoz_button_label(btn)
+                    file_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
+                    file_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', file_name).strip()
+                    file_size = data.get("file_size", "")
+                    label = f"{file_name} ({file_size})" if file_size else file_name
+                    result["links"].append({"label": label, "url": final_url})
+            except Exception:
+                continue
 
     return result
 
