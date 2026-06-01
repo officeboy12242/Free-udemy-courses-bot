@@ -30,9 +30,23 @@ def _get_db():
     if _db is None:
         if not MONGODB_URI:
             raise ValueError("MONGODB_URI environment variable not set")
-        _client = MongoClient(MONGODB_URI)
+        
+        # Add TLS options for Render compatibility
+        import certifi
+        _client = MongoClient(
+            MONGODB_URI,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=30000,
+            connectTimeoutMS=30000,
+            socketTimeoutMS=30000,
+            retryWrites=True,
+        )
         _db = _client.udemy_enroller
-        log.info("Connected to MongoDB")
+        
+        # Test connection
+        _client.admin.command('ping')
+        log.info("Connected to MongoDB successfully")
     return _db
 
 
