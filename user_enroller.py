@@ -501,6 +501,46 @@ def get_user_total_enrollments(user_id: int) -> int:
     return result[0]["total"] if result else 0
 
 
+# ─── Bot Settings (Owner) ─────────────────────────────────────────────────────
+
+def get_setting(key: str, default=None):
+    """Get a bot setting value"""
+    try:
+        db = _get_db()
+        doc = db.bot_settings.find_one({"key": key})
+        return doc["value"] if doc else default
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value) -> bool:
+    """Set a bot setting value"""
+    try:
+        db = _get_db()
+        db.bot_settings.update_one(
+            {"key": key},
+            {"$set": {"key": key, "value": value, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        log.error(f"Failed to set setting {key}: {e}")
+        return False
+
+
+def is_channel_posting_enabled() -> bool:
+    """Check if channel posting is enabled"""
+    return get_setting("channel_posting", False)
+
+
+def toggle_channel_posting() -> bool:
+    """Toggle channel posting on/off. Returns new state."""
+    current = is_channel_posting_enabled()
+    new_state = not current
+    set_setting("channel_posting", new_state)
+    return new_state
+
+
 # Initialize on import
 try:
     if MONGODB_URI:
