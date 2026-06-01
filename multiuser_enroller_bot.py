@@ -399,12 +399,16 @@ async def cmd_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Check daily limit for free users
     can_do, remaining, user_is_premium = can_enroll(user_id)
     if not can_do:
-        await update.effective_message.reply_text(
-            f"⚠️ **Daily limit reached!**\n\n"
+        from user_enroller import OWNER_ID
+        owner_link = f"tg://user?id={OWNER_ID}" if OWNER_ID else ""
+        await update.effective_message.reply_html(
+            f"⚠️ <b>Daily limit reached!</b>\n\n"
             f"Free users can enroll in {FREE_DAILY_LIMIT} courses/day.\n"
             f"Your limit resets at midnight.\n\n"
-            f"💎 Contact owner for premium access (unlimited).",
-            parse_mode="Markdown"
+            f"💎 <b>Want unlimited enrollments?</b>\n"
+            f"Contact the owner for premium access:\n"
+            f"👉 <a href=\"{owner_link}\">Click here to message owner</a>\n"
+            f"🆔 Owner ID: <code>{OWNER_ID}</code>"
         )
         return
     
@@ -808,11 +812,15 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         # Check daily limit for free users
         can_do, remaining, user_is_premium = can_enroll(user_id)
         if not can_do:
+            from user_enroller import OWNER_ID
+            owner_link = f"tg://user?id={OWNER_ID}" if OWNER_ID else ""
             await msg.edit_text(
-                f"⚠️ **Daily limit reached!**\n\n"
-                f"Free: {FREE_DAILY_LIMIT}/day\n"
-                f"💎 Contact owner for premium (unlimited).",
-                parse_mode="Markdown"
+                f"⚠️ <b>Daily limit reached!</b>\n\n"
+                f"Free: {FREE_DAILY_LIMIT}/day\n\n"
+                f"💎 <b>Want unlimited?</b>\n"
+                f"<a href=\"{owner_link}\">Contact owner for premium</a>\n"
+                f"🆔 <code>{OWNER_ID}</code>",
+                parse_mode="HTML"
             )
             return
         
