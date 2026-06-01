@@ -449,13 +449,26 @@ async def cmd_enroll_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     state = get_auto_enroll_state(user_id)
     recent = get_recently_enrolled(user_id, 5)
     
+    # Get daily stats
+    today_count = get_daily_usage(user_id)
+    total_all_time = get_user_total_enrollments(user_id)
+    user_is_premium = is_premium(user_id)
+    
     lines = [
         "📊 **Enrollment Stats**\n",
         f"Accounts: {stats['total_accounts']}",
         f"Auto-enroll: {'🟢 ON' if state['enabled'] else '🔴 OFF'}",
-        f"Total auto-enrolled: {state['total']}",
-        f"Last check: {state['last_check'] or 'Never'}",
     ]
+    
+    # Show daily limit info
+    if user_is_premium:
+        lines.append(f"✅ Today: {today_count} courses (💎 Unlimited)")
+    else:
+        remaining = max(0, FREE_DAILY_LIMIT - today_count)
+        lines.append(f"✅ Today: {today_count}/{FREE_DAILY_LIMIT} ({remaining} remaining)")
+    
+    lines.append(f"📈 All-time: {total_all_time} courses")
+    lines.append(f"Last check: {state['last_check'] or 'Never'}")
     
     if recent:
         lines.append("\n**Recent Enrollments:**")
