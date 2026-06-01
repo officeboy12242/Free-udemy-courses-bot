@@ -884,15 +884,38 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             new_remaining = get_remaining_today(user_id)
             lines.append(f"\n📊 Remaining today: {new_remaining}/{FREE_DAILY_LIMIT}")
         
-        if total_enrolled:
-            lines.append("\n**✅ Newly Enrolled:**")
-            for title, acc_name in total_enrolled[:10]:
-                short = title[:40] + "..." if len(title) > 40 else title
-                lines.append(f"• {short} ({acc_name})")
-            if len(total_enrolled) > 10:
-                lines.append(f"  ...and {len(total_enrolled) - 10} more!")
-        
         await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        
+        # Send full list of enrolled courses as separate message(s)
+        if total_enrolled:
+            course_lines = [f"**✅ Newly Enrolled ({len(total_enrolled)} courses):**\n"]
+            for title, acc_name in total_enrolled:
+                short = title[:50] + "..." if len(title) > 50 else title
+                course_lines.append(f"✅ {short}")
+            
+            full_text = "\n".join(course_lines)
+            
+            try:
+                if len(full_text) <= 4000:
+                    await msg.reply_text(full_text, parse_mode="Markdown")
+                else:
+                    # Send in chunks
+                    header = course_lines[0]
+                    await msg.reply_text(header, parse_mode="Markdown")
+                    
+                    chunk = []
+                    chunk_len = 0
+                    for line in course_lines[1:]:
+                        if chunk_len + len(line) + 1 > 3900:
+                            await msg.reply_text("\n".join(chunk))
+                            chunk = []
+                            chunk_len = 0
+                        chunk.append(line)
+                        chunk_len += len(line) + 1
+                    if chunk:
+                        await msg.reply_text("\n".join(chunk))
+            except Exception as e:
+                log.debug(f"Failed to send full course list: {e}")
         
     except Exception as e:
         log.error(f"Enroll error: {e}")
@@ -968,19 +991,43 @@ async def auto_enroll_job(app: Application) -> None:
                 
                 # Notify user only if something new was enrolled
                 if all_enrolled:
-                    lines = [f"🔔 **Auto-Enrolled {len(all_enrolled)} Courses!**\n"]
-                    for title, acc_name in all_enrolled[:8]:
-                        short = title[:42] + "..." if len(title) > 42 else title
-                        lines.append(f"• {short} ({acc_name})")
-                    if len(all_enrolled) > 8:
-                        lines.append(f"  ...+{len(all_enrolled) - 8} more")
+                    header = f"🔔 **Auto-Enrolled {len(all_enrolled)} Courses!**\n\n"
+                    
+                    # Build full list of courses
+                    course_lines = []
+                    for title, acc_name in all_enrolled:
+                        short = title[:50] + "..." if len(title) > 50 else title
+                        course_lines.append(f"✅ {short}")
+                    
+                    # Split into chunks if too long (Telegram limit ~4096 chars)
+                    full_text = header + "\n".join(course_lines)
                     
                     try:
-                        await bot.send_message(
-                            chat_id=user_id,
-                            text="\n".join(lines),
-                            parse_mode="Markdown"
-                        )
+                        if len(full_text) <= 4000:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=full_text,
+                                parse_mode="Markdown"
+                            )
+                        else:
+                            # Send header first
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=header,
+                                parse_mode="Markdown"
+                            )
+                            # Send courses in chunks
+                            chunk = []
+                            chunk_len = 0
+                            for line in course_lines:
+                                if chunk_len + len(line) + 1 > 3900:
+                                    await bot.send_message(chat_id=user_id, text="\n".join(chunk))
+                                    chunk = []
+                                    chunk_len = 0
+                                chunk.append(line)
+                                chunk_len += len(line) + 1
+                            if chunk:
+                                await bot.send_message(chat_id=user_id, text="\n".join(chunk))
                     except Exception as e:
                         log.debug(f"Notify user {user_id} failed: {e}")
                     
