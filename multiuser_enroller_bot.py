@@ -22,12 +22,100 @@ from user_enroller import (
     user_has_credentials, get_user_stats,
     validate_token_format, validate_client_id_format, get_setup_instructions,
     delete_user_data,
+    # Premium & Access Control
+    is_owner, is_premium, grant_premium, revoke_premium, get_all_premium_users,
+    can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
 )
 
 log = logging.getLogger(__name__)
 
 COURSES_API = "https://cdn.real.discount/api/courses"
 AUTO_ENROLL_INTERVAL = 120  # 2 minutes
+
+
+# ─── Premium Management Commands (Owner Only) ─────────────────────────────────
+
+async def cmd_grant_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grant premium access to a user (owner only)"""
+    if not update.effective_user or not update.effective_message:
+        return
+    
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+    
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/grant_premium <user_id>`\nExample: `/grant_premium 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid user ID. Must be a number.")
+        return
+    
+    if grant_premium(target_id, update.effective_user.id):
+        await update.effective_message.reply_text(
+            f"✅ Premium access granted to user `{target_id}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.effective_message.reply_text("❌ Failed to grant premium.")
+
+
+async def cmd_revoke_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Revoke premium access from a user (owner only)"""
+    if not update.effective_user or not update.effective_message:
+        return
+    
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+    
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/revoke_premium <user_id>`\nExample: `/revoke_premium 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid user ID.")
+        return
+    
+    if revoke_premium(target_id):
+        await update.effective_message.reply_text(
+            f"✅ Premium revoked from user `{target_id}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.effective_message.reply_text("❌ Failed to revoke premium.")
+
+
+async def cmd_list_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all premium users (owner only)"""
+    if not update.effective_user or not update.effective_message:
+        return
+    
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+    
+    users = get_all_premium_users()
+    if not users:
+        await update.effective_message.reply_text("No premium users.")
+        return
+    
+    lines = ["👑 **Premium Users:**\n"]
+    for u in users:
+        lines.append(f"• `{u['user_id']}` (granted: {u['granted_at'][:10]})")
+    
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ─── Setup Commands ──────────────────────────────────────────────────────────
@@ -272,6 +360,24 @@ async def cmd_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     
+    # Check daily limit for free users
+    can_do, remaining, user_is_premium = can_enroll(user_id)
+    if not can_do:
+        await update.effective_message.reply_text(
+            f"⚠️ **Daily limit reached!**\n\n"
+            f"Free users can enroll in {FREE_DAILY_LIMIT} courses/day.\n"
+            f"Your limit resets at midnight.\n\n"
+            f"💎 Contact owner for premium access (unlimited).",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Build limit info
+    if user_is_premium:
+        limit_info = "💎 Premium: Unlimited"
+    else:
+        limit_info = f"📊 Today: {remaining}/{FREE_DAILY_LIMIT} remaining"
+    
     if len(accounts) == 1:
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(f"🚀 Enroll — {accounts[0]['name']}", callback_data="enroll_start_all"),
@@ -287,6 +393,7 @@ async def cmd_enroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(
         "🎓 **Udemy Auto-Enroller**\n\n"
         f"Accounts: {len(accounts)}\n"
+        f"{limit_info}\n"
         "Action: Fetch latest 50 free courses & enroll\n"
         "Source: Real.Discount API\n"
         "Time: ~2-4 min per account\n\n"
@@ -649,8 +756,27 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.edit_text("❌ No accounts found.")
             return
         
+        # Check daily limit for free users
+        can_do, remaining, user_is_premium = can_enroll(user_id)
+        if not can_do:
+            await msg.edit_text(
+                f"⚠️ **Daily limit reached!**\n\n"
+                f"Free: {FREE_DAILY_LIMIT}/day\n"
+                f"💎 Contact owner for premium (unlimited).",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Determine how many courses to fetch
+        if user_is_premium:
+            courses_to_fetch = 50
+            limit_info = "💎 Premium: Unlimited"
+        else:
+            courses_to_fetch = min(50, remaining)
+            limit_info = f"📊 Limit: {remaining} remaining today"
+        
         # Fetch courses
-        courses = await asyncio.to_thread(_fetch_courses_from_api, 50)
+        courses = await asyncio.to_thread(_fetch_courses_from_api, courses_to_fetch)
         if not courses:
             await msg.edit_text("❌ No free courses found from API.")
             return
@@ -667,7 +793,8 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"🚀 **Enrolling...**\n\n"
                     f"Account: {account['name']} ({i+1}/{len(accounts)})\n"
                     f"{bar}\n"
-                    f"Courses to process: {len(courses)}\n\n"
+                    f"Courses to process: {len(courses)}\n"
+                    f"{limit_info}\n\n"
                     f"✅ Enrolled so far: {len(total_enrolled)}",
                     parse_mode="Markdown"
                 )
@@ -697,6 +824,10 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             total_expired += result["expired"]
             total_failed += result["failed"]
         
+        # Track daily usage for free users (count actual new enrollments)
+        if not user_is_premium and total_enrolled:
+            increment_daily_usage(user_id, len(total_enrolled))
+        
         # Update state
         update_auto_enroll_state(user_id, enrolled_count=len(total_enrolled))
         
@@ -711,6 +842,11 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             f"⏰ Expired: {total_expired}",
             f"❌ Failed: {total_failed}",
         ]
+        
+        # Show remaining for free users
+        if not user_is_premium:
+            new_remaining = get_remaining_today(user_id)
+            lines.append(f"\n📊 Remaining today: {new_remaining}/{FREE_DAILY_LIMIT}")
         
         if total_enrolled:
             lines.append("\n**✅ Newly Enrolled:**")

@@ -17,6 +17,14 @@ def _conn():
     return sqlite3.connect(ENROLL_DB_FILE)
 
 
+import os
+
+# Daily enrollment limit for free users
+FREE_DAILY_LIMIT = 20
+# Owner ID from environment (gets full access)
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+
 def init_enroller_db():
     """Initialize enroller database with multi-account support"""
     conn = _conn()
@@ -63,6 +71,25 @@ def init_enroller_db():
             last_check TIMESTAMP,
             last_course_id TEXT,
             total_auto_enrolled INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Premium users table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS premium_users (
+            user_id INTEGER PRIMARY KEY,
+            granted_by INTEGER,
+            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Daily usage tracking
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS daily_usage (
+            user_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            enroll_count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, date)
         )
     """)
     
@@ -352,6 +379,7 @@ def delete_user_data(user_id: int) -> bool:
         c.execute("DELETE FROM user_setup_state WHERE user_id = ?", (user_id,))
         c.execute("DELETE FROM enrolled_courses WHERE user_id = ?", (user_id,))
         c.execute("DELETE FROM auto_enroll_state WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM daily_usage WHERE user_id = ?", (user_id,))
         conn.commit()
         return True
     except Exception as e:
@@ -359,6 +387,131 @@ def delete_user_data(user_id: int) -> bool:
         return False
     finally:
         conn.close()
+
+
+# ─── Premium & Access Control ─────────────────────────────────────────────────
+
+def is_owner(user_id: int) -> bool:
+    """Check if user is the bot owner"""
+    return user_id == OWNER_ID and OWNER_ID != 0
+
+
+def is_premium(user_id: int) -> bool:
+    """Check if user has premium access"""
+    if is_owner(user_id):
+        return True
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM premium_users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+
+def grant_premium(user_id: int, granted_by: int) -> bool:
+    """Grant premium access to a user"""
+    conn = _conn()
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT OR REPLACE INTO premium_users (user_id, granted_by, granted_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (user_id, granted_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        log.error(f"Error granting premium: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def revoke_premium(user_id: int) -> bool:
+    """Revoke premium access from a user"""
+    conn = _conn()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM premium_users WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        log.error(f"Error revoking premium: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_all_premium_users() -> list:
+    """Get all premium users"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, granted_by, granted_at FROM premium_users")
+    rows = c.fetchall()
+    conn.close()
+    return [{"user_id": r[0], "granted_by": r[1], "granted_at": r[2]} for r in rows]
+
+
+# ─── Daily Usage Limits ───────────────────────────────────────────────────────
+
+def get_today_str() -> str:
+    """Get today's date as string YYYY-MM-DD"""
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def get_daily_usage(user_id: int) -> int:
+    """Get number of enrollments today for a user"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT enroll_count FROM daily_usage WHERE user_id = ? AND date = ?",
+              (user_id, get_today_str()))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+
+def increment_daily_usage(user_id: int, count: int = 1) -> int:
+    """Increment daily usage count. Returns new total."""
+    today = get_today_str()
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO daily_usage (user_id, date, enroll_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET enroll_count = enroll_count + ?
+    """, (user_id, today, count, count))
+    conn.commit()
+    c.execute("SELECT enroll_count FROM daily_usage WHERE user_id = ? AND date = ?",
+              (user_id, today))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else count
+
+
+def get_remaining_today(user_id: int) -> int:
+    """Get remaining enrollments for today. Returns -1 for unlimited (premium/owner)."""
+    if is_premium(user_id):
+        return -1  # Unlimited
+    used = get_daily_usage(user_id)
+    return max(0, FREE_DAILY_LIMIT - used)
+
+
+def can_enroll(user_id: int, count: int = 1) -> tuple:
+    """Check if user can enroll. Returns (can_enroll: bool, remaining: int, is_premium: bool)"""
+    if is_premium(user_id):
+        return True, -1, True
+    remaining = get_remaining_today(user_id)
+    return remaining >= count, remaining, False
+
+
+def cleanup_old_usage(days: int = 30) -> int:
+    """Clean up usage records older than X days"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM daily_usage WHERE date < date('now', '-' || ? || ' days')", (days,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 # Initialize

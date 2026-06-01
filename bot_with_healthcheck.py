@@ -60,7 +60,12 @@ from multiuser_enroller_bot import (
     profile_callback,
     handle_setup_message,
     auto_enroll_job,
+    # Premium management (owner only)
+    cmd_grant_premium,
+    cmd_revoke_premium,
+    cmd_list_premium,
 )
+from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
 from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
@@ -199,63 +204,96 @@ async def reply_html_chunked(
 
 # ─── /start welcome ───────────────────────────────────────────────────────────
 
-WELCOME_HTML = """<b>Welcome!</b> 👋
+# Welcome for regular users (courses only)
+WELCOME_USER_HTML = """<b>🎓 Udemy Auto-Enroller Bot</b>
 
-Here's what I can do:
+Auto-enroll in free Udemy courses!
 
-• <b>Course alerts</b> — free-course picks posted to the channel on a timer.
-• <b>Market dip heads-up</b> — alerts when Nifty 50, Sensex, or Nifty BeES fall by your dip threshold vs previous close.
-• <b>Tech news</b> — latest tech headlines auto-posted daily at 10 AM &amp; 10 PM IST.
-• <b>🆕 Udemy Auto-Enroller</b> — multi-account auto-enrollment with background checks!
+<b>📚 Commands:</b>
+/enroll_setup — add your Udemy account
+/enroll — enroll in latest free courses
+/accounts — manage your accounts
+/autoenroll — toggle auto-enrollment
+/enroll_status — view your stats
+/myprofile — profile &amp; settings
+/myid — your Telegram ID
+/help — detailed help
+
+<b>📊 Free Plan:</b> {remaining}/{limit} enrollments today
+<b>💎 Premium:</b> Unlimited enrollments
+
+<b>ℹ️ How it works:</b>
+1. /enroll_setup → add your Udemy cookies
+2. /enroll → enroll in 50 latest free courses
+3. /autoenroll → auto-enroll every 2 min
+
+⚡ <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
+
+# Welcome for premium users
+WELCOME_PREMIUM_HTML = """<b>💎 Udemy Auto-Enroller Bot</b>
+
+Premium user — <b>Unlimited enrollments!</b>
+
+<b>📚 Commands:</b>
+/enroll_setup — add Udemy accounts
+/enroll — enroll in latest free courses
+/accounts — manage your accounts
+/autoenroll — toggle auto-enrollment
+/enroll_status — view your stats
+/myprofile — profile &amp; settings
+/myid — your Telegram ID
+/help — detailed help
+
+<b>ℹ️ How it works:</b>
+1. /enroll_setup → add your Udemy cookies
+2. /enroll → enroll in 50 latest free courses
+3. /autoenroll → auto-enroll every 2 min
+
+⚡ <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
+
+# Full welcome for owner
+WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 
 <b>📽️ Movie Commands:</b>
-/movies — browse latest movies from 10+ sites
+/movies — browse latest movies
 /search &lt;title&gt; — search all movie sites
-/movietest — quick test with popular movies
 
 <b>📰 News Commands:</b>
-/news — preview latest tech news (Post / Skip)
+/news — preview latest tech news
 
 <b>📈 Market Commands:</b>
-/market — live market snapshot + dip status
-/testdip — sample dip alert (not real data)
-/testalert — check if dip alerts can reach destination
+/market — live market snapshot
+/testdip — sample dip alert
+/testalert — test alert delivery
 
-<b>🎓 Udemy Multi-Account Enroller:</b>
-/enroll_setup — add a new Udemy account (multi-account!)
-/set_token &lt;token&gt; — set access_token
-/set_client_id &lt;id&gt; — set client_id
-/enroll — enroll now (all accounts or latest)
-/accounts — manage your Udemy accounts
-/autoenroll — toggle auto-enrollment (checks every 2 min)
-/enroll_status — view enrollment stats
-/myprofile — profile &amp; data management
+<b>🎓 Udemy Enroller:</b>
+/enroll_setup — add Udemy accounts
+/enroll — enroll in courses
+/accounts — manage accounts
+/autoenroll — toggle auto-enrollment
+/enroll_status — view stats
 
-<b>🔧 Utility Commands:</b>
+<b>👑 Owner Commands:</b>
+/grant_premium &lt;user_id&gt; — give premium access
+/revoke_premium &lt;user_id&gt; — remove premium
+/list_premium — show all premium users
+
+<b>🔧 Utility:</b>
 /start — this menu
 /help — detailed help
 /myid — your Telegram ID
 
-<b>ℹ️ How Auto-Enroller works:</b>
-1. /enroll_setup → add 1 or more Udemy accounts
-2. /enroll → manually enroll in 50 latest free courses
-3. /autoenroll → turn on background auto-enrollment
-   → Bot checks every 2 min for new courses
-   → Auto-enrolls all your accounts
-   → Sends you notification when courses are enrolled
-
-<i>Each user can add multiple Udemy accounts.
-Auto-enrollment runs in background and notifies you.</i>
-
-⚡ Powered by <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
+⚡ <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_message or not update.effective_chat:
+    if not update.effective_message or not update.effective_chat or not update.effective_user:
         return
-        
-    # Save user to DB so they receive market alerts
+    
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    
+    # Save user to DB
     con = sqlite3.connect(DB_FILE)
     try:
         con.execute("INSERT OR IGNORE INTO bot_users (chat_id) VALUES (?)", (chat_id,))
@@ -264,143 +302,129 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("Failed to save user %s: %s", chat_id, e)
     finally:
         con.close()
-        
-    await update.effective_message.reply_html(WELCOME_HTML)
+    
+    # Show appropriate welcome based on user type
+    if is_owner(user_id):
+        await update.effective_message.reply_html(WELCOME_OWNER_HTML)
+    elif is_premium(user_id):
+        await update.effective_message.reply_html(WELCOME_PREMIUM_HTML)
+    else:
+        remaining = get_remaining_today(user_id)
+        msg = WELCOME_USER_HTML.format(remaining=remaining, limit=FREE_DAILY_LIMIT)
+        await update.effective_message.reply_html(msg)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show detailed help for all commands"""
-    if not update.effective_message:
+    """Show detailed help based on user type"""
+    if not update.effective_message or not update.effective_user:
         return
     
-    help_text = """<b>📖 DETAILED COMMAND HELP</b>
-
-<b>🎓 UDEMY MULTI-ACCOUNT ENROLLER</b>
+    user_id = update.effective_user.id
+    
+    # Base help for all users (Udemy enroller)
+    base_help = """<b>📖 UDEMY ENROLLER HELP</b>
 
 <b>/enroll_setup</b>
-Add a new Udemy account. You can add multiple accounts!
-Bot asks for access_token and client_id from browser cookies.
+Add a new Udemy account. You can add multiple!
+Bot asks for access_token and client_id from cookies.
 
 <b>/set_token &lt;token&gt;</b>
-Set access_token directly. Usage: /set_token eyJhbGc...
+Set access_token directly.
 
 <b>/set_client_id &lt;id&gt;</b>
-Set client_id directly. Usage: /set_client_id 6U...
+Set client_id directly.
 
 <b>/enroll</b>
-Fetches latest 50 free courses and enrolls.
-Choose: All accounts or latest account only.
-Source: Real.Discount API. Takes ~2-4 min per account.
+Enroll in latest 50 free courses.
+Choose: All accounts or latest only.
 
 <b>/accounts</b>
 Manage your Udemy accounts:
-• View all accounts with auto-enroll status
 • Toggle auto-enroll per account
 • Add or remove accounts
 
 <b>/autoenroll</b>
-Toggle background auto-enrollment ON/OFF.
-When ON: Bot checks every 2 min for new free courses
-and auto-enrolls all your enabled accounts.
-You get notified when courses are enrolled!
+Toggle background auto-enrollment.
+Bot checks every 2 min for new courses.
 
 <b>/enroll_status</b>
-View enrollment stats and recent enrollments.
+View enrollment stats.
 
 <b>/myprofile</b>
-View profile, account count, and manage data.
-
-<b>📽️ MOVIE COMMANDS</b>
-
-<b>/movies</b>
-Browse latest movies from multiple sources:
-⭐ HDHub4u | 🎬 4KHDHub | 🎥 MoviesDrive | 🎞️ HDMovie2
-🌟 Vegamovies | 📀 SDMoviesPoint | 🎞️ BollyFlix | 🚜 MoviesMod
-🅰️ AtoZ Cinemas | 🎬 ZeeFliz
-Click a source, select quality, browse latest movies.
-
-<b>/search &lt;title&gt;</b>
-Search all 10+ movie sites for a specific title.
-Usage: /search Project Hail Mary
-Shows results from each site with direct download links.
-
-<b>/movietest</b>
-Quick test - shows latest movies from popular sources.
-Good for checking if all sites are working.
-
-<b>📰 NEWS COMMANDS</b>
-
-<b>/news</b>
-Preview latest tech news from Inshorts.
-Choose to Post (to channel) or Skip each article.
-Auto-posts daily at 10 AM and 10 PM IST.
-
-<b>📈 MARKET COMMANDS</b>
-
-<b>/market</b>
-Live market snapshot for:
-• Nifty 50 | Sensex | Nifty BeES
-Shows: Current value, change %, dip status.
-Market updates every 2 minutes.
-
-<b>/testdip</b>
-Send a sample dip alert (simulated, not real data).
-Shows what alerts look like when markets fall.
-
-<b>/testalert</b>
-Test if dip alerts can reach the channel.
-Useful for debugging alert delivery.
-
-<b>🔧 UTILITY COMMANDS</b>
-
-<b>/start</b>
-Show welcome menu with quick command overview.
+View profile and manage data.
 
 <b>/myid</b>
 Show your Telegram user ID.
-Useful for debugging and permissions.
-
-<b>/updateapi</b>
-Update API configuration (admin only).
-For updating scraper settings.
 
 <b>💡 TIPS</b>
-
-• Add multiple Udemy accounts for multi-enrollment
-• Enable /autoenroll so you never miss free courses
-• Each user's data is private and separate
-• Delete all data anytime: /myprofile → Delete
+• Add multiple Udemy accounts
+• Enable /autoenroll to never miss free courses
+• Your data is private
 
 <b>❓ FAQ</b>
 
-<b>Q: Can I add multiple Udemy accounts?</b>
-A: Yes! Run /enroll_setup multiple times to add more accounts.
-Use /accounts to manage them.
-
-<b>Q: How does auto-enroll work?</b>
-A: Enable via /autoenroll. Bot checks API every 2 minutes
-for new free courses and enrolls all your enabled accounts.
-You get a Telegram notification for each batch enrolled.
-
 <b>Q: Token expired?</b>
-A: Run /enroll_setup → Add Account with fresh cookies.
-Remove old account from /accounts if needed.
+A: /enroll_setup → Add new account with fresh cookies.
 """
     
-    await update.effective_message.reply_html(help_text)
+    # Premium info for non-premium users
+    if not is_premium(user_id):
+        base_help += f"""
+<b>📊 FREE PLAN LIMITS</b>
+Daily limit: {FREE_DAILY_LIMIT} courses/day
+Resets at midnight.
+💎 Contact owner for unlimited (premium).
+"""
+    
+    # Owner-only additions
+    if is_owner(user_id):
+        owner_help = """
+
+<b>👑 OWNER COMMANDS</b>
+
+<b>/grant_premium &lt;user_id&gt;</b>
+Give a user unlimited enrollment access.
+
+<b>/revoke_premium &lt;user_id&gt;</b>
+Remove premium access from a user.
+
+<b>/list_premium</b>
+Show all premium users.
+
+<b>📽️ MOVIES</b>
+/movies — browse latest movies
+/search &lt;title&gt; — search movies
+
+<b>📰 NEWS</b>
+/news — preview &amp; post tech news
+
+<b>📈 MARKET</b>
+/market — live market snapshot
+/testdip — sample dip alert
+/testalert — test alert delivery
+"""
+        base_help += owner_help
+    
+    await update.effective_message.reply_html(base_help)
 
 
 async def cmd_testdip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a sample dip alert to this chat (same template as live alerts)."""
-    if not update.effective_message:
+    """Send a sample dip alert. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
         return
     text = format_test_dip_alert(threshold=DIP_THRESHOLD_PERCENT)
     await update.effective_message.reply_text(text)
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetch Yahoo snapshot now and explain dip rule vs your DIP_THRESHOLD_PERCENT."""
-    if not update.effective_message:
+    """Fetch Yahoo snapshot now and explain dip rule. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
     status = await build_dip_status_async()
     await update.effective_message.reply_text(format_dip_status_telegram(status))
@@ -419,8 +443,11 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_testalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Diagnose dip alert delivery: tries to send a test message to MARKET_ALERT_CHAT_ID."""
-    if not update.effective_message:
+    """Diagnose dip alert delivery. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
         return
     chat = MARKET_ALERT_CHAT_ID
     await update.effective_message.reply_text(
@@ -533,11 +560,11 @@ async def cmd_updateapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show site picker: 4KHDHub or MoviesDrive."""
+    """Show site picker: 4KHDHub or MoviesDrive. Owner only."""
     if not update.effective_message or not update.effective_user:
         return
-    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
-        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
 
     keyboard = [
@@ -560,11 +587,11 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: test raw connectivity to movie sites and report HTTP status."""
+    """Test connectivity to movie sites. Owner only."""
     if not update.effective_message or not update.effective_user:
         return
-    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
-        await update.effective_message.reply_text("⛔ Admin only.")
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
         return
 
     msg = await update.effective_message.reply_text("🔍 Testing connectivity to movie sites…")
@@ -832,11 +859,11 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search movie sites. Usage: /search <title>"""
+    """Search movie sites. Usage: /search <title>. Owner only."""
     if not update.effective_message or not update.effective_user:
         return
-    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
-        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
 
     search_query = " ".join(context.args or []).strip()
@@ -1494,13 +1521,12 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Preview latest tech news; offer Post/Skip buttons."""
+    """Preview latest tech news; offer Post/Skip buttons. Owner only."""
     if not update.effective_message or not update.effective_user:
         return
-        
-    # Only allow the admin (MARKET_ALERT_CHAT_ID) to use the /news command
-    if str(update.effective_user.id) != str(MARKET_ALERT_CHAT_ID):
-        await update.effective_message.reply_text("⛔ You do not have permission to use this command.")
+    
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
         
     await update.effective_message.reply_text("Fetching tech news...")
@@ -1596,6 +1622,12 @@ def build_telegram_application() -> Application:
     app.add_handler(CallbackQueryHandler(enroll_callback, pattern=r"^enroll_"))
     app.add_handler(CallbackQueryHandler(setup_callback, pattern=r"^setup_"))
     app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete|acc_toggle_|acc_remove_|autoenroll_toggle|show_accounts)"))
+    
+    # Premium management commands (owner only)
+    app.add_handler(CommandHandler("grant_premium", cmd_grant_premium))
+    app.add_handler(CommandHandler("revoke_premium", cmd_revoke_premium))
+    app.add_handler(CommandHandler("list_premium", cmd_list_premium))
+    
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
     return app
