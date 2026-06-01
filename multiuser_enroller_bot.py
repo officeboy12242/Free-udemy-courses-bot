@@ -241,15 +241,28 @@ async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("❌ Token too short (need 20+ chars)")
         return
     
-    # Add account directly with default client_id
-    accounts = get_user_accounts(user_id)
-    name = f"Account {len(accounts) + 1}"
-    acc_id = add_account(user_id, name, token, None)  # client_id defaults automatically
+    # Show verifying message
+    verify_msg = await update.effective_message.reply_text("🔄 Verifying token...")
+    
+    # Try to get actual Udemy username
+    try:
+        enroller = UdemyAutoEnroller(token)
+        is_valid = await asyncio.to_thread(enroller.verify_login)
+        if not is_valid:
+            await verify_msg.edit_text("❌ Invalid token or Udemy login failed.")
+            return
+        
+        udemy_name = await asyncio.to_thread(enroller.get_user_name)
+        name = udemy_name or "Udemy Account"
+    except Exception:
+        name = "Udemy Account"
+    
+    acc_id = add_account(user_id, name, token, None)
     clear_user_setup_state(user_id)
     
-    await update.effective_message.reply_text(
+    await verify_msg.edit_text(
         f"🎉 **Setup Complete!**\n\n"
-        f"✅ {name} added successfully\n"
+        f"✅ **{name}** added successfully\n"
         f"🚀 Auto-enrollment STARTED!\n\n"
         f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
         f"You'll receive notifications when courses are enrolled.\n\n"
@@ -278,14 +291,33 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.effective_message.reply_text("❌ Token too short. Copy the full `access_token` cookie value.")
             return
         
-        # Add account directly - no client_id needed!
-        name = extra or "Account 1"
-        acc_id = add_account(user_id, name, text, None)  # client_id defaults automatically
+        # Show verifying message
+        verify_msg = await update.effective_message.reply_text("🔄 Verifying token...")
+        
+        # Try to get actual Udemy username
+        try:
+            enroller = UdemyAutoEnroller(text)  # Uses default client_id
+            
+            # Verify login first
+            is_valid = await asyncio.to_thread(enroller.verify_login)
+            if not is_valid:
+                await verify_msg.edit_text("❌ Invalid token or Udemy login failed. Please check and try again.")
+                return
+            
+            # Get actual Udemy username
+            udemy_name = await asyncio.to_thread(enroller.get_user_name)
+            name = udemy_name or extra or "Udemy Account"
+        except Exception as e:
+            log.error(f"Token verification error: {e}")
+            name = extra or "Udemy Account"
+        
+        # Add account with actual name
+        acc_id = add_account(user_id, name, text, None)
         clear_user_setup_state(user_id)
         
-        await update.effective_message.reply_text(
+        await verify_msg.edit_text(
             f"🎉 **Setup Complete!**\n\n"
-            f"✅ {name} added successfully\n"
+            f"✅ **{name}** added successfully\n"
             f"🚀 Auto-enrollment STARTED!\n\n"
             f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
             f"You'll receive notifications when courses are enrolled.\n\n"

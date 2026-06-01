@@ -142,6 +142,21 @@ class UdemyAutoEnroller:
             log.debug(f"Failed to get course count: {e}")
             return -1
     
+    def get_user_name(self) -> str:
+        """Get the Udemy user's display name"""
+        try:
+            r = self._get("https://www.udemy.com/api-2.0/users/me/?fields[user]=display_name,name,title")
+            if r and r.status_code == 200:
+                data = r.json()
+                # Try display_name first, then name, then title
+                name = data.get("display_name") or data.get("name") or data.get("title")
+                if name:
+                    return name.strip()
+            return None
+        except Exception as e:
+            log.debug(f"Failed to get user name: {e}")
+            return None
+    
     @staticmethod
     def _extract_slug(url: str) -> str:
         try:
