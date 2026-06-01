@@ -2230,6 +2230,7 @@ async def run_news_autopost(bot: Bot):
 
 async def run_course_loop(bot: Bot):
     """Poll courses and post to CHANNEL_ID."""
+    from user_enroller import is_channel_posting_enabled
     last_db_check = datetime.now()
 
     while True:
@@ -2238,6 +2239,12 @@ async def run_course_loop(bot: Bot):
                 log.info("🔄 Resetting database during runtime...")
                 reset_database()
             last_db_check = datetime.now()
+        
+        # Check if channel posting is enabled
+        if not is_channel_posting_enabled():
+            log.info("📢 Channel posting disabled, skipping...")
+            await asyncio.sleep(CHECK_EVERY)
+            continue
         
         log.info("─── 🔍 Checking for new courses ───")
         new_courses = fetch_new_courses()

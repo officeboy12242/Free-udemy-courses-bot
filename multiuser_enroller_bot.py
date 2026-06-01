@@ -125,7 +125,7 @@ async def cmd_list_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle channel posting for auto-enrolled courses (owner only)"""
+    """Toggle channel posting for free courses (owner only)"""
     if not update.effective_user or not update.effective_message:
         return
     
@@ -146,10 +146,11 @@ async def cmd_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     channel_info = f"Channel: `{CHANNEL_ID}`" if CHANNEL_ID else "⚠️ CHANNEL_ID not set in .env"
     
     await update.effective_message.reply_text(
-        f"📢 **Channel Auto-Posting**\n\n"
+        f"📢 **Channel Course Posting**\n\n"
         f"Status: {status}\n"
         f"{channel_info}\n\n"
-        f"When ON, newly enrolled courses from auto-enroll will be posted to the channel.",
+        f"When ON, free Udemy courses are automatically posted to the channel.\n"
+        f"When OFF, course posting to channel is paused.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -781,10 +782,11 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         ]])
         
         await query.edit_message_text(
-            f"📢 **Channel Auto-Posting**\n\n"
+            f"📢 **Channel Course Posting**\n\n"
             f"Status: {status}\n"
             f"{channel_info}\n\n"
-            f"When ON, newly enrolled courses from auto-enroll will be posted to the channel.",
+            f"When ON, free Udemy courses are automatically posted to the channel.\n"
+            f"When OFF, course posting to channel is paused.",
             reply_markup=keyboard,
             parse_mode="Markdown"
         )
@@ -1227,26 +1229,6 @@ async def auto_enroll_job(app: Application) -> None:
                         log.debug(f"Notify user {user_id} failed: {e}")
                     
                     log.info(f"Auto-enroll: user {user_id} got {len(all_enrolled)} new courses")
-                    
-                    # Post to channel if enabled (owner only feature)
-                    if is_channel_posting_enabled() and CHANNEL_ID:
-                        try:
-                            channel_lines = [f"🎓 **{len(all_enrolled)} Free Udemy Courses!**\n"]
-                            for title, _ in all_enrolled[:15]:
-                                short = title[:50] + "..." if len(title) > 50 else title
-                                channel_lines.append(f"✅ {short}")
-                            if len(all_enrolled) > 15:
-                                channel_lines.append(f"\n...and {len(all_enrolled) - 15} more!")
-                            channel_lines.append("\n🤖 Auto-enrolled via @YourBotUsername")
-                            
-                            await bot.send_message(
-                                chat_id=CHANNEL_ID,
-                                text="\n".join(channel_lines),
-                                parse_mode="Markdown"
-                            )
-                            log.info(f"Posted {len(all_enrolled)} courses to channel")
-                        except Exception as e:
-                            log.debug(f"Channel post failed: {e}")
                 
                 # Notify user if ALL accounts failed login (token expired)
                 if failed_accounts and not all_enrolled:
