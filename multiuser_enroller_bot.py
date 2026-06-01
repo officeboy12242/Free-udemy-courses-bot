@@ -241,12 +241,12 @@ async def cmd_set_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data.pop("pending_token", None)
     
     await update.effective_message.reply_text(
-        f"🎉 **{name} Added!** (ID: {acc_id})\n\n"
-        "✅ Auto-enroll: ON by default\n\n"
-        "Commands:\n"
-        "• `/enroll` — Enroll now (all accounts)\n"
-        "• `/accounts` — Manage accounts\n"
-        "• `/autoenroll` — Toggle auto-enrollment",
+        f"🎉 **Setup Complete!**\n\n"
+        f"✅ {name} added successfully\n"
+        f"🚀 Auto-enrollment STARTED!\n\n"
+        f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
+        f"You'll receive notifications when courses are enrolled.\n\n"
+        f"📊 `/enroll_status` — View your stats",
         parse_mode="Markdown"
     )
 
@@ -293,9 +293,12 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("pending_account_name", None)
         
         await update.effective_message.reply_text(
-            f"🎉 **{name} Added!** (ID: {acc_id})\n\n"
-            "✅ Auto-enroll: ON\n\n"
-            "Use `/enroll` to enroll now or `/autoenroll` to enable background auto-enrollment.",
+            f"🎉 **Setup Complete!**\n\n"
+            f"✅ {name} added successfully\n"
+            f"🚀 Auto-enrollment STARTED!\n\n"
+            f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
+            f"You'll receive notifications when courses are enrolled.\n\n"
+            f"📊 `/enroll_status` — View your stats",
             parse_mode="Markdown"
         )
 
@@ -342,11 +345,22 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─── Auto-Enroll Toggle ─────────────────────────────────────────────────────
 
 async def cmd_autoenroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle auto-enrollment on/off"""
+    """Toggle auto-enrollment on/off (owner only, regular users have it always ON)"""
     if not update.effective_user or not update.effective_message:
         return
     
     user_id = update.effective_user.id
+    
+    # Regular users don't need this - auto-enroll is always on for them
+    if not is_owner(user_id):
+        await update.effective_message.reply_text(
+            "✅ Auto-enrollment is **always active** for you!\n\n"
+            "The bot checks for new free courses every 2 minutes and enrolls you automatically.\n\n"
+            "📊 Use `/enroll_status` to see your stats.",
+            parse_mode="Markdown"
+        )
+        return
+    
     accounts = get_user_accounts(user_id)
     
     if not accounts:

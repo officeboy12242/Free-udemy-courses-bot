@@ -208,25 +208,24 @@ async def reply_html_chunked(
 # Welcome for regular users (courses only)
 WELCOME_USER_HTML = """<b>🎓 Udemy Auto-Enroller Bot</b>
 
-Auto-enroll in free Udemy courses!
+Auto-enroll in FREE Udemy courses — automatically!
 
-<b>📚 Commands:</b>
-/enroll_setup — add your Udemy account
-/enroll — enroll in latest free courses
-/accounts — manage your accounts
-/autoenroll — toggle auto-enrollment
+<b>🚀 Get Started:</b>
+/enroll_setup — add your Udemy account (one-time)
+
+<b>📚 Other Commands:</b>
+/enroll — manual enroll now
 /enroll_status — view your stats
-/myprofile — profile &amp; settings
+/accounts — manage accounts
 /myid — your Telegram ID
-/help — detailed help
 
 <b>📊 Free Plan:</b> {remaining}/{limit} enrollments today
 <b>💎 Premium:</b> Unlimited enrollments
 
 <b>ℹ️ How it works:</b>
-1. /enroll_setup → add your Udemy cookies
-2. /enroll → enroll in 50 latest free courses
-3. /autoenroll → auto-enroll every 2 min
+1. Run /enroll_setup and add your Udemy cookies
+2. Done! Bot auto-enrolls you every 2 minutes
+3. You'll get notifications when courses are enrolled
 
 ⚡ <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
 
@@ -235,20 +234,19 @@ WELCOME_PREMIUM_HTML = """<b>💎 Udemy Auto-Enroller Bot</b>
 
 Premium user — <b>Unlimited enrollments!</b>
 
-<b>📚 Commands:</b>
-/enroll_setup — add Udemy accounts
-/enroll — enroll in latest free courses
-/accounts — manage your accounts
-/autoenroll — toggle auto-enrollment
+<b>🚀 Get Started:</b>
+/enroll_setup — add your Udemy account (one-time)
+
+<b>📚 Other Commands:</b>
+/enroll — manual enroll now
 /enroll_status — view your stats
-/myprofile — profile &amp; settings
+/accounts — manage accounts
 /myid — your Telegram ID
-/help — detailed help
 
 <b>ℹ️ How it works:</b>
-1. /enroll_setup → add your Udemy cookies
-2. /enroll → enroll in 50 latest free courses
-3. /autoenroll → auto-enroll every 2 min
+1. Run /enroll_setup and add your Udemy cookies
+2. Done! Bot auto-enrolls you every 2 minutes
+3. You'll get notifications when courses are enrolled
 
 ⚡ <a href="https://t.me/CoursesDrivee">@CoursesDrivee</a>"""
 
