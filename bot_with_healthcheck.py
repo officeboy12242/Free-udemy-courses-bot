@@ -49,7 +49,6 @@ from news_service import (
 from multiuser_enroller_bot import (
     cmd_enroll_setup,
     cmd_set_token,
-    cmd_set_client_id,
     cmd_enroll,
     cmd_enroll_status,
     cmd_myprofile,
@@ -1642,7 +1641,6 @@ def build_telegram_application() -> Application:
     # Multi-user Udemy enroller handlers
     app.add_handler(CommandHandler("enroll_setup", cmd_enroll_setup))
     app.add_handler(CommandHandler("set_token", cmd_set_token))
-    app.add_handler(CommandHandler("set_client_id", cmd_set_client_id))
     app.add_handler(CommandHandler("enroll", cmd_enroll))
     app.add_handler(CommandHandler("enroll_status", cmd_enroll_status))
     app.add_handler(CommandHandler("myprofile", cmd_myprofile))
