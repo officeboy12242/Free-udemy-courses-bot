@@ -856,15 +856,27 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         total_already = 0
         total_expired = 0
         total_failed = 0
+        limit_reached = False
         
         for i, account in enumerate(accounts):
+            # Check remaining limit for free users BEFORE each account
+            if not user_is_premium:
+                current_remaining = get_remaining_today(user_id)
+                if current_remaining <= 0:
+                    limit_reached = True
+                    break
+                # Limit courses for this account
+                courses_for_account = courses[:current_remaining]
+            else:
+                courses_for_account = courses
+            
             bar = _progress_bar(i, len(accounts))
             try:
                 await msg.edit_text(
                     f"🚀 **Enrolling...**\n\n"
                     f"Account: {account['name']} ({i+1}/{len(accounts)})\n"
                     f"{bar}\n"
-                    f"Courses to process: {len(courses)}\n"
+                    f"Courses to process: {len(courses_for_account)}\n"
                     f"{limit_info}\n\n"
                     f"✅ Enrolled so far: {len(total_enrolled)}",
                     parse_mode="Markdown"
@@ -872,10 +884,10 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception:
                 pass
             
-            result = await asyncio.to_thread(_enroll_account_in_courses, account, courses)
+            result = await asyncio.to_thread(_enroll_account_in_courses, account, courses_for_account)
             
             if result["error"]:
-                total_failed += len(courses)
+                total_failed += len(courses_for_account)
                 try:
                     await msg.edit_text(
                         f"⚠️ {account['name']}: {result['error']}\n"
@@ -886,18 +898,24 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
                     pass
                 continue
             
-            # Log enrollments
+            # Log enrollments and track usage IMMEDIATELY
+            enrolled_count = len(result["enrolled"])
             for title in result["enrolled"]:
                 log_enrollment(user_id, account["id"], "", title)
+            
+            # Track daily usage immediately after enrollment
+            if enrolled_count > 0:
+                increment_daily_usage(user_id, enrolled_count)
             
             total_enrolled.extend([(t, account["name"]) for t in result["enrolled"]])
             total_already += result["already"]
             total_expired += result["expired"]
             total_failed += result["failed"]
-        
-        # Track daily usage for ALL users (for stats)
-        if total_enrolled:
-            increment_daily_usage(user_id, len(total_enrolled))
+            
+            # Update limit info for display
+            if not user_is_premium:
+                new_remaining = get_remaining_today(user_id)
+                limit_info = f"📊 Limit: {new_remaining} remaining today"
         
         # Update state
         update_auto_enroll_state(user_id, enrolled_count=len(total_enrolled))
@@ -914,8 +932,10 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             f"❌ Failed: {total_failed}",
         ]
         
-        # Show remaining for free users
-        if not user_is_premium:
+        # Show limit reached message for free users
+        if limit_reached:
+            lines.append(f"\n⚠️ Daily limit reached ({FREE_DAILY_LIMIT} courses)")
+        elif not user_is_premium:
             new_remaining = get_remaining_today(user_id)
             lines.append(f"\n📊 Remaining today: {new_remaining}/{FREE_DAILY_LIMIT}")
         
@@ -994,10 +1014,31 @@ async def auto_enroll_job(app: Application) -> None:
                 all_enrolled = []
                 failed_accounts = []
                 
+                # Check if user has reached daily limit (for free users)
+                user_is_premium = is_premium(user_id)
+                if not user_is_premium:
+                    remaining = get_remaining_today(user_id)
+                    if remaining <= 0:
+                        log.info(f"Auto-enroll: user {user_id} hit daily limit, skipping")
+                        continue
+                    courses_for_user = courses[:remaining]
+                else:
+                    courses_for_user = courses
+                
                 for acc in user_accs:
+                    # Re-check limit before each account for free users
+                    if not user_is_premium:
+                        current_remaining = get_remaining_today(user_id)
+                        if current_remaining <= 0:
+                            log.info(f"Auto-enroll: user {user_id} hit limit mid-enrollment")
+                            break
+                        courses_for_acc = courses_for_user[:current_remaining]
+                    else:
+                        courses_for_acc = courses_for_user
+                    
                     try:
                         result = await asyncio.to_thread(
-                            _enroll_account_in_courses, acc, courses
+                            _enroll_account_in_courses, acc, courses_for_acc
                         )
                     except Exception as e:
                         log.error(f"Auto-enroll error acc {acc['id']}: {e}")
@@ -1009,9 +1050,14 @@ async def auto_enroll_job(app: Application) -> None:
                         failed_accounts.append(acc["name"])
                         continue
                     
+                    enrolled_count = len(result["enrolled"])
                     for title in result["enrolled"]:
                         log_enrollment(user_id, acc["id"], title, title)
                         all_enrolled.append((title, acc["name"]))
+                    
+                    # Track daily usage immediately after each account enrollment
+                    if enrolled_count > 0:
+                        increment_daily_usage(user_id, enrolled_count)
                 
                 # Always update state (last_check timestamp)
                 update_auto_enroll_state(
@@ -1019,10 +1065,6 @@ async def auto_enroll_job(app: Application) -> None:
                     last_course_id=courses[0].url if courses else None,
                     enrolled_count=len(all_enrolled)
                 )
-                
-                # Track daily usage for stats
-                if all_enrolled:
-                    increment_daily_usage(user_id, len(all_enrolled))
                 
                 # Notify user only if something new was enrolled
                 if all_enrolled:

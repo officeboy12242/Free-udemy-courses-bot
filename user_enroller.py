@@ -1,308 +1,270 @@
 """
-Multi-Account Udemy Enroller - Database and credential management
+Multi-Account Udemy Enroller - MongoDB Database Management
 Supports multiple Udemy accounts per user with auto-enrollment tracking
+Persists across deployments using MongoDB Atlas
 """
 
-import sqlite3
+import os
 import logging
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger(__name__)
-
-ENROLL_DB_FILE = "user_enroller.db"
-
-
-def _conn():
-    return sqlite3.connect(ENROLL_DB_FILE)
-
-
-import os
 
 # Daily enrollment limit for free users
 FREE_DAILY_LIMIT = 20
 # Owner ID from environment (gets full access)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# MongoDB connection string from environment
+MONGODB_URI = os.getenv("MONGODB_URI", "")
+
+# Global database connection
+_client = None
+_db = None
+
+
+def _get_db():
+    """Get MongoDB database connection (lazy initialization)"""
+    global _client, _db
+    if _db is None:
+        if not MONGODB_URI:
+            raise ValueError("MONGODB_URI environment variable not set")
+        _client = MongoClient(MONGODB_URI)
+        _db = _client.udemy_enroller
+        log.info("Connected to MongoDB")
+    return _db
 
 
 def init_enroller_db():
-    """Initialize enroller database with multi-account support"""
-    conn = _conn()
-    c = conn.cursor()
-    
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            account_name TEXT NOT NULL,
-            access_token TEXT NOT NULL,
-            client_id TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1,
-            auto_enroll INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_setup_state (
-            user_id INTEGER PRIMARY KEY,
-            setup_step TEXT,
-            extra_data TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS enrolled_courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            account_id INTEGER NOT NULL,
-            course_url TEXT NOT NULL,
-            course_title TEXT,
-            enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS auto_enroll_state (
-            user_id INTEGER PRIMARY KEY,
-            enabled INTEGER DEFAULT 0,
-            last_check TIMESTAMP,
-            last_course_id TEXT,
-            total_auto_enrolled INTEGER DEFAULT 0
-        )
-    """)
-    
-    # Premium users table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS premium_users (
-            user_id INTEGER PRIMARY KEY,
-            granted_by INTEGER,
-            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Daily usage tracking
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS daily_usage (
-            user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            enroll_count INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, date)
-        )
-    """)
-    
-    # Migrate from old schema if needed
+    """Initialize MongoDB collections and indexes"""
     try:
-        c.execute("SELECT user_id, access_token, client_id FROM user_credentials")
-        rows = c.fetchall()
-        for user_id, token, client in rows:
-            if token and client:
-                c.execute("""
-                    INSERT OR IGNORE INTO user_accounts (user_id, account_name, access_token, client_id, is_active, auto_enroll)
-                    VALUES (?, ?, ?, ?, 1, 0)
-                """, (user_id, "Account 1", token, client))
-        if rows:
-            log.info(f"Migrated {len(rows)} accounts from old schema")
-    except sqlite3.OperationalError:
-        pass
-    
-    conn.commit()
-    conn.close()
-    log.info("Enroller database initialized")
+        db = _get_db()
+        
+        # Create indexes for better performance
+        db.user_accounts.create_index([("user_id", 1)])
+        db.user_accounts.create_index([("user_id", 1), ("is_active", 1), ("auto_enroll", 1)])
+        db.enrolled_courses.create_index([("user_id", 1), ("course_url", 1)])
+        db.enrolled_courses.create_index([("user_id", 1), ("enrolled_at", -1)])
+        db.daily_usage.create_index([("user_id", 1), ("date", 1)], unique=True)
+        db.premium_users.create_index([("user_id", 1)], unique=True)
+        db.user_setup_state.create_index([("user_id", 1)], unique=True)
+        db.auto_enroll_state.create_index([("user_id", 1)], unique=True)
+        
+        log.info("MongoDB indexes created successfully")
+    except Exception as e:
+        log.error(f"MongoDB init error: {e}")
 
 
 # ─── Account Management ──────────────────────────────────────────────────────
 
 def add_account(user_id: int, account_name: str, access_token: str, client_id: str) -> int:
     """Add a new Udemy account for user. Returns account ID."""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO user_accounts (user_id, account_name, access_token, client_id, is_active, auto_enroll)
-        VALUES (?, ?, ?, ?, 1, 1)
-    """, (user_id, account_name, access_token, client_id))
-    account_id = c.lastrowid
-    conn.commit()
-    conn.close()
+    db = _get_db()
+    
+    # Generate a simple incrementing ID
+    counter = db.counters.find_one_and_update(
+        {"_id": "account_id"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True
+    )
+    account_id = counter["seq"]
+    
+    db.user_accounts.insert_one({
+        "_id": account_id,
+        "user_id": user_id,
+        "account_name": account_name,
+        "access_token": access_token,
+        "client_id": client_id,
+        "is_active": True,
+        "auto_enroll": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    })
+    
     return account_id
 
 
 def get_user_accounts(user_id: int) -> list:
     """Get all accounts for a user. Returns list of dicts."""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, account_name, access_token, client_id, is_active, auto_enroll
-        FROM user_accounts WHERE user_id = ? ORDER BY id
-    """, (user_id,))
-    rows = c.fetchall()
-    conn.close()
+    db = _get_db()
+    accounts = db.user_accounts.find({"user_id": user_id}).sort("_id", 1)
     return [
-        {"id": r[0], "name": r[1], "access_token": r[2], "client_id": r[3],
-         "is_active": bool(r[4]), "auto_enroll": bool(r[5])}
-        for r in rows
+        {
+            "id": a["_id"],
+            "name": a["account_name"],
+            "access_token": a["access_token"],
+            "client_id": a["client_id"],
+            "is_active": a.get("is_active", True),
+            "auto_enroll": a.get("auto_enroll", True)
+        }
+        for a in accounts
     ]
 
 
 def get_account(account_id: int) -> dict:
     """Get a specific account by ID"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, user_id, account_name, access_token, client_id, is_active, auto_enroll
-        FROM user_accounts WHERE id = ?
-    """, (account_id,))
-    r = c.fetchone()
-    conn.close()
-    if r:
-        return {"id": r[0], "user_id": r[1], "name": r[2], "access_token": r[3],
-                "client_id": r[4], "is_active": bool(r[5]), "auto_enroll": bool(r[6])}
+    db = _get_db()
+    a = db.user_accounts.find_one({"_id": account_id})
+    if a:
+        return {
+            "id": a["_id"],
+            "user_id": a["user_id"],
+            "name": a["account_name"],
+            "access_token": a["access_token"],
+            "client_id": a["client_id"],
+            "is_active": a.get("is_active", True),
+            "auto_enroll": a.get("auto_enroll", True)
+        }
     return None
 
 
 def remove_account(account_id: int) -> bool:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM user_accounts WHERE id = ?", (account_id,))
-    deleted = c.rowcount > 0
-    conn.commit()
-    conn.close()
-    return deleted
+    """Remove an account by ID"""
+    db = _get_db()
+    result = db.user_accounts.delete_one({"_id": account_id})
+    return result.deleted_count > 0
 
 
 def toggle_auto_enroll(account_id: int, enabled: bool) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("UPDATE user_accounts SET auto_enroll = ? WHERE id = ?", (int(enabled), account_id))
-    conn.commit()
-    conn.close()
+    """Toggle auto-enroll for an account"""
+    db = _get_db()
+    db.user_accounts.update_one(
+        {"_id": account_id},
+        {"$set": {"auto_enroll": enabled, "updated_at": datetime.utcnow()}}
+    )
 
 
 def get_all_auto_enroll_accounts() -> list:
     """Get all accounts with auto_enroll enabled (across all users)"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id, user_id, account_name, access_token, client_id
-        FROM user_accounts WHERE is_active = 1 AND auto_enroll = 1
-    """)
-    rows = c.fetchall()
-    conn.close()
+    db = _get_db()
+    accounts = db.user_accounts.find({
+        "is_active": True,
+        "auto_enroll": True
+    })
     return [
-        {"id": r[0], "user_id": r[1], "name": r[2], "access_token": r[3], "client_id": r[4]}
-        for r in rows
+        {
+            "id": a["_id"],
+            "user_id": a["user_id"],
+            "name": a["account_name"],
+            "access_token": a["access_token"],
+            "client_id": a["client_id"]
+        }
+        for a in accounts
     ]
 
 
 # ─── Auto-Enroll State ───────────────────────────────────────────────────────
 
 def get_auto_enroll_state(user_id: int) -> dict:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT enabled, last_check, last_course_id, total_auto_enrolled FROM auto_enroll_state WHERE user_id = ?", (user_id,))
-    r = c.fetchone()
-    conn.close()
-    if r:
-        return {"enabled": bool(r[0]), "last_check": r[1], "last_course_id": r[2], "total": r[3]}
+    """Get auto-enroll state for a user"""
+    db = _get_db()
+    state = db.auto_enroll_state.find_one({"user_id": user_id})
+    if state:
+        return {
+            "enabled": state.get("enabled", False),
+            "last_check": state.get("last_check"),
+            "last_course_id": state.get("last_course_id"),
+            "total": state.get("total_auto_enrolled", 0)
+        }
     return {"enabled": False, "last_check": None, "last_course_id": None, "total": 0}
 
 
 def set_auto_enroll_enabled(user_id: int, enabled: bool) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO auto_enroll_state (user_id, enabled) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET enabled = ?
-    """, (user_id, int(enabled), int(enabled)))
-    conn.commit()
-    conn.close()
+    """Set auto-enroll enabled status for a user"""
+    db = _get_db()
+    db.auto_enroll_state.update_one(
+        {"user_id": user_id},
+        {"$set": {"enabled": enabled, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
 
 
 def update_auto_enroll_state(user_id: int, last_course_id: str = None, enrolled_count: int = 0) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO auto_enroll_state (user_id, enabled, last_check, last_course_id, total_auto_enrolled)
-        VALUES (?, 1, CURRENT_TIMESTAMP, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET 
-            last_check = CURRENT_TIMESTAMP,
-            last_course_id = COALESCE(?, last_course_id),
-            total_auto_enrolled = total_auto_enrolled + ?
-    """, (user_id, last_course_id, enrolled_count, last_course_id, enrolled_count))
-    conn.commit()
-    conn.close()
+    """Update auto-enroll state after a check"""
+    db = _get_db()
+    update = {
+        "$set": {
+            "enabled": True,
+            "last_check": datetime.utcnow()
+        }
+    }
+    if last_course_id:
+        update["$set"]["last_course_id"] = last_course_id
+    if enrolled_count > 0:
+        update["$inc"] = {"total_auto_enrolled": enrolled_count}
+    
+    db.auto_enroll_state.update_one({"user_id": user_id}, update, upsert=True)
 
 
 # ─── Enrolled Course Tracking ────────────────────────────────────────────────
 
 def log_enrollment(user_id: int, account_id: int, course_url: str, course_title: str) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO enrolled_courses (user_id, account_id, course_url, course_title)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, account_id, course_url, course_title))
-    conn.commit()
-    conn.close()
+    """Log a course enrollment"""
+    db = _get_db()
+    db.enrolled_courses.insert_one({
+        "user_id": user_id,
+        "account_id": account_id,
+        "course_url": course_url,
+        "course_title": course_title,
+        "enrolled_at": datetime.utcnow()
+    })
 
 
 def get_recently_enrolled(user_id: int, limit: int = 20) -> list:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT course_title, enrolled_at, account_id FROM enrolled_courses
-        WHERE user_id = ? ORDER BY enrolled_at DESC LIMIT ?
-    """, (user_id, limit))
-    rows = c.fetchall()
-    conn.close()
-    return [{"title": r[0], "enrolled_at": r[1], "account_id": r[2]} for r in rows]
+    """Get recently enrolled courses for a user"""
+    db = _get_db()
+    courses = db.enrolled_courses.find(
+        {"user_id": user_id}
+    ).sort("enrolled_at", -1).limit(limit)
+    return [
+        {
+            "title": c.get("course_title", ""),
+            "enrolled_at": c.get("enrolled_at"),
+            "account_id": c.get("account_id")
+        }
+        for c in courses
+    ]
 
 
 def is_course_enrolled(user_id: int, course_url: str) -> bool:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM enrolled_courses WHERE user_id = ? AND course_url = ?", (user_id, course_url))
-    exists = c.fetchone() is not None
-    conn.close()
-    return exists
+    """Check if a course is already enrolled by user"""
+    db = _get_db()
+    return db.enrolled_courses.find_one({"user_id": user_id, "course_url": course_url}) is not None
 
 
 # ─── Setup State ─────────────────────────────────────────────────────────────
 
 def set_user_setup_state(user_id: int, step: str, extra: str = None) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR REPLACE INTO user_setup_state (user_id, setup_step, extra_data, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-    """, (user_id, step, extra))
-    conn.commit()
-    conn.close()
+    """Set user setup state"""
+    db = _get_db()
+    db.user_setup_state.update_one(
+        {"user_id": user_id},
+        {"$set": {"setup_step": step, "extra_data": extra, "updated_at": datetime.utcnow()}},
+        upsert=True
+    )
 
 
 def get_user_setup_state(user_id: int) -> tuple:
     """Returns (step, extra_data)"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT setup_step, extra_data FROM user_setup_state WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return (result[0], result[1]) if result else (None, None)
+    db = _get_db()
+    state = db.user_setup_state.find_one({"user_id": user_id})
+    if state:
+        return (state.get("setup_step"), state.get("extra_data"))
+    return (None, None)
 
 
 def clear_user_setup_state(user_id: int) -> None:
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM user_setup_state WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    """Clear user setup state"""
+    db = _get_db()
+    db.user_setup_state.delete_one({"user_id": user_id})
 
 
 # ─── Legacy Compatibility ────────────────────────────────────────────────────
 
 def user_has_credentials(user_id: int) -> bool:
+    """Check if user has any accounts"""
     accounts = get_user_accounts(user_id)
     return len(accounts) > 0
 
@@ -319,25 +281,24 @@ def store_user_credentials(user_id: int, access_token: str = None, client_id: st
     """Legacy: store credentials as Account 1"""
     accounts = get_user_accounts(user_id)
     if accounts:
-        conn = _conn()
-        c = conn.cursor()
+        db = _get_db()
+        update = {"updated_at": datetime.utcnow()}
         if access_token:
-            c.execute("UPDATE user_accounts SET access_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                      (access_token, accounts[0]["id"]))
+            update["access_token"] = access_token
         if client_id:
-            c.execute("UPDATE user_accounts SET client_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                      (client_id, accounts[0]["id"]))
-        conn.commit()
-        conn.close()
+            update["client_id"] = client_id
+        db.user_accounts.update_one({"_id": accounts[0]["id"]}, {"$set": update})
     else:
         add_account(user_id, "Account 1", access_token or "", client_id or "")
 
 
 def log_scrape_history(user_id: int, site_name: str, course_count: int) -> None:
+    """Legacy: no-op"""
     pass
 
 
 def get_user_stats(user_id: int) -> dict:
+    """Get user statistics"""
     accounts = get_user_accounts(user_id)
     state = get_auto_enroll_state(user_id)
     return {
@@ -348,14 +309,17 @@ def get_user_stats(user_id: int) -> dict:
 
 
 def validate_token_format(token: str) -> bool:
+    """Validate access token format"""
     return bool(token) and len(token) > 20
 
 
 def validate_client_id_format(client_id: str) -> bool:
+    """Validate client ID format"""
     return bool(client_id) and len(client_id) >= 2
 
 
 def get_setup_instructions() -> str:
+    """Return setup instructions"""
     return """
 🔐 **How to get Udemy cookies:**
 
@@ -372,21 +336,19 @@ Send them when asked!
 
 
 def delete_user_data(user_id: int) -> bool:
-    conn = _conn()
-    c = conn.cursor()
+    """Delete all data for a user"""
     try:
-        c.execute("DELETE FROM user_accounts WHERE user_id = ?", (user_id,))
-        c.execute("DELETE FROM user_setup_state WHERE user_id = ?", (user_id,))
-        c.execute("DELETE FROM enrolled_courses WHERE user_id = ?", (user_id,))
-        c.execute("DELETE FROM auto_enroll_state WHERE user_id = ?", (user_id,))
-        c.execute("DELETE FROM daily_usage WHERE user_id = ?", (user_id,))
-        conn.commit()
+        db = _get_db()
+        db.user_accounts.delete_many({"user_id": user_id})
+        db.user_setup_state.delete_one({"user_id": user_id})
+        db.enrolled_courses.delete_many({"user_id": user_id})
+        db.auto_enroll_state.delete_one({"user_id": user_id})
+        db.daily_usage.delete_many({"user_id": user_id})
+        db.premium_users.delete_one({"user_id": user_id})
         return True
     except Exception as e:
         log.error(f"Error deleting user data: {e}")
         return False
-    finally:
-        conn.close()
 
 
 # ─── Premium & Access Control ─────────────────────────────────────────────────
@@ -400,91 +362,78 @@ def is_premium(user_id: int) -> bool:
     """Check if user has premium access"""
     if is_owner(user_id):
         return True
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM premium_users WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    db = _get_db()
+    return db.premium_users.find_one({"user_id": user_id}) is not None
 
 
 def grant_premium(user_id: int, granted_by: int) -> bool:
     """Grant premium access to a user"""
-    conn = _conn()
-    c = conn.cursor()
     try:
-        c.execute("""
-            INSERT OR REPLACE INTO premium_users (user_id, granted_by, granted_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-        """, (user_id, granted_by))
-        conn.commit()
+        db = _get_db()
+        db.premium_users.update_one(
+            {"user_id": user_id},
+            {"$set": {"user_id": user_id, "granted_by": granted_by, "granted_at": datetime.utcnow()}},
+            upsert=True
+        )
         return True
     except Exception as e:
         log.error(f"Error granting premium: {e}")
         return False
-    finally:
-        conn.close()
 
 
 def revoke_premium(user_id: int) -> bool:
     """Revoke premium access from a user"""
-    conn = _conn()
-    c = conn.cursor()
     try:
-        c.execute("DELETE FROM premium_users WHERE user_id = ?", (user_id,))
-        conn.commit()
+        db = _get_db()
+        db.premium_users.delete_one({"user_id": user_id})
         return True
     except Exception as e:
         log.error(f"Error revoking premium: {e}")
         return False
-    finally:
-        conn.close()
 
 
 def get_all_premium_users() -> list:
     """Get all premium users"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT user_id, granted_by, granted_at FROM premium_users")
-    rows = c.fetchall()
-    conn.close()
-    return [{"user_id": r[0], "granted_by": r[1], "granted_at": r[2]} for r in rows]
+    db = _get_db()
+    users = db.premium_users.find()
+    return [
+        {
+            "user_id": u["user_id"],
+            "granted_by": u.get("granted_by"),
+            "granted_at": str(u.get("granted_at", ""))[:10]
+        }
+        for u in users
+    ]
 
 
 # ─── Daily Usage Limits ───────────────────────────────────────────────────────
 
 def get_today_str() -> str:
     """Get today's date as string YYYY-MM-DD"""
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
 
 def get_daily_usage(user_id: int) -> int:
     """Get number of enrollments today for a user"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT enroll_count FROM daily_usage WHERE user_id = ? AND date = ?",
-              (user_id, get_today_str()))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else 0
+    db = _get_db()
+    today = get_today_str()
+    doc = db.daily_usage.find_one({"user_id": user_id, "date": today})
+    return doc["enroll_count"] if doc else 0
 
 
 def increment_daily_usage(user_id: int, count: int = 1) -> int:
     """Increment daily usage count. Returns new total."""
+    db = _get_db()
     today = get_today_str()
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO daily_usage (user_id, date, enroll_count)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, date) DO UPDATE SET enroll_count = enroll_count + ?
-    """, (user_id, today, count, count))
-    conn.commit()
-    c.execute("SELECT enroll_count FROM daily_usage WHERE user_id = ? AND date = ?",
-              (user_id, today))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else count
+    
+    result = db.daily_usage.find_one_and_update(
+        {"user_id": user_id, "date": today},
+        {"$inc": {"enroll_count": count}},
+        upsert=True,
+        return_document=True
+    )
+    
+    return result["enroll_count"] if result else count
 
 
 def get_remaining_today(user_id: int) -> int:
@@ -505,57 +454,58 @@ def can_enroll(user_id: int, count: int = 1) -> tuple:
 
 def cleanup_old_usage(days: int = 30) -> int:
     """Clean up usage records older than X days"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM daily_usage WHERE date < date('now', '-' || ? || ' days')", (days,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
-    return deleted
+    db = _get_db()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    result = db.daily_usage.delete_many({"date": {"$lt": cutoff}})
+    return result.deleted_count
 
 
 def get_all_daily_stats() -> dict:
     """Get today's enrollment stats for all users. Returns dict with user stats."""
+    db = _get_db()
     today = get_today_str()
-    conn = _conn()
-    c = conn.cursor()
     
     # Get all users with today's usage
-    c.execute("""
-        SELECT user_id, enroll_count FROM daily_usage WHERE date = ?
-        ORDER BY enroll_count DESC
-    """, (today,))
-    rows = c.fetchall()
+    users = list(db.daily_usage.find({"date": today}).sort("enroll_count", -1))
     
     # Get total for today
-    c.execute("SELECT SUM(enroll_count) FROM daily_usage WHERE date = ?", (today,))
-    total_result = c.fetchone()
-    total_today = total_result[0] if total_result and total_result[0] else 0
+    pipeline = [
+        {"$match": {"date": today}},
+        {"$group": {"_id": None, "total": {"$sum": "$enroll_count"}}}
+    ]
+    today_agg = list(db.daily_usage.aggregate(pipeline))
+    total_today = today_agg[0]["total"] if today_agg else 0
     
-    # Get all-time total (all dates)
-    c.execute("SELECT SUM(enroll_count) FROM daily_usage")
-    all_result = c.fetchone()
-    all_time = all_result[0] if all_result and all_result[0] else 0
-    
-    conn.close()
+    # Get all-time total
+    all_agg = list(db.daily_usage.aggregate([
+        {"$group": {"_id": None, "total": {"$sum": "$enroll_count"}}}
+    ]))
+    all_time = all_agg[0]["total"] if all_agg else 0
     
     return {
         "today_total": total_today,
         "all_time_total": all_time,
-        "users": [{"user_id": r[0], "count": r[1]} for r in rows],
+        "users": [{"user_id": u["user_id"], "count": u["enroll_count"]} for u in users],
         "date": today
     }
 
 
 def get_user_total_enrollments(user_id: int) -> int:
     """Get total enrollments for a user across all time"""
-    conn = _conn()
-    c = conn.cursor()
-    c.execute("SELECT SUM(enroll_count) FROM daily_usage WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result and result[0] else 0
+    db = _get_db()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {"_id": None, "total": {"$sum": "$enroll_count"}}}
+    ]
+    result = list(db.daily_usage.aggregate(pipeline))
+    return result[0]["total"] if result else 0
 
 
-# Initialize
-init_enroller_db()
+# Initialize on import
+try:
+    if MONGODB_URI:
+        init_enroller_db()
+    else:
+        log.warning("MONGODB_URI not set - database features disabled")
+except Exception as e:
+    log.error(f"Failed to initialize MongoDB: {e}")
