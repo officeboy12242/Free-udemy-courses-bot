@@ -64,6 +64,7 @@ from multiuser_enroller_bot import (
     cmd_grant_premium,
     cmd_revoke_premium,
     cmd_list_premium,
+    cmd_stats,
 )
 from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
 from movie_service import (
@@ -277,6 +278,7 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 /grant_premium &lt;user_id&gt; — give premium access
 /revoke_premium &lt;user_id&gt; — remove premium
 /list_premium — show all premium users
+/stats — enrollment stats for all users
 
 <b>🔧 Utility:</b>
 /start — this menu
@@ -413,6 +415,10 @@ Remove premium access from a user.
 
 <b>/list_premium</b>
 Show all premium users.
+
+<b>/stats</b>
+View enrollment stats: today's total, all-time total,
+and breakdown by user (owner/premium/free).
 
 <b>📽️ MOVIES</b>
 /movies — browse latest movies
@@ -1650,6 +1656,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("grant_premium", cmd_grant_premium))
     app.add_handler(CommandHandler("revoke_premium", cmd_revoke_premium))
     app.add_handler(CommandHandler("list_premium", cmd_list_premium))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))

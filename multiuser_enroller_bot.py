@@ -25,6 +25,7 @@ from user_enroller import (
     # Premium & Access Control
     is_owner, is_premium, grant_premium, revoke_premium, get_all_premium_users,
     can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
+    get_all_daily_stats, get_daily_usage, get_user_total_enrollments,
 )
 
 log = logging.getLogger(__name__)
@@ -114,6 +115,41 @@ async def cmd_list_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lines = ["👑 **Premium Users:**\n"]
     for u in users:
         lines.append(f"• `{u['user_id']}` (granted: {u['granted_at'][:10]})")
+    
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show enrollment stats for all users (owner only)"""
+    if not update.effective_user or not update.effective_message:
+        return
+    
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+    
+    stats = get_all_daily_stats()
+    
+    lines = [
+        "📊 **Enrollment Statistics**\n",
+        f"📅 Date: {stats['date']}",
+        f"✅ Today Total: **{stats['today_total']}** courses",
+        f"📈 All-Time Total: **{stats['all_time_total']}** courses",
+        "",
+        "👥 **Today's Enrollments by User:**"
+    ]
+    
+    if stats['users']:
+        for i, u in enumerate(stats['users'][:20], 1):  # Top 20
+            user_type = "👑" if is_owner(u['user_id']) else ("💎" if is_premium(u['user_id']) else "👤")
+            lines.append(f"{i}. {user_type} `{u['user_id']}`: {u['count']} courses")
+        
+        if len(stats['users']) > 20:
+            lines.append(f"... and {len(stats['users']) - 20} more users")
+    else:
+        lines.append("No enrollments today yet.")
+    
+    lines.append("\n_Legend: 👑=Owner 💎=Premium 👤=Free_")
     
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -824,8 +860,8 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
             total_expired += result["expired"]
             total_failed += result["failed"]
         
-        # Track daily usage for free users (count actual new enrollments)
-        if not user_is_premium and total_enrolled:
+        # Track daily usage for ALL users (for stats)
+        if total_enrolled:
             increment_daily_usage(user_id, len(total_enrolled))
         
         # Update state
@@ -925,6 +961,10 @@ async def auto_enroll_job(app: Application) -> None:
                     last_course_id=courses[0].url if courses else None,
                     enrolled_count=len(all_enrolled)
                 )
+                
+                # Track daily usage for stats
+                if all_enrolled:
+                    increment_daily_usage(user_id, len(all_enrolled))
                 
                 # Notify user only if something new was enrolled
                 if all_enrolled:

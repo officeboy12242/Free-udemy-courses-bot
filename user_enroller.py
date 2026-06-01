@@ -514,5 +514,48 @@ def cleanup_old_usage(days: int = 30) -> int:
     return deleted
 
 
+def get_all_daily_stats() -> dict:
+    """Get today's enrollment stats for all users. Returns dict with user stats."""
+    today = get_today_str()
+    conn = _conn()
+    c = conn.cursor()
+    
+    # Get all users with today's usage
+    c.execute("""
+        SELECT user_id, enroll_count FROM daily_usage WHERE date = ?
+        ORDER BY enroll_count DESC
+    """, (today,))
+    rows = c.fetchall()
+    
+    # Get total for today
+    c.execute("SELECT SUM(enroll_count) FROM daily_usage WHERE date = ?", (today,))
+    total_result = c.fetchone()
+    total_today = total_result[0] if total_result and total_result[0] else 0
+    
+    # Get all-time total (all dates)
+    c.execute("SELECT SUM(enroll_count) FROM daily_usage")
+    all_result = c.fetchone()
+    all_time = all_result[0] if all_result and all_result[0] else 0
+    
+    conn.close()
+    
+    return {
+        "today_total": total_today,
+        "all_time_total": all_time,
+        "users": [{"user_id": r[0], "count": r[1]} for r in rows],
+        "date": today
+    }
+
+
+def get_user_total_enrollments(user_id: int) -> int:
+    """Get total enrollments for a user across all time"""
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT SUM(enroll_count) FROM daily_usage WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result and result[0] else 0
+
+
 # Initialize
 init_enroller_db()
