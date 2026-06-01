@@ -348,7 +348,26 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     
     user_id = update.effective_user.id
-    accounts = get_user_accounts(user_id)
+    
+    # Try to get accounts with timeout
+    try:
+        accounts = await asyncio.wait_for(
+            asyncio.to_thread(get_user_accounts, user_id),
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        await update.effective_message.reply_text(
+            "⏱️ Database connection timed out. Please try again.",
+            parse_mode="Markdown"
+        )
+        return
+    except Exception as e:
+        log.error(f"Error getting accounts: {e}")
+        await update.effective_message.reply_text(
+            f"❌ Database error: {str(e)[:100]}\nPlease try again later.",
+            parse_mode="Markdown"
+        )
+        return
     
     if not accounts:
         await update.effective_message.reply_text(

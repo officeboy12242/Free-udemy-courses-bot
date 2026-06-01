@@ -25,51 +25,66 @@ _db = None
 
 
 def _get_db():
-    """Get MongoDB database connection (lazy initialization)"""
+    """Get MongoDB database connection (lazy initialization with auto-reconnect)"""
     global _client, _db
-    if _db is None:
-        if not MONGODB_URI:
-            raise ValueError("MONGODB_URI environment variable not set")
-        
-        # Try connection with different TLS settings
-        import ssl
-        
-        # First try: with certifi certificates
+    
+    if not MONGODB_URI:
+        raise ValueError("MONGODB_URI environment variable not set")
+    
+    # Check if connection is healthy
+    if _client is not None:
         try:
-            import certifi
-            _client = MongoClient(
-                MONGODB_URI,
-                tls=True,
-                tlsCAFile=certifi.where(),
-                serverSelectionTimeoutMS=30000,
-                connectTimeoutMS=30000,
-                socketTimeoutMS=30000,
-                retryWrites=True,
-            )
             _client.admin.command('ping')
-            log.info("Connected to MongoDB with certifi")
-        except Exception as e1:
-            log.warning(f"Certifi connection failed: {e1}")
-            
-            # Second try: with tlsAllowInvalidCertificates (less secure but works)
-            try:
-                _client = MongoClient(
-                    MONGODB_URI,
-                    tls=True,
-                    tlsAllowInvalidCertificates=True,
-                    serverSelectionTimeoutMS=30000,
-                    connectTimeoutMS=30000,
-                    socketTimeoutMS=30000,
-                    retryWrites=True,
-                )
-                _client.admin.command('ping')
-                log.info("Connected to MongoDB with tlsAllowInvalidCertificates")
-            except Exception as e2:
-                log.error(f"Both connection methods failed: {e2}")
-                raise
-        
+            return _db
+        except Exception:
+            log.warning("MongoDB connection lost, reconnecting...")
+            _client = None
+            _db = None
+    
+    # Try connection with different TLS settings
+    log.info("Connecting to MongoDB...")
+    
+    # First try: with certifi certificates
+    try:
+        import certifi
+        _client = MongoClient(
+            MONGODB_URI,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+            retryWrites=True,
+            retryReads=True,
+        )
+        _client.admin.command('ping')
         _db = _client.udemy_enroller
-    return _db
+        log.info("Connected to MongoDB with certifi")
+        return _db
+    except Exception as e1:
+        log.warning(f"Certifi connection failed: {e1}")
+    
+    # Second try: with tlsAllowInvalidCertificates
+    try:
+        _client = MongoClient(
+            MONGODB_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+            retryWrites=True,
+            retryReads=True,
+        )
+        _client.admin.command('ping')
+        _db = _client.udemy_enroller
+        log.info("Connected to MongoDB with tlsAllowInvalidCertificates")
+        return _db
+    except Exception as e2:
+        log.error(f"Both connection methods failed: {e2}")
+        _client = None
+        _db = None
+        raise ConnectionError(f"Cannot connect to MongoDB: {e2}")
 
 
 def init_enroller_db():
