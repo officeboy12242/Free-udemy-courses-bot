@@ -306,7 +306,7 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
 # ─── Account Management ──────────────────────────────────────────────────────
 
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show and manage accounts"""
+    """Show and manage accounts with course counts"""
     if not update.effective_user or not update.effective_message:
         return
     
@@ -320,11 +320,27 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     
+    # Show loading message while fetching course counts
+    msg = await update.effective_message.reply_text("🔄 Loading accounts...")
+    
     lines = ["🎓 **Your Udemy Accounts:**\n"]
     keyboard = []
+    
     for a in accounts:
         auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
-        lines.append(f"**{a['name']}** (ID: {a['id']}) — {auto}")
+        
+        # Fetch course count for this account
+        try:
+            enroller = UdemyAutoEnroller(a["access_token"], a["client_id"])
+            course_count = await asyncio.to_thread(enroller.get_total_courses_count)
+            if course_count >= 0:
+                count_str = f"📚 {course_count} courses"
+            else:
+                count_str = "⚠️ Token expired"
+        except Exception:
+            count_str = "❓ Unknown"
+        
+        lines.append(f"**{a['name']}** — {auto}\n   {count_str}")
         keyboard.append([
             InlineKeyboardButton(
                 f"{'🔴 Disable' if a['auto_enroll'] else '🟢 Enable'} Auto - {a['name']}",
@@ -334,8 +350,9 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ])
     
     keyboard.append([InlineKeyboardButton("➕ Add Account", callback_data="setup_add_new")])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="show_accounts")])
     
-    await update.effective_message.reply_text(
+    await msg.edit_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
@@ -650,7 +667,45 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     
     elif data == "show_accounts":
-        await cmd_accounts(update, context)
+        # Refresh accounts display
+        user_id = query.from_user.id
+        accounts = get_user_accounts(user_id)
+        
+        if not accounts:
+            await query.edit_message_text("No accounts. Run `/enroll_setup`.", parse_mode="Markdown")
+            return
+        
+        await query.edit_message_text("🔄 Loading accounts...")
+        
+        lines = ["🎓 **Your Udemy Accounts:**\n"]
+        keyboard = []
+        
+        for a in accounts:
+            auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
+            try:
+                enroller = UdemyAutoEnroller(a["access_token"], a["client_id"])
+                course_count = await asyncio.to_thread(enroller.get_total_courses_count)
+                count_str = f"📚 {course_count} courses" if course_count >= 0 else "⚠️ Token expired"
+            except Exception:
+                count_str = "❓ Unknown"
+            
+            lines.append(f"**{a['name']}** — {auto}\n   {count_str}")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{'🔴 Disable' if a['auto_enroll'] else '🟢 Enable'} Auto - {a['name']}",
+                    callback_data=f"acc_toggle_{a['id']}"
+                ),
+                InlineKeyboardButton(f"🗑️ Remove", callback_data=f"acc_remove_{a['id']}"),
+            ])
+        
+        keyboard.append([InlineKeyboardButton("➕ Add Account", callback_data="setup_add_new")])
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="show_accounts")])
+        
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
     
     elif data == "clear_my_data":
         keyboard = [[

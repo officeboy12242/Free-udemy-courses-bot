@@ -127,6 +127,18 @@ class UdemyAutoEnroller:
                     self.enrolled_slugs.add(slug)
             next_page = data.get("next")
     
+    def get_total_courses_count(self) -> int:
+        """Get total number of courses in the Udemy account"""
+        try:
+            r = self._get("https://www.udemy.com/api-2.0/users/me/subscribed-courses/?page_size=1")
+            if r and r.status_code == 200:
+                data = r.json()
+                return data.get("count", 0)
+            return -1  # Error
+        except Exception as e:
+            log.debug(f"Failed to get course count: {e}")
+            return -1
+    
     @staticmethod
     def _extract_slug(url: str) -> str:
         try:
