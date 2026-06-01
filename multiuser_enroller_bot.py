@@ -342,6 +342,83 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─── Account Management ──────────────────────────────────────────────────────
 
+async def _refresh_accounts_view(query) -> None:
+    """Refresh accounts view - runs as independent background task"""
+    try:
+        user_id = query.from_user.id
+        
+        # Get accounts from DB (with timeout)
+        try:
+            accounts = await asyncio.wait_for(
+                asyncio.to_thread(get_user_accounts, user_id),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            await query.message.reply_text("⏱️ Database timeout. Try again.")
+            return
+        except Exception as e:
+            await query.message.reply_text(f"❌ Error: {str(e)[:50]}")
+            return
+        
+        if not accounts:
+            await query.message.reply_text("No accounts. Run `/enroll_setup`.", parse_mode="Markdown")
+            return
+        
+        # Send new message immediately with "loading" for course counts
+        lines = ["🎓 **Your Udemy Accounts:**\n"]
+        keyboard = []
+        
+        for a in accounts:
+            auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
+            lines.append(f"**{a['name']}** — {auto}\n   ⏳ Loading...")
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{'🔴 Disable' if a['auto_enroll'] else '🟢 Enable'} Auto - {a['name']}",
+                    callback_data=f"acc_toggle_{a['id']}"
+                ),
+                InlineKeyboardButton(f"🗑️ Remove", callback_data=f"acc_remove_{a['id']}"),
+            ])
+        
+        keyboard.append([InlineKeyboardButton("➕ Add Account", callback_data="setup_add_new")])
+        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="show_accounts")])
+        
+        # Send NEW message (doesn't interfere with enrollment)
+        msg = await query.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        
+        # Fetch course counts in PARALLEL for all accounts
+        async def get_course_count(acc):
+            try:
+                enroller = UdemyAutoEnroller(acc["access_token"], acc["client_id"])
+                count = await asyncio.to_thread(enroller.get_total_courses_count)
+                return acc["id"], count
+            except Exception:
+                return acc["id"], -1
+        
+        tasks = [get_course_count(a) for a in accounts]
+        results = await asyncio.gather(*tasks)
+        counts = {acc_id: count for acc_id, count in results}
+        
+        # Update message with actual counts
+        lines = ["🎓 **Your Udemy Accounts:**\n"]
+        for a in accounts:
+            auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
+            count = counts.get(a["id"], -1)
+            count_str = f"📚 {count} courses" if count >= 0 else "⚠️ Token expired"
+            lines.append(f"**{a['name']}** — {auto}\n   {count_str}")
+        
+        await msg.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.error(f"Refresh accounts error: {e}")
+
+
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show and manage accounts with course counts"""
     if not update.effective_user or not update.effective_message:
@@ -379,22 +456,26 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Show loading message while fetching course counts
     msg = await update.effective_message.reply_text("🔄 Loading accounts...")
     
+    # Fetch ALL course counts in PARALLEL
+    async def get_course_count(acc):
+        try:
+            enroller = UdemyAutoEnroller(acc["access_token"], acc["client_id"])
+            count = await asyncio.to_thread(enroller.get_total_courses_count)
+            return acc["id"], count
+        except Exception:
+            return acc["id"], -1
+    
+    tasks = [get_course_count(a) for a in accounts]
+    results = await asyncio.gather(*tasks)
+    counts = {acc_id: count for acc_id, count in results}
+    
     lines = ["🎓 **Your Udemy Accounts:**\n"]
     keyboard = []
     
     for a in accounts:
         auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
-        
-        # Fetch course count for this account
-        try:
-            enroller = UdemyAutoEnroller(a["access_token"], a["client_id"])
-            course_count = await asyncio.to_thread(enroller.get_total_courses_count)
-            if course_count >= 0:
-                count_str = f"📚 {course_count} courses"
-            else:
-                count_str = "⚠️ Token expired"
-        except Exception:
-            count_str = "❓ Unknown"
+        count = counts.get(a["id"], -1)
+        count_str = f"📚 {count} courses" if count >= 0 else "⚠️ Token expired"
         
         lines.append(f"**{a['name']}** — {auto}\n   {count_str}")
         keyboard.append([
@@ -723,45 +804,9 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     
     elif data == "show_accounts":
-        # Refresh accounts display
-        user_id = query.from_user.id
-        accounts = get_user_accounts(user_id)
-        
-        if not accounts:
-            await query.edit_message_text("No accounts. Run `/enroll_setup`.", parse_mode="Markdown")
-            return
-        
-        await query.edit_message_text("🔄 Loading accounts...")
-        
-        lines = ["🎓 **Your Udemy Accounts:**\n"]
-        keyboard = []
-        
-        for a in accounts:
-            auto = "🟢 Auto" if a["auto_enroll"] else "🔴 Manual"
-            try:
-                enroller = UdemyAutoEnroller(a["access_token"], a["client_id"])
-                course_count = await asyncio.to_thread(enroller.get_total_courses_count)
-                count_str = f"📚 {course_count} courses" if course_count >= 0 else "⚠️ Token expired"
-            except Exception:
-                count_str = "❓ Unknown"
-            
-            lines.append(f"**{a['name']}** — {auto}\n   {count_str}")
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{'🔴 Disable' if a['auto_enroll'] else '🟢 Enable'} Auto - {a['name']}",
-                    callback_data=f"acc_toggle_{a['id']}"
-                ),
-                InlineKeyboardButton(f"🗑️ Remove", callback_data=f"acc_remove_{a['id']}"),
-            ])
-        
-        keyboard.append([InlineKeyboardButton("➕ Add Account", callback_data="setup_add_new")])
-        keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="show_accounts")])
-        
-        await query.edit_message_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        # Refresh accounts display - runs as independent task
+        await query.answer("🔄 Refreshing...")
+        asyncio.create_task(_refresh_accounts_view(query))
     
     elif data == "clear_my_data":
         keyboard = [[
