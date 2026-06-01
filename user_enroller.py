@@ -109,8 +109,11 @@ def init_enroller_db():
 
 # ─── Account Management ──────────────────────────────────────────────────────
 
-def add_account(user_id: int, account_name: str, access_token: str, client_id: str) -> int:
-    """Add a new Udemy account for user. Returns account ID."""
+DEFAULT_CLIENT_ID = "bd2565cb7b0c313f5e9bae44961e8db2"
+
+
+def add_account(user_id: int, account_name: str, access_token: str, client_id: str = None) -> int:
+    """Add a new Udemy account for user. Returns account ID. Uses default client_id if not provided."""
     db = _get_db()
     
     # Generate a simple incrementing ID
@@ -127,7 +130,7 @@ def add_account(user_id: int, account_name: str, access_token: str, client_id: s
         "user_id": user_id,
         "account_name": account_name,
         "access_token": access_token,
-        "client_id": client_id,
+        "client_id": client_id or DEFAULT_CLIENT_ID,
         "is_active": True,
         "auto_enroll": True,
         "created_at": datetime.utcnow(),
@@ -372,17 +375,15 @@ def validate_client_id_format(client_id: str) -> bool:
 def get_setup_instructions() -> str:
     """Return setup instructions"""
     return """
-🔐 **How to get Udemy cookies:**
+🔐 **How to get your Udemy access token:**
 
 1. Open https://www.udemy.com in your browser
 2. Log in with your Udemy account
 3. Press **F12** → **Application** tab
-4. Select **Cookies** → `udemy.com`
-5. Copy these values:
-   - `access_token` (long string)
-   - `client_id` (short hex string)
+4. Click **Cookies** → `www.udemy.com`
+5. Find `access_token` and copy its value
 
-Send them when asked!
+That's it! Just send the `access_token` value.
 """
 
 

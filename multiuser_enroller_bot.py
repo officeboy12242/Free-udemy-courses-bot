@@ -229,7 +229,7 @@ async def cmd_enroll_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set access token via command"""
+    """Set access token via command - now completes setup directly (no client_id needed)"""
     if not update.effective_user or not update.effective_message or not context.args:
         await update.effective_message.reply_text("Usage: `/set_token <your_token>`", parse_mode="Markdown")
         return
@@ -241,41 +241,11 @@ async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("❌ Token too short (need 20+ chars)")
         return
     
-    set_user_setup_state(user_id, "waiting_client_new", None)
-    context.user_data["pending_token"] = token
-    
-    await update.effective_message.reply_text(
-        "✅ Token received!\n\nNow send: `/set_client_id <your_client_id>`",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_set_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set client ID via command"""
-    if not update.effective_user or not update.effective_message or not context.args:
-        await update.effective_message.reply_text("Usage: `/set_client_id <your_client_id>`", parse_mode="Markdown")
-        return
-    
-    user_id = update.effective_user.id
-    client_id = " ".join(context.args)
-    
-    if not validate_client_id_format(client_id):
-        await update.effective_message.reply_text("❌ Invalid client_id format")
-        return
-    
-    token = context.user_data.get("pending_token")
-    if not token:
-        await update.effective_message.reply_text(
-            "❌ No token found. Send `/set_token <token>` first.",
-            parse_mode="Markdown"
-        )
-        return
-    
+    # Add account directly with default client_id
     accounts = get_user_accounts(user_id)
     name = f"Account {len(accounts) + 1}"
-    acc_id = add_account(user_id, name, token, client_id)
+    acc_id = add_account(user_id, name, token, None)  # client_id defaults automatically
     clear_user_setup_state(user_id)
-    context.user_data.pop("pending_token", None)
     
     await update.effective_message.reply_text(
         f"🎉 **Setup Complete!**\n\n"
@@ -307,27 +277,11 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if not validate_token_format(text):
             await update.effective_message.reply_text("❌ Token too short. Copy the full `access_token` cookie value.")
             return
-        context.user_data["pending_token"] = text
-        context.user_data["pending_account_name"] = extra or "Account 1"
-        set_user_setup_state(user_id, "waiting_client_new")
-        await update.effective_message.reply_text("✅ Token saved!\n\nNow send your `client_id`:")
-    
-    elif step == "waiting_client_new":
-        if not validate_client_id_format(text):
-            await update.effective_message.reply_text("❌ Invalid client_id.")
-            return
         
-        token = context.user_data.get("pending_token")
-        if not token:
-            await update.effective_message.reply_text("❌ Session expired. Start again with `/enroll_setup`")
-            clear_user_setup_state(user_id)
-            return
-        
-        name = context.user_data.get("pending_account_name", "Account")
-        acc_id = add_account(user_id, name, token, text)
+        # Add account directly - no client_id needed!
+        name = extra or "Account 1"
+        acc_id = add_account(user_id, name, text, None)  # client_id defaults automatically
         clear_user_setup_state(user_id)
-        context.user_data.pop("pending_token", None)
-        context.user_data.pop("pending_account_name", None)
         
         await update.effective_message.reply_text(
             f"🎉 **Setup Complete!**\n\n"
@@ -752,10 +706,6 @@ async def setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "setup_update_token":
         set_user_setup_state(user_id, "waiting_token_new")
         await query.edit_message_text("📝 Send your new `access_token`:")
-    
-    elif data == "setup_update_client_id":
-        set_user_setup_state(user_id, "waiting_client_new")
-        await query.edit_message_text("📝 Send your new `client_id`:")
     
     elif data == "setup_keep_current":
         await query.edit_message_text("✅ Keeping current setup.")

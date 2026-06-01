@@ -41,15 +41,18 @@ class Course:
         return f"Course({self.title[:30]})"
 
 
+DEFAULT_CLIENT_ID = "bd2565cb7b0c313f5e9bae44961e8db2"
+
+
 class UdemyAutoEnroller:
     """
     Enrolls user in Udemy courses using access_token and client_id cookies.
     Uses bulk checkout with one-by-one fallback.
     """
     
-    def __init__(self, access_token: str, client_id: str):
+    def __init__(self, access_token: str, client_id: str = None):
         self.access_token = access_token
-        self.client_id = client_id
+        self.client_id = client_id or DEFAULT_CLIENT_ID
         self.session = requests.Session()
         self.session.cookies.update({
             "access_token": access_token,
