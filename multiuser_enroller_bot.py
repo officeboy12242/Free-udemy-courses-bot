@@ -997,64 +997,80 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         total_failed = 0
         limit_reached = False
         
-        for i, account in enumerate(accounts):
-            # Check remaining limit for free users BEFORE each account
-            if not user_is_premium:
-                current_remaining = get_remaining_today(user_id)
-                if current_remaining <= 0:
-                    limit_reached = True
-                    break
-                # Limit courses for this account
-                courses_for_account = courses[:current_remaining]
-            else:
-                courses_for_account = courses
-            
-            bar = _progress_bar(i, len(accounts))
+        # For free users, limit courses
+        if not user_is_premium:
+            courses_for_enrollment = courses[:remaining]
+        else:
+            courses_for_enrollment = courses
+        
+        # Show progress - enrolling all accounts simultaneously
+        try:
+            await msg.edit_text(
+                f"🚀 **Enrolling ALL {len(accounts)} accounts simultaneously...**\n\n"
+                f"📚 Courses to process: {len(courses_for_enrollment)}\n"
+                f"{limit_info}\n\n"
+                f"⏳ Please wait...",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        
+        # Enroll ALL accounts SIMULTANEOUSLY using asyncio.gather
+        async def enroll_single_account(account, courses_list):
+            """Enroll a single account - runs in parallel with others"""
             try:
-                await msg.edit_text(
-                    f"🚀 **Enrolling...**\n\n"
-                    f"Account: {account['name']} ({i+1}/{len(accounts)})\n"
-                    f"{bar}\n"
-                    f"Courses to process: {len(courses_for_account)}\n"
-                    f"{limit_info}\n\n"
-                    f"✅ Enrolled so far: {len(total_enrolled)}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+                result = await asyncio.to_thread(_enroll_account_in_courses, account, courses_list)
+                return {"account": account, "result": result, "error": None}
+            except Exception as e:
+                return {"account": account, "result": None, "error": str(e)}
+        
+        # Launch all accounts in parallel
+        tasks = [enroll_single_account(acc, courses_for_enrollment) for acc in accounts]
+        results = await asyncio.gather(*tasks)
+        
+        # Process results from all parallel enrollments
+        failed_accounts = []
+        for res in results:
+            account = res["account"]
             
-            result = await asyncio.to_thread(_enroll_account_in_courses, account, courses_for_account)
-            
-            if result["error"]:
-                total_failed += len(courses_for_account)
-                try:
-                    await msg.edit_text(
-                        f"⚠️ {account['name']}: {result['error']}\n"
-                        "Token may be expired. Update with `/enroll_setup`.",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+            if res["error"]:
+                total_failed += len(courses_for_enrollment)
+                failed_accounts.append(account["name"])
                 continue
             
-            # Log enrollments and track usage IMMEDIATELY
-            enrolled_count = len(result["enrolled"])
+            result = res["result"]
+            if result["error"]:
+                total_failed += len(courses_for_enrollment)
+                failed_accounts.append(account["name"])
+                continue
+            
+            # Log enrollments
             for title in result["enrolled"]:
                 log_enrollment(user_id, account["id"], "", title)
-            
-            # Track daily usage immediately after enrollment
-            if enrolled_count > 0:
-                increment_daily_usage(user_id, enrolled_count)
             
             total_enrolled.extend([(t, account["name"]) for t in result["enrolled"]])
             total_already += result["already"]
             total_expired += result["expired"]
             total_failed += result["failed"]
-            
-            # Update limit info for display
-            if not user_is_premium:
-                new_remaining = get_remaining_today(user_id)
-                limit_info = f"📊 Limit: {new_remaining} remaining today"
+        
+        # Track daily usage after all parallel enrollments complete
+        unique_enrolled = len(set(t for t, _ in total_enrolled))
+        if unique_enrolled > 0 and not user_is_premium:
+            increment_daily_usage(user_id, unique_enrolled)
+            new_remaining = get_remaining_today(user_id)
+            limit_info = f"📊 Limit: {new_remaining} remaining today"
+        
+        # Show failed accounts if any
+        if failed_accounts:
+            try:
+                await msg.edit_text(
+                    f"⚠️ Some accounts failed: {', '.join(failed_accounts)}\n"
+                    "Token may be expired. Update with `/enroll_setup`.\n\n"
+                    "Processing other accounts...",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
         
         # Update state
         update_auto_enroll_state(user_id, enrolled_count=len(total_enrolled))
@@ -1164,26 +1180,31 @@ async def auto_enroll_job(app: Application) -> None:
                 else:
                     courses_for_user = courses
                 
-                for acc in user_accs:
-                    # Re-check limit before each account for free users
-                    if not user_is_premium:
-                        current_remaining = get_remaining_today(user_id)
-                        if current_remaining <= 0:
-                            log.info(f"Auto-enroll: user {user_id} hit limit mid-enrollment")
-                            break
-                        courses_for_acc = courses_for_user[:current_remaining]
-                    else:
-                        courses_for_acc = courses_for_user
-                    
+                # Enroll ALL accounts SIMULTANEOUSLY using asyncio.gather
+                async def enroll_single_account(acc, courses_list):
+                    """Enroll a single account - runs in parallel with others"""
                     try:
                         result = await asyncio.to_thread(
-                            _enroll_account_in_courses, acc, courses_for_acc
+                            _enroll_account_in_courses, acc, courses_list
                         )
+                        return {"acc": acc, "result": result, "error": None}
                     except Exception as e:
-                        log.error(f"Auto-enroll error acc {acc['id']}: {e}")
+                        return {"acc": acc, "result": None, "error": str(e)}
+                
+                # Launch all accounts in parallel
+                tasks = [enroll_single_account(acc, courses_for_user) for acc in user_accs]
+                results = await asyncio.gather(*tasks)
+                
+                # Process results
+                total_enrolled = 0
+                for res in results:
+                    acc = res["acc"]
+                    if res["error"]:
+                        log.error(f"Auto-enroll error acc {acc['id']}: {res['error']}")
                         failed_accounts.append(acc["name"])
                         continue
                     
+                    result = res["result"]
                     if result["error"]:
                         log.warning(f"Auto-enroll login failed user {user_id} acc {acc['id']}: {result['error']}")
                         failed_accounts.append(acc["name"])
@@ -1193,10 +1214,11 @@ async def auto_enroll_job(app: Application) -> None:
                     for title in result["enrolled"]:
                         log_enrollment(user_id, acc["id"], title, title)
                         all_enrolled.append((title, acc["name"]))
-                    
-                    # Track daily usage immediately after each account enrollment
-                    if enrolled_count > 0:
-                        increment_daily_usage(user_id, enrolled_count)
+                    total_enrolled += enrolled_count
+                
+                # Track daily usage after all parallel enrollments complete
+                if total_enrolled > 0 and not user_is_premium:
+                    increment_daily_usage(user_id, total_enrolled)
                 
                 # Always update state (last_check timestamp)
                 update_auto_enroll_state(
