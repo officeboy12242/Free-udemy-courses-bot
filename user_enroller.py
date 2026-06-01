@@ -31,22 +31,44 @@ def _get_db():
         if not MONGODB_URI:
             raise ValueError("MONGODB_URI environment variable not set")
         
-        # Add TLS options for Render compatibility
-        import certifi
-        _client = MongoClient(
-            MONGODB_URI,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            serverSelectionTimeoutMS=30000,
-            connectTimeoutMS=30000,
-            socketTimeoutMS=30000,
-            retryWrites=True,
-        )
-        _db = _client.udemy_enroller
+        # Try connection with different TLS settings
+        import ssl
         
-        # Test connection
-        _client.admin.command('ping')
-        log.info("Connected to MongoDB successfully")
+        # First try: with certifi certificates
+        try:
+            import certifi
+            _client = MongoClient(
+                MONGODB_URI,
+                tls=True,
+                tlsCAFile=certifi.where(),
+                serverSelectionTimeoutMS=30000,
+                connectTimeoutMS=30000,
+                socketTimeoutMS=30000,
+                retryWrites=True,
+            )
+            _client.admin.command('ping')
+            log.info("Connected to MongoDB with certifi")
+        except Exception as e1:
+            log.warning(f"Certifi connection failed: {e1}")
+            
+            # Second try: with tlsAllowInvalidCertificates (less secure but works)
+            try:
+                _client = MongoClient(
+                    MONGODB_URI,
+                    tls=True,
+                    tlsAllowInvalidCertificates=True,
+                    serverSelectionTimeoutMS=30000,
+                    connectTimeoutMS=30000,
+                    socketTimeoutMS=30000,
+                    retryWrites=True,
+                )
+                _client.admin.command('ping')
+                log.info("Connected to MongoDB with tlsAllowInvalidCertificates")
+            except Exception as e2:
+                log.error(f"Both connection methods failed: {e2}")
+                raise
+        
+        _db = _client.udemy_enroller
     return _db
 
 
