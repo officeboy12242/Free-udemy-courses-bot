@@ -898,6 +898,8 @@ def _progress_bar(current: int, total: int, width: int = 15) -> str:
 
 def _enroll_account_in_courses(account: dict, courses: list) -> dict:
     """Enroll a single account in the given courses. Returns results dict."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
     enroller = UdemyAutoEnroller(
         access_token=account["access_token"],
         client_id=account["client_id"]
@@ -914,7 +916,10 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
     expired = 0
     failed = 0
     batch = []
+    free_courses = []
     
+    # Step 1: Filter out already enrolled courses (fast, no API call)
+    courses_to_process = []
     for course in courses:
         slug = enroller._extract_slug(course.url)
         if not slug:
@@ -923,53 +928,68 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         if slug in enroller.enrolled_slugs:
             already += 1
             continue
-        
+        courses_to_process.append((course, slug))
+    
+    # Step 2: Validate courses in PARALLEL (4 threads)
+    def validate_course(course_slug_tuple):
+        course, slug = course_slug_tuple
         coupon = course.coupon_code or enroller._extract_coupon(course.url)
         course_id, is_free = enroller._get_course_id_from_page(slug)
-        
         if not course_id:
-            log.debug(f"No course_id for {slug}")
-            failed += 1
-            continue
-        
+            return ("failed", course, None, None, None)
         if is_free:
-            free_result = enroller._free_checkout(course_id)
-            if free_result == "enrolled":
-                enrolled.append(course.title)
-                log.info(f"Free enrolled: {course.title[:40]}")
-            elif free_result == "already":
-                already += 1
-            else:
-                failed += 1
-            continue
-        
+            return ("free", course, course_id, None, None)
         if not coupon:
-            failed += 1
-            continue
-        
+            return ("failed", course, None, None, None)
         if not enroller._check_coupon(course_id, coupon):
-            expired += 1
-            continue
-        
-        batch.append((course_id, coupon, course.title))
-        log.debug(f"Added to batch: {course.title[:30]}")
-        
-        if len(batch) >= 5:
-            log.info(f"Processing batch of {len(batch)} courses")
-            titles = enroller._bulk_checkout(batch)
+            return ("expired", course, None, None, None)
+        return ("valid", course, course_id, coupon, course.title)
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(validate_course, cs): cs for cs in courses_to_process}
+        for future in as_completed(futures):
+            try:
+                status, course, course_id, coupon, title = future.result()
+                if status == "failed":
+                    failed += 1
+                elif status == "expired":
+                    expired += 1
+                elif status == "free":
+                    free_courses.append((course, course_id))
+                elif status == "valid":
+                    batch.append((course_id, coupon, title))
+            except Exception:
+                failed += 1
+    
+    # Step 3: Enroll FREE courses in parallel
+    def enroll_free(course_tuple):
+        course, course_id = course_tuple
+        return enroller._free_checkout(course_id), course.title
+    
+    if free_courses:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(enroll_free, free_courses))
+            for result, title in results:
+                if result == "enrolled":
+                    enrolled.append(title)
+                    log.info(f"Free enrolled: {title[:40]}")
+                elif result == "already":
+                    already += 1
+                else:
+                    failed += 1
+    
+    # Step 4: Bulk checkout coupon courses (batch of 10)
+    if batch:
+        log.info(f"Processing {len(batch)} coupon courses in batches of 10")
+        while batch:
+            chunk = batch[:10]
+            batch = batch[10:]
+            log.info(f"Processing chunk of {len(chunk)} courses")
+            titles = enroller._bulk_checkout(chunk)
             enrolled.extend(titles)
             if titles:
-                log.info(f"Batch enrolled {len(titles)}: {titles}")
-            failed += len(batch) - len(titles)
-            batch.clear()
-    
-    if batch:
-        log.info(f"Processing final batch of {len(batch)} courses")
-        titles = enroller._bulk_checkout(batch)
-        enrolled.extend(titles)
-        if titles:
-            log.info(f"Final batch enrolled {len(titles)}: {titles}")
-        failed += len(batch) - len(titles)
+                log.info(f"Chunk enrolled {len(titles)}: {titles}")
+            failed += len(chunk) - len(titles)
     
     log.info(f"Result: enrolled={len(enrolled)}, already={already}, expired={expired}, failed={failed}")
     return {"enrolled": enrolled, "already": already, "expired": expired, "failed": failed, "error": None}
