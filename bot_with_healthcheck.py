@@ -292,16 +292,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    user = update.effective_user
     
-    # Save user to DB
+    # Check if new user (for notification)
+    is_new_user = False
     con = sqlite3.connect(DB_FILE)
     try:
-        con.execute("INSERT OR IGNORE INTO bot_users (chat_id) VALUES (?)", (chat_id,))
-        con.commit()
+        cursor = con.execute("SELECT 1 FROM bot_users WHERE chat_id = ?", (chat_id,))
+        if cursor.fetchone() is None:
+            is_new_user = True
+            con.execute("INSERT INTO bot_users (chat_id) VALUES (?)", (chat_id,))
+            con.commit()
     except Exception as e:
         log.error("Failed to save user %s: %s", chat_id, e)
     finally:
         con.close()
+    
+    # Notify owner about new user (if not owner themselves)
+    if is_new_user and not is_owner(user_id):
+        from user_enroller import OWNER_ID
+        if OWNER_ID and OWNER_ID != 0:
+            try:
+                username = f"@{user.username}" if user.username else "No username"
+                name = user.full_name or "No name"
+                notify_msg = (
+                    f"🆕 <b>New User Started Bot!</b>\n\n"
+                    f"👤 <b>Name:</b> {name}\n"
+                    f"🔗 <b>Username:</b> {username}\n"
+                    f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+                    f"<i>Grant premium: /grant_premium {user_id}</i>"
+                )
+                await context.bot.send_message(chat_id=OWNER_ID, text=notify_msg, parse_mode="HTML")
+            except Exception as e:
+                log.error(f"Failed to notify owner about new user: {e}")
     
     # Show appropriate welcome based on user type
     if is_owner(user_id):
