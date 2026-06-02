@@ -602,6 +602,51 @@ def _get_course_id_from_url(course_url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _make_udemy_session(access_token, client_id):
+    """Build a requests Session with Udemy mobile auth headers/cookies."""
+    s = requests.Session()
+    s.cookies.update({"access_token": access_token, "client_id": client_id or DEFAULT_CLIENT_ID})
+    s.headers.update({
+        "User-Agent": "okhttp/4.10.0 UdemyAndroid 9.7.0(515) (phone)",
+        "Accept": "application/json",
+        "Referer": "https://www.udemy.com/",
+    })
+    return s
+
+
+def _find_enrolled_account(accounts, course_id, preferred_acc_id=None):
+    """Return the account that can actually access (is enrolled in) course_id.
+
+    Prevents per-lecture 404s caused by using a token for an account that isn't
+    subscribed to the course. Prefers preferred_acc_id, then tries the rest.
+    Returns (account_dict_or_None, token_expired_any: bool).
+    """
+    if not course_id:
+        return None, False
+    ordered = sorted(
+        accounts,
+        key=lambda a: 0 if (preferred_acc_id and a["id"] == preferred_acc_id) else 1,
+    )
+    saw_expired = False
+    for acc in ordered:
+        try:
+            s = _make_udemy_session(acc["access_token"], acc.get("client_id"))
+            r = _session_get_retry(
+                s,
+                f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/?fields[course]=id",
+                retries=2, timeout=15,
+            )
+            if r is None:
+                continue
+            if r.status_code == 200:
+                return acc, saw_expired
+            if r.status_code in (401, 403):
+                saw_expired = True  # token likely expired/invalid for this account
+        except Exception:
+            continue
+    return None, saw_expired
+
+
 def _resolve_course(session, course_url, course_id_hint=None):
     """Resolve (course_id, course_title) robustly.
 
@@ -795,14 +840,26 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
             continue  # already downloaded
 
         # Get lecture detail including supplementary assets (attachments/resources)
+        qs = "?fields[lecture]=asset,supplementary_assets&fields[asset]=@all"
         detail_url = (
-            f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/lectures/{lid}/"
-            f"?fields[lecture]=asset,supplementary_assets&fields[asset]=@all"
+            f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/lectures/{lid}/{qs}"
         )
         try:
-            r_lec = session.get(detail_url, timeout=20)
-            if r_lec.status_code != 200:
-                errors.append(f"Lecture {lid} API error {r_lec.status_code}")
+            r_lec = _session_get_retry(session, detail_url, retries=3, timeout=20)
+            # Fallback: course-scoped lecture endpoint (helps when the subscribed-courses
+            # path 404s for some lectures/courses).
+            if r_lec is None or r_lec.status_code == 404:
+                alt_url = f"https://www.udemy.com/api-2.0/courses/{course_id}/lectures/{lid}/{qs}"
+                alt = _session_get_retry(session, alt_url, retries=2, timeout=20)
+                if alt is not None and alt.status_code == 200:
+                    r_lec = alt
+
+            if r_lec is None or r_lec.status_code != 200:
+                code = r_lec.status_code if r_lec is not None else "timeout"
+                if code in (401, 403, 404):
+                    errors.append(f"Lecture not accessible ({code}): {ltitle}")
+                else:
+                    errors.append(f"Lecture {lid} API error {code}")
                 continue
 
             lecture_json = r_lec.json()
@@ -1187,6 +1244,27 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 pass
         return
 
+    # Pick the account that is ACTUALLY enrolled in this course, to avoid
+    # per-lecture 404s when the wrong/duplicate account token is used.
+    if accounts and str(udemy_id).isdigit():
+        try:
+            enrolled_acc, saw_expired = await asyncio.to_thread(
+                _find_enrolled_account, accounts, int(udemy_id), source_acc_id
+            )
+            if enrolled_acc:
+                chosen = enrolled_acc
+            elif saw_expired and not silent_start:
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        "⚠️ Your saved Udemy token(s) may have expired for this course. "
+                        "If the archive comes back empty or with many 404s, refresh via /enroll_setup.",
+                    )
+                except Exception:
+                    pass
+        except Exception as _e:
+            log.warning(f"Enrolled-account check failed for {title}: {_e}")
+
     safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
     work_dir = Path(tempfile.mkdtemp(prefix="udemy_"))
     out_dir = work_dir / safe_name
@@ -1366,13 +1444,23 @@ async def _start_course_archive(update, context, item, silent_start=False):
                     pass
 
             if other_errs:
+                access_errs = [e for e in other_errs if "not accessible" in e or "API error 401" in e or "API error 403" in e or "API error 404" in e]
                 err_summary = "\n".join(other_errs[:5])
                 if len(other_errs) > 5:
                     err_summary += f"\n... +{len(other_errs)-5} more"
+                hint = ""
+                # If most failures are access/404 errors, it's almost always a token/account issue.
+                if access_errs and len(access_errs) >= max(3, len(other_errs) // 2):
+                    hint = (
+                        "\n\n💡 Many lectures returned *not accessible / 404*. This usually means:\n"
+                        "• The Udemy token for this account has **expired** → refresh via /enroll_setup\n"
+                        "• Or the course is enrolled on a **different account** than the one used.\n"
+                        "Re-run after updating the token and it should download fully."
+                    )
                 try:
                     await context.bot.send_message(
                         owner_id,
-                        f"\u26a0\ufe0f Some other issues while archiving ({len(other_errs)}):\n`{err_summary[:400]}`",
+                        f"\u26a0\ufe0f Some issues while archiving ({len(other_errs)}):\n`{err_summary[:400]}`{hint}",
                         parse_mode="Markdown"
                     )
                 except Exception:
