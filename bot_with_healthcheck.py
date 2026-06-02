@@ -276,6 +276,11 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 /autoenroll — toggle auto-enrollment
 /enroll_status — view stats
 
+<b>📚 Course Archive (Owner):</b>
+/search_courses &lt;query&gt; — search enrolled courses
+/download_queue — view download queue
+/downloads — active downloads & system stats
+
 <b>👑 Owner Commands:</b>
 /grant_premium &lt;user_id&gt; — give premium access
 /revoke_premium &lt;user_id&gt; — remove premium
@@ -422,6 +427,25 @@ Show all premium users.
 <b>/stats</b>
 View enrollment stats: today's total, all-time total,
 and breakdown by user (owner/premium/free).
+
+<b>/channel_post</b>
+Toggle automatic channel posting of enrolled courses.
+
+<b>📚 COURSE ARCHIVE</b>
+
+<b>/search_courses &lt;query&gt;</b>
+Search your enrolled courses across all accounts.
+Select results to add to download queue.
+
+<b>/download_queue</b>
+View and manage your course download queue.
+Archive courses with all resources (videos, PDFs, etc.).
+
+<b>/downloads</b>
+View active downloads/uploads with real-time stats:
+• Progress and speed for each task
+• System disk usage and free space
+• Bandwidth monitoring
 
 <b>📽️ MOVIES</b>
 /movies — browse latest movies
