@@ -64,6 +64,12 @@ AUTO_ENROLL_INTERVAL = 120  # 2 minutes
 active_tasks = {}
 active_tasks_lock = Lock()
 
+# Persistent /downloads status message per owner (so repeated calls reuse the
+# same message instead of spamming new ones). Maps owner_id -> message_id.
+status_msg_refs = {}
+# Owners that currently have a live /downloads refresh loop running.
+status_live_owners = set()
+
 # Bot pool for parallel operations
 bot_pool = []
 bot_pool_lock = Lock()
@@ -330,82 +336,120 @@ async def cmd_download_queue(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _show_download_queue(update.effective_message, queue)
 
 
+def _build_status_text(remaining: int | None = None) -> str:
+    """Build the active-tasks status text (same layout as live archive progress)."""
+    with active_tasks_lock:
+        tasks = dict(active_tasks)  # Copy to avoid lock issues
+
+    if not tasks:
+        msg = "📊 **Active Tasks**\n\n✅ No active downloads or uploads."
+    else:
+        msg = f"📊 **Active Tasks** ({len(tasks)})\n\n"
+        for task_id, task_info in tasks.items():
+            course = task_info.get("course", "Unknown")
+            progress = task_info.get("progress", 0)
+            speed = task_info.get("speed", "N/A")
+            eta = task_info.get("eta", "N/A")
+            stage = task_info.get("stage", "")
+            bots = task_info.get("bots", {})
+
+            bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
+
+            msg += f"**{course[:35]}**\n"
+            msg += f"[{bar}] {progress}%\n"
+
+            if bots and len(bots) > 1:
+                msg += "\n🤖 **Bot Activity:**\n"
+                for bot_num in sorted(bots.keys()):
+                    bot_info = bots[bot_num]
+                    bot_status_emoji = "⏳" if bot_info.get("status") == "downloading" else "✅"
+                    lecture = bot_info.get("current_lecture", "Idle")[:25]
+                    bot_pct = bot_info.get("progress", 0)
+                    msg += f"Bot {bot_num+1}: {bot_status_emoji} {bot_pct}% - `{lecture}`\n"
+
+            if stage and not bots:
+                msg += f"{stage[:60]}\n"
+            if speed != "N/A":
+                msg += f"⚡ {speed}"
+            if eta != "N/A":
+                msg += f" | ⏱ {eta}"
+            msg += "\n\n"
+
+    disk = get_disk_usage()
+    if disk:
+        msg += f"💾 **Disk Usage**\n"
+        msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
+        msg += f"Free: {disk['free_gb']:.1f} GB\n"
+
+    if remaining is not None and remaining > 0:
+        msg += f"\n_Live view • Refreshing... ({remaining}s remaining)_"
+    return msg[:4000]
+
+
 async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: View active download/upload tasks with system stats - LIVE updates."""
+    """Owner-only: View active download/upload tasks with system stats - LIVE updates.
+
+    Reuses ONE persistent status message per owner (edits it in place) instead of
+    sending a new message every time, so repeated /downloads calls never spam.
+    """
     if not update.effective_user or not update.effective_message:
         return
-    if not is_owner(update.effective_user.id):
+    owner_id = update.effective_user.id
+    if not is_owner(owner_id):
         await update.effective_message.reply_text("⛔ Owner only.")
         return
-    
-    # Send initial message
-    status_msg = await update.effective_message.reply_text("📊 Loading active tasks...", parse_mode="Markdown")
-    
-    # Keep updating for 60 seconds (LIVE view)
+
     import time
-    start_time = time.time()
-    
-    while time.time() - start_time < 60:
-        with active_tasks_lock:
-            tasks = dict(active_tasks)  # Copy to avoid lock issues
-        
-        if not tasks:
-            msg = "📊 **Active Tasks**\n\n✅ No active downloads or uploads.\n\n"
-            msg += "_Monitoring stopped - no active tasks._"
-        else:
-            msg = f"📊 **Active Tasks** ({len(tasks)})\n\n"
-            for task_id, task_info in tasks.items():
-                status = task_info.get("status", "unknown")
-                course = task_info.get("course", "Unknown")
-                progress = task_info.get("progress", 0)
-                speed = task_info.get("speed", "N/A")
-                eta = task_info.get("eta", "N/A")
-                stage = task_info.get("stage", "")
-                bots = task_info.get("bots", {})
-                
-                bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
-                
-                msg += f"**{course[:35]}**\n"
-                msg += f"[{bar}] {progress}%\n"
-                
-                # Show bot activity if parallel download
-                if bots and len(bots) > 1:
-                    msg += "\n🤖 **Bot Activity:**\n"
-                    for bot_num in sorted(bots.keys()):
-                        bot_info = bots[bot_num]
-                        bot_status_emoji = "⏳" if bot_info.get("status") == "downloading" else "✅"
-                        lecture = bot_info.get("current_lecture", "Idle")[:25]
-                        bot_pct = bot_info.get("progress", 0)
-                        msg += f"Bot {bot_num+1}: {bot_status_emoji} {bot_pct}% - `{lecture}`\n"
-                
-                if stage and not bots:
-                    msg += f"{stage[:60]}\n"
-                if speed != "N/A":
-                    msg += f"⚡ {speed}"
-                if eta != "N/A":
-                    msg += f" | ⏱ {eta}"
-                msg += "\n\n"
-        
-        # Add system stats
-        disk = get_disk_usage()
-        if disk:
-            msg += f"💾 **Disk Usage**\n"
-            msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
-            msg += f"Free: {disk['free_gb']:.1f} GB\n\n"
-        
-        elapsed = int(time.time() - start_time)
-        msg += f"_Live view • Refreshing... ({60-elapsed}s remaining)_"
-        
+
+    # Try to reuse an existing status message; otherwise create a fresh one.
+    existing_id = status_msg_refs.get(owner_id)
+    status_msg = None
+    if existing_id:
         try:
-            await status_msg.edit_text(msg[:4000], parse_mode="Markdown")
+            status_msg = await context.bot.edit_message_text(
+                chat_id=owner_id,
+                message_id=existing_id,
+                text=_build_status_text(remaining=60),
+                parse_mode="Markdown",
+            )
         except Exception:
-            pass  # Message not modified or rate limited
-        
-        # Stop if no tasks
-        if not tasks:
-            break
-        
-        await asyncio.sleep(3)  # Update every 3 seconds
+            status_msg = None  # Old message gone/edit failed → create a new one
+
+    if status_msg is None:
+        status_msg = await update.effective_message.reply_text(
+            _build_status_text(remaining=60), parse_mode="Markdown"
+        )
+        status_msg_refs[owner_id] = status_msg.message_id
+
+    # If a live refresh loop is already running for this owner, don't start a
+    # second one (that would double-edit / spam). The existing loop already
+    # reflects the latest state.
+    if owner_id in status_live_owners:
+        return
+    status_live_owners.add(owner_id)
+
+    try:
+        start_time = time.time()
+        while time.time() - start_time < 60:
+            with active_tasks_lock:
+                has_tasks = bool(active_tasks)
+
+            remaining = 60 - int(time.time() - start_time)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=owner_id,
+                    message_id=status_msg_refs[owner_id],
+                    text=_build_status_text(remaining=remaining if has_tasks else None),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass  # Not modified / rate limited
+
+            if not has_tasks:
+                break
+            await asyncio.sleep(3)
+    finally:
+        status_live_owners.discard(owner_id)
 
 
 async def _send_search_results(msg, context, results, query, page):

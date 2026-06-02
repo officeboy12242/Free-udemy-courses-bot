@@ -279,7 +279,7 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 <b>📚 Course Archive (Owner):</b>
 /search_courses &lt;query&gt; — search enrolled courses
 /download_queue — view download queue
-/downloads — active downloads & system stats
+/downloads or /status — live download progress & system stats
 
 <b>👑 Owner Commands:</b>
 /grant_premium &lt;user_id&gt; — give premium access
@@ -441,8 +441,9 @@ Select results to add to download queue.
 View and manage your course download queue.
 Archive courses with all resources (videos, PDFs, etc.).
 
-<b>/downloads</b>
-View active downloads/uploads with real-time stats:
+<b>/downloads</b> (or <b>/status</b>)
+View active downloads/uploads with real-time stats.
+Reuses the same live message (no spam):
 • Progress and speed for each task
 • System disk usage and free space
 • Bandwidth monitoring
@@ -1687,6 +1688,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("search_courses", cmd_search_courses))
     app.add_handler(CommandHandler("download_queue", cmd_download_queue))
     app.add_handler(CommandHandler("downloads", cmd_downloads))
+    app.add_handler(CommandHandler("status", cmd_downloads))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
