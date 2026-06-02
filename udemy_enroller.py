@@ -7,6 +7,7 @@ Udemy Course Auto-Enroller
 import logging
 import requests
 from datetime import datetime
+from urllib.parse import quote
 from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
@@ -174,45 +175,44 @@ class UdemyAutoEnroller:
             log.debug(f"Failed to get user info: {e}")
             return None
 
-    def search_enrolled_courses(
-        self,
-        query: str,
-        max_results: int = 20,
-        page_size: int = 200,
-    ) -> list:
-        """Search enrolled courses by title (client-side filtering)."""
-        if not query:
-            return []
-        query_lower = query.strip().lower()
-        results = []
+    def search_enrolled_courses(self, query: str, page: int = 1, page_size: int = 10) -> dict:
+        """
+        Search within THIS account's enrolled/subscribed courses.
+        Returns a dict similar to Udemy API: {count, results: [ {id, title, url, headline, ...} ]}
+        Uses the account's authenticated session so it only sees courses the account has access to.
+        """
+        if not query or not query.strip():
+            query = ""
+        q = quote(query.strip())
         url = (
             "https://www.udemy.com/api-2.0/users/me/subscribed-courses/"
-            f"?page_size={page_size}&fields[course]=title,url"
+            f"?search={q}&page={page}&page_size={page_size}"
+            "&ordering=-enroll_time"
+            "&fields[course]=id,title,url,headline,primary_category,content_info,"
+            "num_reviews,avg_rating,image_240x135,is_paid,locale,completion_ratio"
         )
         r = self._get(url)
         if not r or r.status_code != 200:
-            return []
+            return {"count": 0, "results": []}
         try:
             data = r.json()
-        except Exception:
-            return []
-        for course in data.get("results", []):
-            title = course.get("title", "")
-            if query_lower in title.lower():
-                url = course.get("url", "")
-                if url and not url.startswith("http"):
-                    url = f"https://www.udemy.com{url}"
-                results.append(
-                    {
-                        "id": course.get("id"),
-                        "title": title.strip(),
-                        "url": url,
-                    }
-                )
-                if len(results) >= max_results:
-                    break
-
-        return results
+            # Normalize a bit
+            out = []
+            for c in data.get("results", []):
+                out.append({
+                    "id": c.get("id"),
+                    "title": c.get("title"),
+                    "url": c.get("url"),
+                    "headline": c.get("headline"),
+                    "is_paid": c.get("is_paid", True),
+                    "avg_rating": c.get("avg_rating"),
+                    "content_info": c.get("content_info"),
+                    "image": c.get("image_240x135"),
+                })
+            return {"count": data.get("count", 0), "results": out, "page": page, "page_size": page_size}
+        except Exception as e:
+            log.debug(f"search_enrolled_courses parse error: {e}")
+            return {"count": 0, "results": []}
     
     @staticmethod
     def _extract_slug(url: str) -> str:

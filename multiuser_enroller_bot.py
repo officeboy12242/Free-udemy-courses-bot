@@ -7,9 +7,14 @@ Multi-Account Udemy Auto-Enroller Bot
 
 import asyncio
 import logging
-import time
-import uuid
+import os
+import shutil
+import tempfile
+import zipfile
 import requests
+from datetime import datetime
+from pathlib import Path
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import ContextTypes, Application
 
@@ -18,7 +23,9 @@ from user_enroller import (
     init_enroller_db,
     add_account, get_user_accounts, get_account, remove_account, toggle_auto_enroll,
     get_all_auto_enroll_accounts, find_existing_account, update_account_token,
+    add_to_download_queue, get_owner_download_queue, remove_from_download_queue, clear_owner_download_queue,
     set_user_setup_state, get_user_setup_state, clear_user_setup_state,
+    DEFAULT_CLIENT_ID,
     get_auto_enroll_state, set_auto_enroll_enabled, update_auto_enroll_state,
     log_enrollment, is_course_enrolled, get_recently_enrolled,
     user_has_credentials, get_user_stats,
@@ -156,6 +163,360 @@ async def cmd_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
+
+
+# ─── Owner: Search enrolled courses across all linked accounts & archive ─────
+
+async def cmd_search_courses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: Search courses the linked Udemy accounts are enrolled in."""
+    if not update.effective_user or not update.effective_message:
+        return
+
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/search_courses <keywords>`\n\n"
+            "Searches within the courses your linked Udemy accounts are already enrolled in.\n"
+            "Example: `/search_courses machine learning`",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(context.args).strip()
+    if len(query) < 2:
+        await update.effective_message.reply_text("Please provide at least 2 characters to search.")
+        return
+
+    msg = await update.effective_message.reply_text(f"🔍 Searching enrolled courses for “{query}” across your accounts...")
+
+    accounts = get_user_accounts(user_id)
+    if not accounts:
+        await msg.edit_text("No Udemy accounts linked. Use `/enroll_setup` first.")
+        return
+
+    all_results = []
+    seen_ids = set()
+    # Search each account's library (page 1 is usually the most relevant)
+    for acc in accounts:
+        try:
+            enroller = UdemyAutoEnroller(acc["access_token"], acc.get("client_id"))
+            res = await asyncio.to_thread(enroller.search_enrolled_courses, query, 1, 20)
+            for item in res.get("results", []):
+                uid = item.get("id")
+                if uid and uid not in seen_ids:
+                    seen_ids.add(uid)
+                    item["source_account_id"] = acc["id"]  # mongo account id for preferring cookies later
+                    item["source_account_name"] = acc.get("name", "Account")
+                    all_results.append(item)
+        except Exception as e:
+            log.warning(f"Search failed on account {acc.get('name')}: {e}")
+
+    if not all_results:
+        await msg.edit_text(f"😕 No enrolled courses matched “{query}” in any of your accounts.")
+        return
+
+    # Store for pagination / selection in this chat
+    context.user_data["dl_search"] = {
+        "query": query,
+        "page": 1,
+        "results": all_results[:30]  # cap
+    }
+
+    await _send_search_results(msg, context, all_results[:10], query, 1)
+
+
+async def cmd_download_queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: Show current archive/download queue."""
+    if not update.effective_user or not update.effective_message:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only.")
+        return
+    queue = get_owner_download_queue(update.effective_user.id)
+    await update.effective_message.reply_text(
+        "Use the buttons below or search with /search_courses.",
+        parse_mode="Markdown"
+    )
+    await _show_download_queue(update.effective_message, queue)
+
+
+async def _send_search_results(msg, context, results, query, page):
+    """Render a page of search results with Select buttons."""
+    lines = [f"🔍 **Search results for “{query}”** (page {page})\n"]
+    keyboard = []
+
+    for idx, r in enumerate(results):
+        title = (r.get("title") or "Untitled")[:55]
+        headline = (r.get("headline") or "")[:70]
+        paid = "💰 Paid" if r.get("is_paid") else "🆓 Free"
+        rating = f"⭐ {r.get('avg_rating'):.1f}" if r.get("avg_rating") else ""
+        src = r.get("source_account_name", "")
+        lines.append(f"**{title}**\n{headline}\n{paid} {rating} · via {src}\n")
+
+        udemy_id = r.get("id")
+        keyboard.append([
+            InlineKeyboardButton(f"📥 Select “{title[:30]}”", callback_data=f"dl_select_{udemy_id}"),
+        ])
+
+    # Pagination (simple, we have the full list in context for now)
+    total = len(context.user_data.get("dl_search", {}).get("results", []))
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data="dl_prev"))
+    if (page * 10) < total:
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data="dl_next"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([
+        InlineKeyboardButton("📋 View Queue", callback_data="dl_queue"),
+        InlineKeyboardButton("🗑️ Clear Queue", callback_data="dl_clear"),
+    ])
+
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3750] + "\n... (truncated)"
+
+    try:
+        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except Exception:
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+
+async def _show_download_queue(query_or_msg, queue: list):
+    """Display the current download queue with action buttons."""
+    if not queue:
+        text = "📋 **Download / Archive Queue**\n\nQueue is empty.\nUse `/search_courses <query>` to find courses from your accounts."
+        keyboard = []
+    else:
+        lines = ["📋 **Download / Archive Queue**\n"]
+        keyboard = []
+        for item in queue[:12]:  # show up to 12
+            title = item["title"][:50]
+            lines.append(f"• **{title}**")
+            uid = item["udemy_course_id"]
+            keyboard.append([
+                InlineKeyboardButton(f"🚀 Archive “{title[:25]}”", callback_data=f"dl_start_{uid}"),
+                InlineKeyboardButton("🗑️", callback_data=f"dl_remove_{uid}"),
+            ])
+        if len(queue) > 12:
+            lines.append(f"... +{len(queue)-12} more")
+        keyboard.append([
+            InlineKeyboardButton("🚀 Archive ALL", callback_data="dl_start_all"),
+            InlineKeyboardButton("🗑️ Clear All", callback_data="dl_clear"),
+        ])
+        text = "\n".join(lines)
+
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+    try:
+        if hasattr(query_or_msg, "edit_message_text"):
+            await query_or_msg.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await query_or_msg.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+async def _start_course_archive(update: Update, context: ContextTypes.DEFAULT_TYPE, item: dict, silent_start: bool = False):
+    """
+    Background task: download a full course using yt-dlp (via one of the owner's accounts),
+    zip it, split if necessary, and upload the part(s) to the configured CHANNEL_ID.
+    Sends progress updates to the owner.
+    """
+    owner_id = update.effective_user.id if update.effective_user else OWNER_ID
+    udemy_id = item["udemy_course_id"]
+    title = item.get("title", f"Course-{udemy_id}")
+    course_url = item.get("course_url", "")
+    source_acc_id = item.get("source_account_id")
+
+    # Pick best account (prefer source, else any)
+    accounts = get_user_accounts(owner_id)
+    chosen = None
+    if source_acc_id:
+        chosen = next((a for a in accounts if a["id"] == source_acc_id), None)
+    if not chosen and accounts:
+        chosen = accounts[0]
+
+    if not chosen or not course_url:
+        if not silent_start:
+            try:
+                await context.bot.send_message(owner_id, f"❌ Cannot archive “{title}”: no linked account or URL.")
+            except Exception:
+                pass
+        return
+
+    safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60]
+    work_dir = Path(tempfile.mkdtemp(prefix="udemy_"))
+    out_dir = work_dir / safe_name
+    zip_path = work_dir / f"{safe_name}.zip"
+
+    progress_msg = None
+    if not silent_start:
+        try:
+            progress_msg = await context.bot.send_message(
+                owner_id,
+                f"📥 **Archiving started**\n\n**{title}**\n\n"
+                f"Using account: {chosen.get('name')}\n"
+                f"Working in temp folder...\n"
+                f"0%"
+            )
+        except Exception:
+            pass
+
+    def _update_progress(pct: int, stage: str = ""):
+        if progress_msg:
+            try:
+                txt = f"📥 **Archiving**\n\n**{title}**\n\n{stage}\n{pct}%"
+                # Fire and forget edit
+                asyncio.create_task(progress_msg.edit_text(txt))
+            except Exception:
+                pass
+
+    try:
+        # 1. Write a temporary Netscape cookies.txt for yt-dlp
+        cookie_file = work_dir / "cookies.txt"
+        # Minimal Netscape format for the two cookies we care about
+        cookie_lines = [
+            "# Netscape HTTP Cookie File",
+            "# This file is generated by the bot for yt-dlp",
+            ".udemy.com\tTRUE\t/\tFALSE\t" + str(int(datetime.utcnow().timestamp()) + 86400*30) + "\taccess_token\t" + chosen["access_token"],
+            ".udemy.com\tTRUE\t/\tFALSE\t" + str(int(datetime.utcnow().timestamp()) + 86400*30) + "\tclient_id\t" + (chosen.get("client_id") or DEFAULT_CLIENT_ID),
+        ]
+        cookie_file.write_text("\n".join(cookie_lines) + "\n", encoding="utf-8")
+
+        # 2. Build yt-dlp options
+        ydl_opts = {
+            "outtmpl": str(out_dir / "%(playlist_index)s - %(title)s.%(ext)s"),
+            "cookiefile": str(cookie_file),
+            "restrictfilenames": True,
+            "ignoreerrors": True,
+            "nooverwrites": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [],
+            # We intentionally do NOT force ffmpeg here; if available yt-dlp will use it.
+        }
+
+        # Progress hook
+        def _hook(d):
+            if d.get("status") == "downloading":
+                pct = int(d.get("_percent_str", "0%").replace("%", "").strip() or 0)
+                _update_progress(min(pct, 95), f"Downloading: {d.get('filename', '')[-40:]}")
+            elif d.get("status") == "finished":
+                _update_progress(96, "Post-processing / muxing...")
+
+        ydl_opts["progress_hooks"].append(_hook)
+
+        import yt_dlp
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _update_progress(5, "Starting yt-dlp for course page...")
+            # The course URL from Udemy is usually relative; make absolute
+            full_url = course_url if course_url.startswith("http") else f"https://www.udemy.com{course_url}"
+            ydl.download([full_url])
+
+        _update_progress(97, "Creating ZIP archive...")
+
+        # 3. Zip the downloaded tree
+        def _zip_tree(src: Path, dst: Path):
+            with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, _, files in os.walk(src):
+                    for f in files:
+                        full = Path(root) / f
+                        arcname = full.relative_to(src)
+                        zf.write(full, arcname)
+
+        _zip_tree(out_dir, zip_path)
+
+        size = zip_path.stat().st_size
+        _update_progress(99, f"ZIP ready ({size // (1024*1024)} MB)")
+
+        # 4. Split if necessary (we use a conservative 45 MiB to be safe for most Telegram setups)
+        MAX_PART = 45 * 1024 * 1024
+        part_files = []
+        if size <= MAX_PART:
+            part_files = [zip_path]
+        else:
+            part_files = _split_file_into_parts(zip_path, work_dir, MAX_PART)
+
+        # 5. Upload parts to channel (or owner if no CHANNEL_ID)
+        target_chat = CHANNEL_ID or owner_id
+        for i, p in enumerate(part_files, 1):
+            caption = (
+                f"📚 **{title}**\n"
+                f"Part {i}/{len(part_files)} • {p.stat().st_size // 1024 // 1024} MB\n"
+                f"Udemy: https://www.udemy.com{course_url}\n\n"
+                f"{'Join parts with: cat *.part*.zip > full.zip (or 7-Zip)' if len(part_files) > 1 else ''}"
+            )
+            try:
+                with open(p, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=target_chat,
+                        document=f,
+                        filename=p.name,
+                        caption=caption[:1020],
+                        parse_mode="Markdown"
+                    )
+            except Exception as e:
+                log.error(f"Upload part failed: {e}")
+                # Try sending to owner as fallback
+                try:
+                    with open(p, "rb") as f:
+                        await context.bot.send_document(owner_id, f, filename=p.name)
+                except Exception:
+                    pass
+
+        # 6. Notify owner of completion and clean queue item
+        remove_from_download_queue(owner_id, udemy_id)
+        if progress_msg:
+            try:
+                await progress_msg.edit_text(
+                    f"✅ **Archive complete**\n\n**{title}**\n\n"
+                    f"Uploaded {len(part_files)} part(s) to the channel.\n"
+                    f"Item removed from queue."
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await context.bot.send_message(owner_id, f"✅ Archive complete for “{title}” — {len(part_files)} part(s) sent.")
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.exception(f"Archive failed for {title}: {e}")
+        try:
+            await context.bot.send_message(owner_id, f"❌ Archive failed for “{title}”:\n{str(e)[:300]}")
+        except Exception:
+            pass
+    finally:
+        # Cleanup
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
+    """Split a large file into sequentially named .partXX.zip files."""
+    parts = []
+    part_num = 1
+    with open(src, "rb") as f:
+        while True:
+            chunk = f.read(max_bytes)
+            if not chunk:
+                break
+            part_name = work_dir / f"{src.stem}.part{part_num:02d}{src.suffix}"
+            with open(part_name, "wb") as pf:
+                pf.write(chunk)
+            parts.append(part_name)
+            part_num += 1
+    return parts
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -522,150 +883,6 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def cmd_course_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: search enrolled courses across all accounts and post to channel"""
-    if not update.effective_user or not update.effective_message:
-        return
-
-    user_id = update.effective_user.id
-    if not is_owner(user_id):
-        await update.effective_message.reply_text("Owner only.", parse_mode="Markdown")
-        return
-
-    query_text = " ".join(context.args).strip() if context.args else ""
-    if not query_text:
-        await update.effective_message.reply_text(
-            "Usage: `/course_search <keyword>`",
-            parse_mode="Markdown"
-        )
-        return
-
-    accounts = get_user_accounts(user_id)
-    if not accounts:
-        await update.effective_message.reply_text(
-            "No accounts set up.\nRun `/enroll_setup` to add one.",
-            parse_mode="Markdown"
-        )
-        return
-
-    msg = await update.effective_message.reply_text("🔍 Searching enrolled courses...")
-
-    async def search_account(account: dict) -> dict:
-        try:
-            enroller = UdemyAutoEnroller(account["access_token"], account["client_id"])
-            is_valid = await asyncio.to_thread(enroller.verify_login)
-            if not is_valid:
-                return {"account": account, "error": "Login failed", "courses": []}
-            courses = await asyncio.to_thread(
-                enroller.search_enrolled_courses,
-                query_text,
-                10,
-                200,
-            )
-            return {"account": account, "error": None, "courses": courses}
-        except Exception as e:
-            return {"account": account, "error": str(e), "courses": []}
-
-    results = await asyncio.gather(*[search_account(a) for a in accounts])
-
-    combined = []
-    for res in results:
-        for course in res["courses"]:
-            combined.append({
-                "title": course["title"],
-                "url": course["url"],
-                "account_name": res["account"]["name"],
-            })
-
-    if not combined:
-        await msg.edit_text("❌ No matching enrolled courses found.")
-        return
-
-    combined = combined[:15]
-    lines = [f"🔎 **Results for:** `{query_text}`\n"]
-    keyboard = []
-    search_id = uuid.uuid4().hex[:10]
-    for idx, course in enumerate(combined, start=1):
-        title = course["title"][:70] + "..." if len(course["title"]) > 70 else course["title"]
-        lines.append(f"{idx}. **{title}**\n   _{course['account_name']}_")
-
-        keyboard.append([
-            InlineKeyboardButton(
-                f"📢 Post #{idx}",
-                callback_data=f"course_pick:{search_id}:{idx-1}"
-            )
-        ])
-
-    context.bot_data.setdefault("course_search_results", {})
-    context.bot_data["course_search_results"][search_id] = {
-        "created_at": time.time(),
-        "query": query_text,
-        "results": combined,
-    }
-
-    await msg.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-
-async def course_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle course_search callbacks"""
-    query = update.callback_query
-    if not query or not update.effective_user:
-        return
-
-    user_id = update.effective_user.id
-    if not is_owner(user_id):
-        await query.answer("Owner only.", show_alert=True)
-        return
-
-    if not CHANNEL_ID:
-        await query.answer("CHANNEL_ID not set.", show_alert=True)
-        return
-
-    data = query.data or ""
-    try:
-        _, search_id, idx_str = data.split(":")
-        idx = int(idx_str)
-    except ValueError:
-        await query.answer("Invalid selection.", show_alert=True)
-        return
-
-    search_store = context.bot_data.get("course_search_results", {})
-    payload = search_store.get(search_id)
-    if not payload:
-        await query.answer("Search expired. Run /course_search again.", show_alert=True)
-        return
-
-    results = payload.get("results", [])
-    if idx < 0 or idx >= len(results):
-        await query.answer("Invalid selection.", show_alert=True)
-        return
-
-    course = results[idx]
-    title = course["title"]
-    url = course["url"]
-    account_name = course["account_name"]
-
-    text = (
-        f"🎓 **{title}**\n"
-        f"{url}\n\n"
-        f"Account: _{account_name}_"
-    )
-
-    try:
-        await query.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text,
-            parse_mode="Markdown"
-        )
-        await query.answer("Posted to channel ✅")
-    except Exception as e:
-        log.error(f"Post to channel failed: {e}")
-        await query.answer("Failed to post.", show_alert=True)
-
 # ─── Auto-Enroll Toggle ─────────────────────────────────────────────────────
 
 async def cmd_autoenroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1021,6 +1238,111 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown"
         )
         await query.answer(f"Channel posting {'enabled' if new_state else 'disabled'}!")
+
+    # ─── Owner Download / Archive callbacks ─────────────────────────────────
+    elif data.startswith("dl_select_"):
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        try:
+            udemy_id = int(data.replace("dl_select_", ""))
+        except ValueError:
+            await query.answer("Bad selection")
+            return
+
+        search_state = context.user_data.get("dl_search", {})
+        results = search_state.get("results", [])
+        match = next((r for r in results if r.get("id") == udemy_id), None)
+        if not match:
+            await query.answer("Selection expired. Search again with /search_courses")
+            return
+
+        title = match.get("title", "Course")
+        url = match.get("url", "")
+        src_acc = match.get("source_account_id")
+
+        added = add_to_download_queue(user_id, udemy_id, title, url, src_acc)
+        if added:
+            await query.answer(f"✅ Added: {title[:40]}")
+            # Show the queue immediately
+            queue = get_owner_download_queue(user_id)
+            await _show_download_queue(query, queue)
+        else:
+            await query.answer("Could not add (maybe duplicate?)")
+
+    elif data in ("dl_next", "dl_prev"):
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        state = context.user_data.get("dl_search")
+        if not state:
+            await query.answer("Search session expired. Use /search_courses again.")
+            return
+        all_res = state.get("results", [])
+        current_page = state.get("page", 1)
+        new_page = current_page + 1 if data == "dl_next" else max(1, current_page - 1)
+        state["page"] = new_page
+        context.user_data["dl_search"] = state
+        start = (new_page - 1) * 10
+        page_results = all_res[start : start + 10]
+        await _send_search_results(query.message, context, page_results, state.get("query", ""), new_page)
+
+    elif data == "dl_queue":
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        queue = get_owner_download_queue(user_id)
+        await _show_download_queue(query, queue)
+
+    elif data == "dl_clear":
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        count = clear_owner_download_queue(user_id)
+        await query.edit_message_text(f"🗑️ Cleared {count} items from download queue.")
+        context.user_data.pop("dl_search", None)
+
+    elif data.startswith("dl_remove_"):
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        try:
+            uid = int(data.replace("dl_remove_", ""))
+        except ValueError:
+            return
+        remove_from_download_queue(user_id, uid)
+        queue = get_owner_download_queue(user_id)
+        await _show_download_queue(query, queue)
+
+    elif data.startswith("dl_start_"):
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        try:
+            uid = int(data.replace("dl_start_", ""))
+        except ValueError:
+            return
+        queue = get_owner_download_queue(user_id)
+        item = next((q for q in queue if q["udemy_course_id"] == uid), None)
+        if not item:
+            await query.answer("Item not in queue anymore.")
+            return
+        # Start background download+zip+upload
+        await query.answer("🚀 Starting download in background...")
+        asyncio.create_task(_start_course_archive(update, context, item))
+
+    elif data == "dl_start_all":
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        queue = get_owner_download_queue(user_id)
+        if not queue:
+            await query.answer("Queue is empty.")
+            return
+        await query.answer(f"🚀 Starting archive for {len(queue)} courses (one by one)...")
+        # Process sequentially to avoid hammering disk/bandwidth
+        for item in queue:
+            await _start_course_archive(update, context, item, silent_start=True)
 
 
 # ─── Core Enrollment Logic ───────────────────────────────────────────────────

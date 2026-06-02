@@ -101,6 +101,10 @@ def init_enroller_db():
         db.premium_users.create_index([("user_id", 1)], unique=True)
         db.user_setup_state.create_index([("user_id", 1)], unique=True)
         db.auto_enroll_state.create_index([("user_id", 1)], unique=True)
+
+        # Owner course archive / download queue
+        db.owner_download_queue.create_index([("owner_id", 1)])
+        db.owner_download_queue.create_index([("owner_id", 1), ("udemy_course_id", 1)], unique=True)
         
         log.info("MongoDB indexes created successfully")
     except Exception as e:
@@ -637,6 +641,68 @@ def toggle_channel_posting() -> bool:
     new_state = not current
     set_setting("channel_posting", new_state)
     return new_state
+
+
+# ─── Owner Course Download / Archive Queue ────────────────────────────────────
+# Allows the owner to search enrolled courses across linked accounts,
+# select interesting ones, and later download+zip+upload them to the channel.
+
+def add_to_download_queue(owner_id: int, udemy_course_id: int, title: str, course_url: str, source_account_id: int | None = None) -> bool:
+    """Add a Udemy course to the owner's download/zip queue. Idempotent (unique on owner+udemy id)."""
+    try:
+        db = _get_db()
+        db.owner_download_queue.update_one(
+            {"owner_id": owner_id, "udemy_course_id": udemy_course_id},
+            {"$set": {
+                "title": title,
+                "course_url": course_url,
+                "source_account_id": source_account_id,
+                "added_at": datetime.utcnow()
+            }},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        log.error(f"add_to_download_queue error: {e}")
+        return False
+
+
+def get_owner_download_queue(owner_id: int) -> list:
+    """Return list of selected courses for the owner, newest first."""
+    db = _get_db()
+    docs = db.owner_download_queue.find({"owner_id": owner_id}).sort("added_at", -1)
+    return [
+        {
+            "udemy_course_id": d["udemy_course_id"],
+            "title": d.get("title", "Untitled"),
+            "course_url": d.get("course_url", ""),
+            "source_account_id": d.get("source_account_id"),
+            "added_at": d.get("added_at")
+        }
+        for d in docs
+    ]
+
+
+def remove_from_download_queue(owner_id: int, udemy_course_id: int) -> bool:
+    """Remove one item from the queue."""
+    try:
+        db = _get_db()
+        res = db.owner_download_queue.delete_one({"owner_id": owner_id, "udemy_course_id": udemy_course_id})
+        return res.deleted_count > 0
+    except Exception as e:
+        log.error(f"remove_from_download_queue error: {e}")
+        return False
+
+
+def clear_owner_download_queue(owner_id: int) -> int:
+    """Clear the entire queue for the owner. Returns number deleted."""
+    try:
+        db = _get_db()
+        res = db.owner_download_queue.delete_many({"owner_id": owner_id})
+        return res.deleted_count
+    except Exception as e:
+        log.error(f"clear_owner_download_queue error: {e}")
+        return 0
 
 
 # Initialize on import

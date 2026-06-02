@@ -53,12 +53,10 @@ from multiuser_enroller_bot import (
     cmd_enroll_status,
     cmd_myprofile,
     cmd_accounts,
-    cmd_course_search,
     cmd_autoenroll,
     enroll_callback,
     setup_callback,
     profile_callback,
-    course_search_callback,
     handle_setup_message,
     auto_enroll_job,
     # Premium management (owner only)
@@ -67,6 +65,8 @@ from multiuser_enroller_bot import (
     cmd_list_premium,
     cmd_stats,
     cmd_channel_post,
+    cmd_search_courses,
+    cmd_download_queue,
 )
 from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
 from movie_service import (
@@ -1647,12 +1647,10 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("enroll_status", cmd_enroll_status))
     app.add_handler(CommandHandler("myprofile", cmd_myprofile))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
-    app.add_handler(CommandHandler("course_search", cmd_course_search))
     app.add_handler(CommandHandler("autoenroll", cmd_autoenroll))
     app.add_handler(CallbackQueryHandler(enroll_callback, pattern=r"^enroll_"))
     app.add_handler(CallbackQueryHandler(setup_callback, pattern=r"^setup_"))
-    app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete|acc_toggle_|acc_remove_|autoenroll_toggle|show_accounts|toggle_channel_post)"))
-    app.add_handler(CallbackQueryHandler(course_search_callback, pattern=r"^course_pick:"))
+    app.add_handler(CallbackQueryHandler(profile_callback, pattern=r"^(start_setup|update_creds|clear_my_data|confirm_delete|cancel_delete|acc_toggle_|acc_remove_|autoenroll_toggle|show_accounts|toggle_channel_post|dl_select_|dl_next|dl_prev|dl_queue|dl_clear|dl_remove_|dl_start_)"))
     
     # Premium management commands (owner only)
     app.add_handler(CommandHandler("grant_premium", cmd_grant_premium))
@@ -1660,6 +1658,8 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("list_premium", cmd_list_premium))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("channel_post", cmd_channel_post))
+    app.add_handler(CommandHandler("search_courses", cmd_search_courses))
+    app.add_handler(CommandHandler("download_queue", cmd_download_queue))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
