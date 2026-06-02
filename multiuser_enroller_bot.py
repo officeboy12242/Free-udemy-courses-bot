@@ -322,19 +322,91 @@ async def _show_download_queue(query_or_msg, queue: list):
         pass
 
 
-async def _start_course_archive(update: Update, context: ContextTypes.DEFAULT_TYPE, item: dict, silent_start: bool = False):
+def _build_udemy_cookies_file(work_dir, access_token, client_id):
+    """Write a Netscape cookies.txt that yt-dlp understands for Udemy auth."""
+    exp = str(int(__import__("datetime").datetime.utcnow().timestamp()) + 86400 * 30)
+    lines = [
+        "# Netscape HTTP Cookie File",
+        f".udemy.com\tTRUE\t/\tTRUE\t{exp}\taccess_token\t{access_token}",
+        f".udemy.com\tTRUE\t/\tTRUE\t{exp}\tclient_id\t{client_id}",
+    ]
+    cookie_file = work_dir / "udemy_cookies.txt"
+    cookie_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cookie_file
+
+
+def _download_course_with_ytdlp(course_url, out_dir, cookie_file, progress_callback=None):
     """
-    Background task: download a full course using yt-dlp (via one of the owner's accounts),
-    zip it, split if necessary, and upload the part(s) to the configured CHANNEL_ID.
-    Sends progress updates to the owner.
+    Download all lectures of a Udemy course using yt-dlp.
+    Returns (ok: bool, error_msg: str | None).
+    Output structure: Chapter folder / lecture-index - title.mp4
     """
-    owner_id = update.effective_user.id if update.effective_user else OWNER_ID
+    import yt_dlp
+
+    outtmpl = str(out_dir / "%(chapter_number)s - %(chapter)s" / "%(playlist_index)s - %(title)s.%(ext)s")
+    last_pct = [0]
+
+    def _hook(d):
+        if progress_callback is None:
+            return
+        status = d.get("status", "")
+        if status == "downloading":
+            try:
+                pct = float((d.get("_percent_str") or "0").replace("%", "").strip())
+            except Exception:
+                pct = last_pct[0]
+            last_pct[0] = pct
+            fname = Path(d.get("filename", "")).name[-50:]
+            progress_callback(int(pct * 0.88), f"\u2b07\ufe0f {fname}")
+        elif status == "finished":
+            progress_callback(int(last_pct[0] * 0.88), "\U0001f500 Merging / processing...")
+
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "cookiefile": str(cookie_file),
+        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "writethumbnail": False,
+        "writesubtitles": True,
+        "subtitleslangs": ["en"],
+        "ignoreerrors": True,
+        "nooverwrites": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "http_chunk_size": 10485760,
+        "concurrent_fragment_downloads": 4,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [_hook],
+    }
+    try:
+        full_url = course_url if course_url.startswith("http") else f"https://www.udemy.com{course_url}"
+        # yt-dlp wants the landing/course page URL, not the /learn/ page
+        if "/learn" in full_url:
+            full_url = full_url.split("/learn")[0].rstrip("/") + "/"
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([full_url])
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+async def _start_course_archive(update, context, item, silent_start=False):
+    """
+    Background task:
+    1. Download entire Udemy course via yt-dlp (cookie auth, chapter/lecture folder structure)
+    2. ZIP the downloaded tree
+    3. Split if > 2 GB (very rare)
+    4. Upload via Pyrogram (~2 GB support) or Bot API fallback
+    5. Progress messages sent to owner throughout
+    """
+    from user_enroller import OWNER_ID as _OWNER_ID
+    owner_id = update.effective_user.id if update.effective_user else _OWNER_ID
     udemy_id = item["udemy_course_id"]
     title = item.get("title", f"Course-{udemy_id}")
     course_url = item.get("course_url", "")
     source_acc_id = item.get("source_account_id")
 
-    # Pick best account (prefer source, else any)
     accounts = get_user_accounts(owner_id)
     chosen = None
     if source_acc_id:
@@ -345,157 +417,170 @@ async def _start_course_archive(update: Update, context: ContextTypes.DEFAULT_TY
     if not chosen or not course_url:
         if not silent_start:
             try:
-                await context.bot.send_message(owner_id, f"❌ Cannot archive “{title}”: no linked account or URL.")
+                await context.bot.send_message(owner_id, f"\u274c Cannot archive \u201c{title}\u201d: no linked account or missing URL.")
             except Exception:
                 pass
         return
 
-    safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60]
+    safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
     work_dir = Path(tempfile.mkdtemp(prefix="udemy_"))
     out_dir = work_dir / safe_name
+    out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = work_dir / f"{safe_name}.zip"
 
     progress_msg = None
-    if not silent_start:
+    _last_edit = [0.0]
+
+    async def _send_progress(pct, stage):
+        nonlocal progress_msg
+        import time
+        now = time.time()
+        if progress_msg and (now - _last_edit[0]) < 5:
+            return
+        _last_edit[0] = now
+        bar = "\u2588" * (pct // 10) + "\u2591" * (10 - pct // 10)
+        txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}"
         try:
-            progress_msg = await context.bot.send_message(
-                owner_id,
-                f"📥 **Archiving started**\n\n**{title}**\n\n"
-                f"Using account: {chosen.get('name')}\n"
-                f"Working in temp folder...\n"
-                f"0%"
-            )
+            if progress_msg:
+                await progress_msg.edit_text(txt, parse_mode="Markdown")
+            else:
+                progress_msg = await context.bot.send_message(owner_id, txt, parse_mode="Markdown")
         except Exception:
             pass
 
-    def _update_progress(pct: int, stage: str = ""):
-        if progress_msg:
-            try:
-                txt = f"📥 **Archiving**\n\n**{title}**\n\n{stage}\n{pct}%"
-                # Fire and forget edit
-                asyncio.create_task(progress_msg.edit_text(txt))
-            except Exception:
-                pass
+    def _sync_progress(pct, stage):
+        asyncio.create_task(_send_progress(pct, stage))
 
     try:
-        # 1. Write a temporary Netscape cookies.txt for yt-dlp
-        cookie_file = work_dir / "cookies.txt"
-        # Minimal Netscape format for the two cookies we care about
-        cookie_lines = [
-            "# Netscape HTTP Cookie File",
-            "# This file is generated by the bot for yt-dlp",
-            ".udemy.com\tTRUE\t/\tFALSE\t" + str(int(datetime.utcnow().timestamp()) + 86400*30) + "\taccess_token\t" + chosen["access_token"],
-            ".udemy.com\tTRUE\t/\tFALSE\t" + str(int(datetime.utcnow().timestamp()) + 86400*30) + "\tclient_id\t" + (chosen.get("client_id") or DEFAULT_CLIENT_ID),
-        ]
-        cookie_file.write_text("\n".join(cookie_lines) + "\n", encoding="utf-8")
+        if not silent_start:
+            await _send_progress(1, f"\U0001f510 Preparing cookies for: **{chosen.get('name')}**")
 
-        # 2. Build yt-dlp options
-        ydl_opts = {
-            "outtmpl": str(out_dir / "%(playlist_index)s - %(title)s.%(ext)s"),
-            "cookiefile": str(cookie_file),
-            "restrictfilenames": True,
-            "ignoreerrors": True,
-            "nooverwrites": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [],
-            # We intentionally do NOT force ffmpeg here; if available yt-dlp will use it.
-        }
+        cookie_file = _build_udemy_cookies_file(
+            work_dir,
+            chosen["access_token"],
+            chosen.get("client_id") or DEFAULT_CLIENT_ID,
+        )
 
-        # Progress hook
-        def _hook(d):
-            if d.get("status") == "downloading":
-                pct = int(d.get("_percent_str", "0%").replace("%", "").strip() or 0)
-                _update_progress(min(pct, 95), f"Downloading: {d.get('filename', '')[-40:]}")
-            elif d.get("status") == "finished":
-                _update_progress(96, "Post-processing / muxing...")
+        await _send_progress(3, "\U0001f680 Starting yt-dlp (all lectures)...")
 
-        ydl_opts["progress_hooks"].append(_hook)
+        ok, err = await asyncio.to_thread(
+            _download_course_with_ytdlp,
+            course_url,
+            out_dir,
+            cookie_file,
+            _sync_progress,
+        )
 
-        import yt_dlp
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            _update_progress(5, "Starting yt-dlp for course page...")
-            # The course URL from Udemy is usually relative; make absolute
-            full_url = course_url if course_url.startswith("http") else f"https://www.udemy.com{course_url}"
-            ydl.download([full_url])
+        if not ok and err:
+            await context.bot.send_message(
+                owner_id,
+                f"\u26a0\ufe0f yt-dlp warning (some lectures may still be present):\n`{err[:300]}`",
+                parse_mode="Markdown"
+            )
 
-        _update_progress(97, "Creating ZIP archive...")
+        all_files = [f for f in out_dir.rglob("*") if f.is_file()]
+        video_files = [f for f in all_files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4v", ".avi")]
 
-        # 3. Zip the downloaded tree
-        def _zip_tree(src: Path, dst: Path):
-            with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
+        if not all_files:
+            await context.bot.send_message(
+                owner_id,
+                f"\u274c **No files downloaded** for \u201c{title}\u201d.\n\n"
+                "Possible reasons:\n"
+                "\u2022 Course URL is /draft/ (Udemy DRM — cannot download)\n"
+                "\u2022 Token expired — update via /enroll_setup\n"
+                "\u2022 Course uses Widevine DRM (not extractable by yt-dlp)"
+            )
+            return
+
+        await _send_progress(90, f"\u2705 {len(video_files)} video(s) downloaded. Creating ZIP...")
+
+        def _zip_tree(src, dst):
+            with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
                 for root, _, files in os.walk(src):
-                    for f in files:
-                        full = Path(root) / f
-                        arcname = full.relative_to(src)
-                        zf.write(full, arcname)
+                    for fname in sorted(files):
+                        full = Path(root) / fname
+                        zf.write(full, full.relative_to(src))
 
-        _zip_tree(out_dir, zip_path)
+        await asyncio.to_thread(_zip_tree, out_dir, zip_path)
+        size_mb = zip_path.stat().st_size // (1024 * 1024)
+        await _send_progress(95, f"\U0001f4e6 ZIP ready: {size_mb} MB. Uploading...")
 
-        size = zip_path.stat().st_size
-        _update_progress(99, f"ZIP ready ({size // (1024*1024)} MB)")
-
-        # 4. Split if necessary.
-        # We target ~2GB single file support (matching common Telegram "large file" limits for documents).
-        # If the archive is larger than 2GB we still chunk it (very rare for a single Udemy course zip).
-        MAX_PART = 2000 * 1024 * 1024  # ~2 GiB
-        part_files = []
-        if size <= MAX_PART:
+        MAX_PART = 2000 * 1024 * 1024
+        if zip_path.stat().st_size <= MAX_PART:
             part_files = [zip_path]
         else:
-            part_files = _split_file_into_parts(zip_path, work_dir, MAX_PART)
+            part_files = await asyncio.to_thread(_split_file_into_parts, zip_path, work_dir, MAX_PART)
 
-        # 5. Upload parts to channel (or owner if no CHANNEL_ID).
-        # Uses Pyrogram (if API_ID/API_HASH provided) so we can send single files up to ~2GB.
-        target_chat = CHANNEL_ID or owner_id
+        raw_target = CHANNEL_ID if CHANNEL_ID else None
+
         for i, p in enumerate(part_files, 1):
+            part_mb = p.stat().st_size // (1024 * 1024)
+            part_label = f"Part {i}/{len(part_files)} \u2022 " if len(part_files) > 1 else ""
             caption = (
-                f"📚 **{title}**\n"
-                f"Part {i}/{len(part_files)} • {p.stat().st_size // 1024 // 1024} MB\n"
-                f"Udemy: https://www.udemy.com{course_url}\n\n"
-                f"{'Join parts with: cat *.part*.zip > full.zip (or 7-Zip)' if len(part_files) > 1 else ''}"
+                f"\U0001f4da **{title}**\n"
+                f"{part_label}{part_mb} MB\n"
+                f"\U0001f4c2 {len(video_files)} lecture(s)\n"
+                f"\U0001f517 udemy.com{course_url.split('/learn')[0]}"
             )
-            ok = await _upload_file_to_chat(target_chat, p, caption, p.name)
-            if not ok:
-                # Fallback to owner DM using the regular bot client (may still fail if >50MB)
+            if len(part_files) > 1:
+                caption += "\n\n\U0001f4a1 Join: `cat *.part*.zip > full.zip`"
+
+            await _send_progress(
+                95 + int(i * 4 / len(part_files)),
+                f"\u2b06\ufe0f Uploading part {i}/{len(part_files)} ({part_mb} MB)..."
+            )
+
+            # Convert channel ID to int if possible (Pyrogram requires numeric peer)
+            target = raw_target
+            if target and isinstance(target, str):
+                try:
+                    target = int(target)
+                except ValueError:
+                    pass  # keep as @username string — Pyrogram resolves it
+            if not target:
+                target = owner_id
+
+            upload_ok = await _upload_file_to_chat(target, p, caption, p.name)
+            if not upload_ok:
                 try:
                     with open(p, "rb") as f:
-                        await context.bot.send_document(owner_id, f, filename=p.name, caption=caption[:1020], parse_mode="Markdown")
+                        await context.bot.send_document(
+                            chat_id=owner_id,
+                            document=f,
+                            filename=p.name,
+                            caption=caption[:1020],
+                            parse_mode="Markdown",
+                        )
                 except Exception as e2:
-                    log.error(f"Fallback DM upload failed: {e2}")
+                    log.error(f"All upload methods failed for {p.name}: {e2}")
 
-        # 6. Notify owner of completion and clean queue item
         remove_from_download_queue(owner_id, udemy_id)
-        if progress_msg:
-            try:
-                await progress_msg.edit_text(
-                    f"✅ **Archive complete**\n\n**{title}**\n\n"
-                    f"Uploaded {len(part_files)} part(s) to the channel.\n"
-                    f"Item removed from queue."
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                await context.bot.send_message(owner_id, f"✅ Archive complete for “{title}” — {len(part_files)} part(s) sent.")
-            except Exception:
-                pass
+        done_txt = (
+            f"\u2705 **Archive complete!**\n\n"
+            f"\U0001f4da **{title}**\n"
+            f"\U0001f4c2 {len(video_files)} lecture(s) \u2022 {size_mb} MB\n"
+            f"\U0001f4e6 {len(part_files)} ZIP part(s) uploaded\n\n"
+            "Item removed from queue."
+        )
+        try:
+            if progress_msg:
+                await progress_msg.edit_text(done_txt, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(owner_id, done_txt, parse_mode="Markdown")
+        except Exception:
+            pass
 
     except Exception as e:
         log.exception(f"Archive failed for {title}: {e}")
         try:
-            await context.bot.send_message(owner_id, f"❌ Archive failed for “{title}”:\n{str(e)[:300]}")
+            await context.bot.send_message(owner_id, f"\u274c Archive failed for \u201c{title}\u201d:\n`{str(e)[:300]}`", parse_mode="Markdown")
         except Exception:
             pass
     finally:
-        # Cleanup
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
-
 
 def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
     """Split a large file into sequentially named .partXX.zip files."""
@@ -514,27 +599,32 @@ def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
     return parts
 
 
-async def _upload_file_to_chat(chat_id: int, file_path: Path, caption: str, filename: str | None = None) -> bool:
+async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=None) -> bool:
     """
     Upload a (potentially large) file to a chat.
-    - If API_ID + API_HASH are configured, use Pyrogram (MTProto) which supports files up to ~2GB.
-    - Otherwise fall back to the regular Bot API send_document (limited to ~50MB).
+    - If API_ID + API_HASH configured → Pyrogram (MTProto, up to ~2GB).
+    - Otherwise → Bot API fallback (limited to ~50MB).
     Returns True on success.
     """
-    file_size = file_path.stat().st_size
+    size_mb = file_path.stat().st_size // (1024 * 1024)
 
-    # Try Pyrogram large file upload first
+    # Normalise chat_id: Pyrogram requires int for numeric ids, or @username str
+    if isinstance(chat_id, str):
+        try:
+            chat_id = int(chat_id)
+        except ValueError:
+            pass  # keep as @username
+
     if API_ID and API_HASH:
         try:
             from pyrogram import Client
-            # We use a unique session name per call to avoid lock issues in long-running bot
-            session_name = f"archive_uploader_{int(datetime.utcnow().timestamp())}"
+            session_name = f"arc_{int(datetime.utcnow().timestamp())}"
             async with Client(
                 session_name,
                 api_id=int(API_ID),
                 api_hash=API_HASH,
                 bot_token=os.getenv("BOT_TOKEN"),
-                in_memory=True,   # don't write session files
+                in_memory=True,
             ) as client:
                 await client.send_document(
                     chat_id=chat_id,
@@ -543,11 +633,11 @@ async def _upload_file_to_chat(chat_id: int, file_path: Path, caption: str, file
                     file_name=filename,
                     force_document=True,
                 )
-            log.info(f"Pyrogram upload succeeded for {file_path.name} ({file_size // (1024*1024)} MB)")
+            log.info(f"Pyrogram upload OK: {file_path.name} ({size_mb} MB)")
             return True
         except Exception as e:
-            log.error(f"Pyrogram large upload failed for {file_path.name}: {e}")
-            # fall through to bot API fallback
+            log.error(f"Pyrogram upload failed for {file_path.name}: {e}")
+            # fall through
 
     # Fallback: regular python-telegram-bot (will fail gracefully if >~50MB)
     try:
