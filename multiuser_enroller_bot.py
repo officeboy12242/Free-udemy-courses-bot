@@ -663,9 +663,50 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                 errors.append(f"Lecture {lid} API error {r_lec.status_code}")
                 continue
 
-            asset = r_lec.json().get("asset") or {}
+            lecture_json = r_lec.json()
+            asset = lecture_json.get("asset") or {}
             atype = asset.get("asset_type", "")
             ms = asset.get("media_sources") or []
+            download_urls = asset.get("download_urls") or {}
+            is_drm = bool(asset.get("asset_is_drmed") or asset.get("course_is_drmed"))
+
+            # Download ALL supplementary assets (PDFs, ZIPs, code files, docs, etc.)
+            # for every lecture — including DRM-protected video lectures.
+            # This is legal as these are separate attached files.
+            for sidx, supp in enumerate(lecture_json.get("supplementary_assets") or [], 1):
+                try:
+                    supp_title = supp.get("title", f"resource_{sidx}")
+                    supp_filename = supp.get("filename", supp_title)
+                    s_urls = supp.get("download_urls") or {}
+                    s_file_url = None
+                    if isinstance(s_urls, dict):
+                        for _k in ("File", "file", "SourceCode", "video", "Video"):
+                            _v = s_urls.get(_k)
+                            if isinstance(_v, list) and _v:
+                                s_file_url = _v[0].get("file") if isinstance(_v[0], dict) else _v[0]
+                            elif isinstance(_v, dict) and _v.get("file"):
+                                s_file_url = _v.get("file")
+                            if s_file_url:
+                                break
+                    if not s_file_url and isinstance(s_urls, list) and s_urls:
+                        s_file_url = s_urls[0].get("file") if isinstance(s_urls[0], dict) else s_urls[0]
+                    if not s_file_url:
+                        continue
+                    safe_s = "".join(c if c.isalnum() or c in " -_." else "_" for c in supp_filename)[:90]
+                    if not any(safe_s.lower().endswith(ext) for ext in (".pdf", ".zip", ".rar", ".7z", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".html", ".htm", ".epub", ".py", ".js", ".json", ".csv")):
+                        guess = str(s_file_url).split("?")[0].rsplit(".", 1)[-1]
+                        if 1 < len(guess) <= 6:
+                            safe_s += f".{guess}"
+                    s_path = lec_dir / f"{safe_lec}_res{sidx}_{safe_s}"
+                    if s_path.exists():
+                        continue
+                    rs = session.get(s_file_url, stream=True, timeout=90)
+                    if rs.status_code == 200:
+                        with open(s_path, "wb") as ff:
+                            for ch in rs.iter_content(8192):
+                                ff.write(ch)
+                except Exception as _se:
+                    errors.append(f"Resource error for {ltitle} #{sidx}: {_se}")
 
             if atype == "Article":
                 # Save article text as .html
@@ -683,13 +724,45 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                     ref_path.write_text(ext_url, encoding="utf-8")
                 continue
 
-            if not ms:
-                errors.append(f"No media for: {ltitle}")
-                continue
+            # Prefer official "Download" files when Udemy provides them (authorized by the course settings)
+            # This can succeed for some lectures even if the streaming asset is flagged DRM.
+            direct_got = False
+            if download_urls:
+                d_url = None
+                for key in ("Video", "video", "mp4", "File", "SourceCode"):
+                    val = download_urls.get(key)
+                    if isinstance(val, list) and val:
+                        it = val[0]
+                        d_url = it.get("file") if isinstance(it, dict) else it
+                    elif isinstance(val, dict) and val.get("file"):
+                        d_url = val["file"]
+                    if d_url:
+                        break
+                if d_url:
+                    try:
+                        rd = session.get(d_url, stream=True, timeout=120)
+                        if rd.status_code == 200:
+                            dext = str(d_url).split("?")[0].rsplit(".", 1)[-1] or "mp4"
+                            if len(dext) > 6 or "/" in dext:
+                                dext = "mp4"
+                            dp = lec_dir / f"{safe_lec}.{dext}"
+                            if not dp.exists():
+                                with open(dp, "wb") as ff:
+                                    for ch in rd.iter_content(8192):
+                                        ff.write(ch)
+                            direct_got = True
+                            log.info(f"Used official download link for: {ltitle}")
+                    except Exception as _de:
+                        log.warning(f"Direct download attempt failed for {ltitle}: {_de}")
 
-            if asset.get("asset_is_drmed") or asset.get("course_is_drmed"):
-                errors.append(f"DRM protected (skipped): {ltitle}")
-                continue
+            if not direct_got:
+                if not ms:
+                    errors.append(f"No media for: {ltitle}")
+                    continue
+
+                if is_drm:
+                    errors.append(f"DRM protected (skipped): {ltitle}")
+                    continue
 
             # Try to get M3U8 (HLS) source first
             m3u8_master_url = next(
@@ -785,49 +858,7 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([download_url])
-            
-            # Download supplementary assets (attachments/resources)
-            lecture_detail = r_lec.json()
-            supplementary_assets = lecture_detail.get("supplementary_assets") or []
-            
-            if supplementary_assets:
-                for idx, supp in enumerate(supplementary_assets, 1):
-                    try:
-                        supp_title = supp.get("title", f"resource_{idx}")
-                        supp_filename = supp.get("filename", supp_title)
-                        download_urls = supp.get("download_urls")
-                        
-                        if not download_urls:
-                            continue
-                        
-                        # Get the file URL (usually in 'File' or first available key)
-                        file_url = None
-                        if isinstance(download_urls, dict):
-                            file_url = download_urls.get("File") or download_urls.get(list(download_urls.keys())[0])
-                        elif isinstance(download_urls, list) and download_urls:
-                            file_url = download_urls[0].get("file")
-                        
-                        if not file_url:
-                            continue
-                        
-                        # Sanitize filename
-                        safe_filename = "".join(c if c.isalnum() or c in " -_." else "_" for c in supp_filename)[:100]
-                        if not any(safe_filename.endswith(ext) for ext in [".pdf", ".zip", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".html", ".htm", ".epub"]):
-                            # Try to get extension from URL
-                            ext_match = file_url.split("?")[0].split(".")[-1]
-                            if len(ext_match) <= 5:
-                                safe_filename += f".{ext_match}"
-                        
-                        resource_path = lec_dir / f"{safe_lec}_resource_{idx}_{safe_filename}"
-                        
-                        # Download resource
-                        r_res = session.get(file_url, stream=True, timeout=60)
-                        if r_res.status_code == 200:
-                            with open(resource_path, "wb") as f:
-                                for chunk in r_res.iter_content(chunk_size=8192):
-                                    f.write(chunk)
-                    except Exception as e_supp:
-                        log.warning(f"Failed to download supplementary asset {idx} for {ltitle}: {e_supp}")
+            # (supplementary assets already downloaded earlier for all lectures, DRM or not)
 
         except Exception as e:
             errors.append(f"Error on {ltitle}: {e}")
@@ -1148,17 +1179,35 @@ async def _start_course_archive(update, context, item, silent_start=False):
             )
 
         if errs:
-            err_summary = "\n".join(errs[:5])
-            if len(errs) > 5:
-                err_summary += f"\n... +{len(errs)-5} more"
-            try:
-                await context.bot.send_message(
-                    owner_id,
-                    f"\u26a0\ufe0f Some lectures skipped ({len(errs)} issues):\n`{err_summary[:400]}`",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+            drm_errs = [e for e in errs if "DRM protected" in e]
+            other_errs = [e for e in errs if "DRM protected" not in e]
+
+            if drm_errs:
+                drm_list = "\n".join("• " + e.split(":", 1)[1].strip() for e in drm_errs if ":" in e)[:800]
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        f"🔒 **DRM-protected lectures skipped** ({len(drm_errs)})\n\n"
+                        f"These videos are protected by Udemy's DRM and cannot be downloaded by third-party tools.\n"
+                        f"Use the official Udemy website or mobile app 'Download' feature for offline viewing of these lectures:\n\n"
+                        f"{drm_list}",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+            if other_errs:
+                err_summary = "\n".join(other_errs[:5])
+                if len(other_errs) > 5:
+                    err_summary += f"\n... +{len(other_errs)-5} more"
+                try:
+                    await context.bot.send_message(
+                        owner_id,
+                        f"\u26a0\ufe0f Some other issues while archiving ({len(other_errs)}):\n`{err_summary[:400]}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
         all_files = [f for f in out_dir.rglob("*") if f.is_file()]
         video_files = [f for f in all_files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4v", ".avi")]
