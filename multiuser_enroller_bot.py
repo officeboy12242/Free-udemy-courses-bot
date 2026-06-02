@@ -91,6 +91,49 @@ def get_disk_usage(path="/"):
         return None
 
 
+def get_cpu_usage():
+    """Get CPU + memory usage stats. Non-blocking (interval=None uses cached value)."""
+    if not PSUTIL_AVAILABLE:
+        return None
+    try:
+        # interval=None is non-blocking (returns since-last-call value) → low overhead
+        cpu_pct = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory()
+        return {
+            "cpu_percent": cpu_pct,
+            "cores": psutil.cpu_count(logical=True) or 1,
+            "mem_percent": mem.percent,
+            "mem_used_gb": mem.used / (1024**3),
+            "mem_total_gb": mem.total / (1024**3),
+        }
+    except Exception:
+        return None
+
+
+def _session_get_retry(session, url, retries=3, timeout=20, **kwargs):
+    """GET with simple retry/backoff for transient Udemy API failures.
+
+    Returns the Response (possibly non-200) or None if all attempts errored.
+    """
+    import time as _t
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, timeout=timeout, **kwargs)
+            # Retry only on transient server-side / rate-limit statuses
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                _t.sleep(1.5 * (attempt + 1))
+                continue
+            return resp
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                _t.sleep(1.5 * (attempt + 1))
+    if last_exc:
+        log.warning(f"GET failed after {retries} attempts: {url} ({last_exc})")
+    return None
+
+
 def format_bytes(bytes_val):
     """Format bytes to human-readable string"""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -103,6 +146,12 @@ def format_bytes(bytes_val):
 async def init_bot_pool():
     """Initialize bot pool from UPLOAD_BOT_TOKENS"""
     global bot_pool
+    # Prime CPU meter so the first get_cpu_usage() call returns a real value.
+    if PSUTIL_AVAILABLE:
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
     with bot_pool_lock:
         bot_pool.clear()
         for token in UPLOAD_BOT_TOKENS:
@@ -375,11 +424,14 @@ def _build_status_text(remaining: int | None = None) -> str:
                 msg += f" | ⏱ {eta}"
             msg += "\n\n"
 
+    cpu = get_cpu_usage()
+    if cpu:
+        msg += f"🖥️ **CPU:** {cpu['cpu_percent']:.0f}% of {cpu['cores']} core(s)\n"
+        msg += f"🧠 **RAM:** {cpu['mem_used_gb']:.1f}/{cpu['mem_total_gb']:.1f} GB ({cpu['mem_percent']:.0f}%)\n"
+
     disk = get_disk_usage()
     if disk:
-        msg += f"💾 **Disk Usage**\n"
-        msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
-        msg += f"Free: {disk['free_gb']:.1f} GB\n"
+        msg += f"💾 **Disk:** {disk['used_gb']:.1f}/{disk['total_gb']:.1f} GB ({disk['percent']:.0f}%) • Free {disk['free_gb']:.1f} GB\n"
 
     if remaining is not None and remaining > 0:
         msg += f"\n_Live view • Refreshing... ({remaining}s remaining)_"
@@ -550,6 +602,64 @@ def _get_course_id_from_url(course_url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _resolve_course(session, course_url, course_id_hint=None):
+    """Resolve (course_id, course_title) robustly.
+
+    Prefers the known numeric course_id (course_id_hint) so we don't fail the
+    whole course just because a slug lookup returns 404/403. Falls back to slug
+    lookup, then to searching the user's subscribed courses.
+    Returns (course_id, title) — course_id may be None only if everything fails.
+    """
+    # 1) Use the numeric hint directly if we have one (most reliable).
+    if course_id_hint and str(course_id_hint).isdigit():
+        title = None
+        r = _session_get_retry(
+            session,
+            f"https://www.udemy.com/api-2.0/courses/{course_id_hint}/?fields[course]=title",
+        )
+        if r is not None and r.status_code == 200:
+            try:
+                title = r.json().get("title")
+            except Exception:
+                title = None
+        return int(course_id_hint), (title or f"Course-{course_id_hint}")
+
+    # 2) Try slug/numeric extracted from the URL.
+    slug_or_id = _get_course_id_from_url(course_url)
+    if slug_or_id:
+        r = _session_get_retry(
+            session,
+            f"https://www.udemy.com/api-2.0/courses/{slug_or_id}/?fields[course]=id,title",
+        )
+        if r is not None and r.status_code == 200:
+            try:
+                data = r.json()
+                if data.get("id"):
+                    return data["id"], data.get("title", str(slug_or_id))
+            except Exception:
+                pass
+        # 2b) If slug is purely numeric, trust it even if metadata fetch failed.
+        if str(slug_or_id).isdigit():
+            return int(slug_or_id), f"Course-{slug_or_id}"
+
+        # 3) Last resort: search the user's subscribed courses by the slug words.
+        try:
+            query = str(slug_or_id).replace("-", " ")
+            rs = _session_get_retry(
+                session,
+                f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/"
+                f"?search={requests.utils.quote(query)}&page_size=1&fields[course]=id,title",
+            )
+            if rs is not None and rs.status_code == 200:
+                results = rs.json().get("results") or []
+                if results and results[0].get("id"):
+                    return results[0]["id"], results[0].get("title", query)
+        except Exception:
+            pass
+
+    return None, None
+
+
 def _get_best_m3u8(master_m3u8_content: str, prefer_height: int = 720) -> str | None:
     """Parse an HLS master playlist and pick the best quality variant URL."""
     import re
@@ -569,7 +679,7 @@ def _get_best_m3u8(master_m3u8_content: str, prefer_height: int = 720) -> str | 
     return chosen[2]
 
 
-def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, client_id: str, progress_callback=None, lecture_subset=None, batch_num=0):
+def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, client_id: str, progress_callback=None, lecture_subset=None, batch_num=0, course_id_hint=None):
     """
     Download all or a subset of lectures of a Udemy course by:
     1. Using the Udemy subscriber-curriculum-items API to enumerate all chapters/lectures
@@ -591,23 +701,11 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         "Referer": "https://www.udemy.com/",
     })
 
-    # Resolve course ID
-    slug_or_id = _get_course_id_from_url(course_url)
-    if not slug_or_id:
-        return False, ["Cannot extract course identifier from URL"]
-
-    # Try to get numeric course_id from search or by fetching the course info
-    r_course = session.get(
-        f"https://www.udemy.com/api-2.0/courses/{slug_or_id}/?fields[course]=id,title",
-        timeout=20
-    )
-    if r_course.status_code != 200:
-        return False, [f"Cannot fetch course info: HTTP {r_course.status_code}"]
-    course_data = r_course.json()
-    course_id = course_data.get("id")
-    course_title = course_data.get("title", slug_or_id)
+    # Resolve course ID robustly (prefer the known numeric id so we don't fail
+    # the whole course on a flaky slug lookup).
+    course_id, course_title = _resolve_course(session, course_url, course_id_hint)
     if not course_id:
-        return False, ["Cannot find course_id"]
+        return False, ["Cannot resolve course (check URL / token, or course may be removed)"]
 
     if progress_callback:
         progress_callback(2, f"📚 Found course: **{course_title}**\nFetching curriculum...")
@@ -622,8 +720,8 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         f"&fields[asset]=id,asset_type,filename,media_sources,is_downloadable"
     )
     while next_page:
-        r = session.get(next_page, timeout=20)
-        if r.status_code != 200:
+        r = _session_get_retry(session, next_page)
+        if r is None or r.status_code != 200:
             break
         data = r.json()
         all_items.extend(data.get("results", []))
@@ -893,7 +991,9 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                 "nooverwrites": True,
                 "retries": 5,
                 "fragment_retries": 10,
-                "concurrent_fragment_downloads": 8,  # Increased from 4 to 8 for faster downloads
+                # Scale fragment concurrency DOWN by the number of parallel workers so
+                # total connections (and CPU) stay bounded (~8) instead of workers*8.
+                "concurrent_fragment_downloads": max(2, 8 // max(1, len(bot_pool))),
                 "http_chunk_size": 10485760,  # 10MB chunks for better speed
                 "quiet": True,
                 "no_warnings": True,
@@ -910,7 +1010,7 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
     return True, errors
 
 
-async def _download_course_parallel(course_url: str, out_dir: Path, access_token: str, client_id: str, num_workers: int, progress_callback=None):
+async def _download_course_parallel(course_url: str, out_dir: Path, access_token: str, client_id: str, num_workers: int, progress_callback=None, course_id_hint=None):
     """
     Download course using multiple parallel workers (bots).
     Each worker downloads a subset of lectures simultaneously.
@@ -927,24 +1027,10 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
         "Referer": "https://www.udemy.com/",
     })
 
-    # Get course info and curriculum (same as single-bot version)
-    slug_or_id = _get_course_id_from_url(course_url)
-    if not slug_or_id:
-        return False, ["Cannot extract course identifier from URL"]
-
-    r_course = session.get(
-        f"https://www.udemy.com/api-2.0/courses/{slug_or_id}/?fields[course]=id,title",
-        timeout=20
-    )
-    if r_course.status_code != 200:
-        return False, [f"Cannot fetch course info: HTTP {r_course.status_code}"]
-    
-    course_data = r_course.json()
-    course_id = course_data.get("id")
-    course_title = course_data.get("title", slug_or_id)
-    
+    # Resolve course robustly (prefer the numeric hint).
+    course_id, course_title = _resolve_course(session, course_url, course_id_hint)
     if not course_id:
-        return False, ["Cannot find course_id"]
+        return False, ["Cannot resolve course (check URL / token, or course may be removed)"]
 
     # Get full curriculum
     all_items = []
@@ -956,8 +1042,8 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
         f"&fields[asset]=id,asset_type,filename,media_sources,is_downloadable"
     )
     while next_page:
-        r = session.get(next_page, timeout=20)
-        if r.status_code != 200:
+        r = _session_get_retry(session, next_page)
+        if r is None or r.status_code != 200:
             break
         data = r.json()
         all_items.extend(data.get("results", []))
@@ -1022,7 +1108,8 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
             client_id,
             batch_progress,
             batch_lectures,
-            batch_idx
+            batch_idx,
+            course_id,  # pass resolved numeric id so batches don't re-resolve/fail
         )
     
     # Execute all downloads in parallel
@@ -1141,13 +1228,16 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 if bot_info:
                     active_tasks[task_id]["bots"] = bot_info
         
-        # Add disk usage to stage info
+        # Add CPU + disk usage to stage info
+        sys_info = ""
+        cpu = get_cpu_usage()
+        if cpu:
+            sys_info += f"\n🖥️ CPU {cpu['cpu_percent']:.0f}% • 🧠 RAM {cpu['mem_percent']:.0f}%"
         disk = get_disk_usage(str(work_dir))
-        disk_info = ""
         if disk:
-            disk_info = f"\n💾 Free: {disk['free_gb']:.1f} GB"
+            sys_info += f"\n💾 Free: {disk['free_gb']:.1f} GB"
         
-        txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}{disk_info}"
+        txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}{sys_info}"
         
         # Add bot status if parallel downloads
         if bot_info and len(bot_info) > 1:
@@ -1221,6 +1311,7 @@ async def _start_course_archive(update, context, item, silent_start=False):
                     chosen.get("client_id") or DEFAULT_CLIENT_ID,
                     num_workers,
                     _sync_progress,
+                    udemy_id,  # known numeric course id → robust resolution
                 )
             else:
                 log.info("Using single-threaded download (no bot pool configured)")
@@ -1231,6 +1322,9 @@ async def _start_course_archive(update, context, item, silent_start=False):
                     chosen["access_token"],
                     chosen.get("client_id") or DEFAULT_CLIENT_ID,
                     _sync_progress,
+                    None,        # lecture_subset
+                    0,           # batch_num
+                    udemy_id,    # course_id_hint
                 )
         except Exception as dl_err:
             # Download phase crashed partway — keep going and archive whatever we have.
@@ -1301,7 +1395,10 @@ async def _start_course_archive(update, context, item, silent_start=False):
         await _send_progress(90, f"\u2705 {len(video_files)} video(s) downloaded. Creating ZIP...")
 
         def _zip_tree(src, dst):
-            with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            # Use ZIP_STORED (no compression). Course content is mostly already-
+            # compressed video (mp4/m3u8) — deflating it burns lots of CPU for
+            # almost zero size saving. Storing keeps CPU usage minimal.
+            with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
                 for root, _, files in os.walk(src):
                     for fname in sorted(files):
                         full = Path(root) / fname
