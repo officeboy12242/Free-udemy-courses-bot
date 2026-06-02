@@ -173,6 +173,46 @@ class UdemyAutoEnroller:
         except Exception as e:
             log.debug(f"Failed to get user info: {e}")
             return None
+
+    def search_enrolled_courses(
+        self,
+        query: str,
+        max_results: int = 20,
+        page_size: int = 200,
+    ) -> list:
+        """Search enrolled courses by title (client-side filtering)."""
+        if not query:
+            return []
+        query_lower = query.strip().lower()
+        results = []
+        url = (
+            "https://www.udemy.com/api-2.0/users/me/subscribed-courses/"
+            f"?page_size={page_size}&fields[course]=title,url"
+        )
+        r = self._get(url)
+        if not r or r.status_code != 200:
+            return []
+        try:
+            data = r.json()
+        except Exception:
+            return []
+        for course in data.get("results", []):
+            title = course.get("title", "")
+            if query_lower in title.lower():
+                url = course.get("url", "")
+                if url and not url.startswith("http"):
+                    url = f"https://www.udemy.com{url}"
+                results.append(
+                    {
+                        "id": course.get("id"),
+                        "title": title.strip(),
+                        "url": url,
+                    }
+                )
+                if len(results) >= max_results:
+                    break
+
+        return results
     
     @staticmethod
     def _extract_slug(url: str) -> str:

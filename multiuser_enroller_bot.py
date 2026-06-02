@@ -7,6 +7,8 @@ Multi-Account Udemy Auto-Enroller Bot
 
 import asyncio
 import logging
+import time
+import uuid
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import ContextTypes, Application
@@ -519,6 +521,150 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode="Markdown"
     )
 
+
+async def cmd_course_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: search enrolled courses across all accounts and post to channel"""
+    if not update.effective_user or not update.effective_message:
+        return
+
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await update.effective_message.reply_text("Owner only.", parse_mode="Markdown")
+        return
+
+    query_text = " ".join(context.args).strip() if context.args else ""
+    if not query_text:
+        await update.effective_message.reply_text(
+            "Usage: `/course_search <keyword>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    accounts = get_user_accounts(user_id)
+    if not accounts:
+        await update.effective_message.reply_text(
+            "No accounts set up.\nRun `/enroll_setup` to add one.",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await update.effective_message.reply_text("🔍 Searching enrolled courses...")
+
+    async def search_account(account: dict) -> dict:
+        try:
+            enroller = UdemyAutoEnroller(account["access_token"], account["client_id"])
+            is_valid = await asyncio.to_thread(enroller.verify_login)
+            if not is_valid:
+                return {"account": account, "error": "Login failed", "courses": []}
+            courses = await asyncio.to_thread(
+                enroller.search_enrolled_courses,
+                query_text,
+                10,
+                200,
+            )
+            return {"account": account, "error": None, "courses": courses}
+        except Exception as e:
+            return {"account": account, "error": str(e), "courses": []}
+
+    results = await asyncio.gather(*[search_account(a) for a in accounts])
+
+    combined = []
+    for res in results:
+        for course in res["courses"]:
+            combined.append({
+                "title": course["title"],
+                "url": course["url"],
+                "account_name": res["account"]["name"],
+            })
+
+    if not combined:
+        await msg.edit_text("❌ No matching enrolled courses found.")
+        return
+
+    combined = combined[:15]
+    lines = [f"🔎 **Results for:** `{query_text}`\n"]
+    keyboard = []
+    search_id = uuid.uuid4().hex[:10]
+    for idx, course in enumerate(combined, start=1):
+        title = course["title"][:70] + "..." if len(course["title"]) > 70 else course["title"]
+        lines.append(f"{idx}. **{title}**\n   _{course['account_name']}_")
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📢 Post #{idx}",
+                callback_data=f"course_pick:{search_id}:{idx-1}"
+            )
+        ])
+
+    context.bot_data.setdefault("course_search_results", {})
+    context.bot_data["course_search_results"][search_id] = {
+        "created_at": time.time(),
+        "query": query_text,
+        "results": combined,
+    }
+
+    await msg.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def course_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle course_search callbacks"""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    if not is_owner(user_id):
+        await query.answer("Owner only.", show_alert=True)
+        return
+
+    if not CHANNEL_ID:
+        await query.answer("CHANNEL_ID not set.", show_alert=True)
+        return
+
+    data = query.data or ""
+    try:
+        _, search_id, idx_str = data.split(":")
+        idx = int(idx_str)
+    except ValueError:
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    search_store = context.bot_data.get("course_search_results", {})
+    payload = search_store.get(search_id)
+    if not payload:
+        await query.answer("Search expired. Run /course_search again.", show_alert=True)
+        return
+
+    results = payload.get("results", [])
+    if idx < 0 or idx >= len(results):
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    course = results[idx]
+    title = course["title"]
+    url = course["url"]
+    account_name = course["account_name"]
+
+    text = (
+        f"🎓 **{title}**\n"
+        f"{url}\n\n"
+        f"Account: _{account_name}_"
+    )
+
+    try:
+        await query.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            parse_mode="Markdown"
+        )
+        await query.answer("Posted to channel ✅")
+    except Exception as e:
+        log.error(f"Post to channel failed: {e}")
+        await query.answer("Failed to post.", show_alert=True)
 
 # ─── Auto-Enroll Toggle ─────────────────────────────────────────────────────
 
