@@ -334,8 +334,8 @@ class UdemyAutoEnroller:
             {
                 "buyable": {"id": str(cid), "type": "course"},
                 "discountInfo": {"code": coup} if coup else {},
-                        "price": {"amount": 0, "currency": self.currency.upper()},
-                    }
+                "price": {"amount": 0, "currency": self.currency.upper()},
+            }
             for cid, coup, _ in courses_to_enroll
         ]
 
@@ -358,7 +358,7 @@ class UdemyAutoEnroller:
             r = self._post("https://www.udemy.com/payment/checkout-submit/", json=payload, headers=headers)
             if not r:
                 continue
-                if r.status_code == 504:
+            if r.status_code == 504:
                 return [t for _, _, t in courses_to_enroll]
             try:
                 if r.json().get("status") == "succeeded":
