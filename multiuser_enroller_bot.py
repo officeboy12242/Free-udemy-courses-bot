@@ -632,17 +632,18 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         lec = item
         lid = lec["id"]
         
+        lecture_counter[0] += 1
+        lindex = lec.get("object_index", lecture_counter[0])
+        
         # Skip if not in subset (for parallel downloads)
         if lecture_ids_to_process is not None and lid not in lecture_ids_to_process:
             continue
         
         ltitle = lec.get("title", f"Lecture {lid}")
-        lindex = lec.get("object_index", lecture_counter[0] + 1)
         chap = current_chap[0]
         chap_num = chap_num_counter[0]
         chap_title = chap.get("title", "Uncategorized")
 
-        lecture_counter[0] += 1
         safe_chap = f"{chap_num:02d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in chap_title)[:50]
         safe_lec = f"{lindex:03d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in ltitle)[:55]
         lec_dir = out_dir / safe_chap
@@ -1008,7 +1009,12 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
                     rel_path = item.relative_to(batch_dir)
                     dest = out_dir / rel_path
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(item), str(dest))
+                    try:
+                        if dest.exists():
+                            dest.unlink()  # Prevent FileExistsError on Windows
+                        shutil.move(str(item), str(dest))
+                    except Exception as e:
+                        all_errors.append(f"Merge error for {item.name}: {e}")
             # Remove batch dir
             shutil.rmtree(batch_dir, ignore_errors=True)
     
