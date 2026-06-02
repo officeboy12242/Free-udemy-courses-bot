@@ -345,6 +345,7 @@ def _download_course_with_ytdlp(course_url, out_dir, cookie_file, progress_callb
 
     outtmpl = str(out_dir / "%(chapter_number)s - %(chapter)s" / "%(playlist_index)s - %(title)s.%(ext)s")
     last_pct = [0]
+    lecture_counter = [0]
 
     def _hook(d):
         if progress_callback is None:
@@ -356,10 +357,35 @@ def _download_course_with_ytdlp(course_url, out_dir, cookie_file, progress_callb
             except Exception:
                 pct = last_pct[0]
             last_pct[0] = pct
-            fname = Path(d.get("filename", "")).name[-50:]
-            progress_callback(int(pct * 0.88), f"\u2b07\ufe0f {fname}")
+
+            speed = d.get("_speed_str") or d.get("speed_str") or ""
+            eta   = d.get("_eta_str")   or d.get("eta_str")   or ""
+            downloaded = d.get("_downloaded_bytes_str") or ""
+            total      = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or ""
+            fname = Path(d.get("filename", "")).name
+            # Strip path noise – keep just filename
+            if "/" in fname:
+                fname = fname.rsplit("/", 1)[-1]
+            if "\\" in fname:
+                fname = fname.rsplit("\\", 1)[-1]
+            fname = fname[:50]
+
+            stage_lines = [f"📄 `{fname}`"]
+            if downloaded and total:
+                stage_lines.append(f"📦 {downloaded} / {total}")
+            if speed:
+                stage_lines.append(f"⚡ {speed}")
+            if eta:
+                stage_lines.append(f"⏱ ETA {eta}")
+
+            progress_callback(int(pct * 0.88), "\n".join(stage_lines))
+
         elif status == "finished":
-            progress_callback(int(last_pct[0] * 0.88), "\U0001f500 Merging / processing...")
+            lecture_counter[0] += 1
+            progress_callback(
+                int(last_pct[0] * 0.88),
+                f"🔀 Merging lecture #{lecture_counter[0]}..."
+            )
 
     ydl_opts = {
         "outtmpl": outtmpl,
@@ -525,11 +551,6 @@ async def _start_course_archive(update, context, item, silent_start=False):
             if len(part_files) > 1:
                 caption += "\n\n\U0001f4a1 Join: `cat *.part*.zip > full.zip`"
 
-            await _send_progress(
-                95 + int(i * 4 / len(part_files)),
-                f"\u2b06\ufe0f Uploading part {i}/{len(part_files)} ({part_mb} MB)..."
-            )
-
             # Convert channel ID to int if possible (Pyrogram requires numeric peer)
             target = raw_target
             if target and isinstance(target, str):
@@ -540,7 +561,41 @@ async def _start_course_archive(update, context, item, silent_start=False):
             if not target:
                 target = owner_id
 
-            upload_ok = await _upload_file_to_chat(target, p, caption, p.name)
+            upload_start = [datetime.utcnow()]
+            upload_last_edit = [0.0]
+
+            async def _upload_progress_cb(current, total):
+                import time
+                now = time.time()
+                if now - upload_last_edit[0] < 5:
+                    return
+                upload_last_edit[0] = now
+                elapsed = max((datetime.utcnow() - upload_start[0]).total_seconds(), 0.1)
+                speed_bps = current / elapsed
+                if speed_bps > 1_048_576:
+                    speed_str = f"{speed_bps / 1_048_576:.1f} MB/s"
+                elif speed_bps > 1024:
+                    speed_str = f"{speed_bps / 1024:.0f} KB/s"
+                else:
+                    speed_str = f"{speed_bps:.0f} B/s"
+
+                remaining = max(total - current, 0)
+                eta_secs = int(remaining / speed_bps) if speed_bps > 0 else 0
+                eta_str = f"{eta_secs // 60}m {eta_secs % 60}s" if eta_secs > 60 else f"{eta_secs}s"
+                uploaded_mb = current / 1_048_576
+                total_mb = total / 1_048_576
+                pct_ul = int(current / total * 100) if total else 0
+                bar = "█" * (pct_ul // 10) + "░" * (10 - pct_ul // 10)
+
+                stage = (
+                    f"⬆️ Uploading part {i}/{len(part_files)}\n"
+                    f"[{bar}] {pct_ul}%\n"
+                    f"📦 {uploaded_mb:.1f} / {total_mb:.1f} MB\n"
+                    f"⚡ {speed_str}   ⏱ ETA {eta_str}"
+                )
+                asyncio.create_task(_send_progress(95 + int(i * 4 / len(part_files)), stage))
+
+            upload_ok = await _upload_file_to_chat(target, p, caption, p.name, progress_cb=_upload_progress_cb)
             if not upload_ok:
                 try:
                     with open(p, "rb") as f:
@@ -599,12 +654,13 @@ def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
     return parts
 
 
-async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=None) -> bool:
+async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=None, progress_cb=None) -> bool:
     """
     Upload a (potentially large) file to a chat.
-    - If API_ID + API_HASH configured → Pyrogram (MTProto, up to ~2GB).
+    - If API_ID + API_HASH configured → Pyrogram (MTProto, up to ~2GB, with upload progress).
     - Otherwise → Bot API fallback (limited to ~50MB).
     Returns True on success.
+    progress_cb: async callable(current_bytes, total_bytes) for upload progress.
     """
     size_mb = file_path.stat().st_size // (1024 * 1024)
 
@@ -632,6 +688,7 @@ async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=
                     caption=caption[:1020] if caption else None,
                     file_name=filename,
                     force_document=True,
+                    progress=progress_cb,   # Pyrogram calls this with (current, total)
                 )
             log.info(f"Pyrogram upload OK: {file_path.name} ({size_mb} MB)")
             return True
