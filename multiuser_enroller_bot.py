@@ -827,8 +827,18 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     except Exception as e:
         log.exception(f"Archive failed for {title}: {e}")
+        # Remove from queue even on failure (to avoid accumulating failed items)
         try:
-            await context.bot.send_message(owner_id, f"\u274c Archive failed for \u201c{title}\u201d:\n`{str(e)[:300]}`", parse_mode="Markdown")
+            remove_from_download_queue(owner_id, udemy_id)
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                owner_id, 
+                f"\u274c Archive failed for \u201c{title}\u201d:\n`{str(e)[:300]}`\n\n"
+                f"Item removed from queue.",
+                parse_mode="Markdown"
+            )
         except Exception:
             pass
     finally:
@@ -1743,10 +1753,47 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not queue:
             await query.answer("Queue is empty.")
             return
-        await query.answer(f"🚀 Starting archive for {len(queue)} courses (one by one)...")
-        # Process sequentially to avoid hammering disk/bandwidth
-        for item in queue:
-            await _start_course_archive(update, context, item, silent_start=True)
+        await query.answer(f"🚀 Starting archive for {len(queue)} courses...")
+        
+        # Send initial notification
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"🚀 **Archive ALL started**\n\n"
+                f"Processing {len(queue)} course(s) from the queue.\n"
+                f"Each will be downloaded and uploaded sequentially.\n\n"
+                f"You'll receive notifications for each course.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        
+        # Process sequentially with error handling
+        success_count = 0
+        failed_courses = []
+        
+        for idx, item in enumerate(queue, 1):
+            try:
+                log.info(f"Archive ALL: Processing {idx}/{len(queue)}: {item.get('title')}")
+                await _start_course_archive(update, context, item, silent_start=True)
+                success_count += 1
+            except Exception as e:
+                log.exception(f"Archive ALL: Failed for {item.get('title')}: {e}")
+                failed_courses.append(item.get('title', 'Unknown'))
+                # Continue with next course even if this one failed
+        
+        # Send summary
+        try:
+            summary = f"✅ **Archive ALL completed**\n\n"
+            summary += f"✅ Successful: {success_count}/{len(queue)}\n"
+            if failed_courses:
+                summary += f"❌ Failed: {len(failed_courses)}\n\n"
+                summary += "Failed courses:\n" + "\n".join(f"• {c}" for c in failed_courses[:5])
+                if len(failed_courses) > 5:
+                    summary += f"\n... and {len(failed_courses) - 5} more"
+            await context.bot.send_message(user_id, summary, parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 # ─── Core Enrollment Logic ───────────────────────────────────────────────────
