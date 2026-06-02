@@ -68,6 +68,7 @@ from multiuser_enroller_bot import (
     cmd_search_courses,
     cmd_download_queue,
     cmd_downloads,
+    init_bot_pool,
 )
 from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
 from movie_service import (
@@ -2276,6 +2277,13 @@ async def main():
     else:
         init_db()
     ensure_news_table()
+    
+    # Initialize bot pool for parallel downloads/uploads
+    num_bots = await init_bot_pool()
+    if num_bots > 0:
+        log.info(f"✅ Bot pool initialized with {num_bots} additional bot(s) for parallel operations")
+    else:
+        log.info("⚠️ No additional bots configured (UPLOAD_BOT_TOKENS not set). Using single-bot mode.")
 
     app = create_web_app()
     await start_http_server(app)

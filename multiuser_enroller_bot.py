@@ -51,6 +51,10 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 
+# Multiple bot tokens for parallel operations (comma-separated)
+UPLOAD_BOT_TOKENS_STR = os.getenv("UPLOAD_BOT_TOKENS", "")
+UPLOAD_BOT_TOKENS = [t.strip() for t in UPLOAD_BOT_TOKENS_STR.split(",") if t.strip()] if UPLOAD_BOT_TOKENS_STR else []
+
 log = logging.getLogger(__name__)
 
 COURSES_API = "https://cdn.real.discount/api/courses"
@@ -59,6 +63,10 @@ AUTO_ENROLL_INTERVAL = 120  # 2 minutes
 # Global tracker for active download/upload tasks
 active_tasks = {}
 active_tasks_lock = Lock()
+
+# Bot pool for parallel operations
+bot_pool = []
+bot_pool_lock = Lock()
 
 
 def get_disk_usage(path="/"):
@@ -84,6 +92,46 @@ def format_bytes(bytes_val):
             return f"{bytes_val:.1f} {unit}"
         bytes_val /= 1024.0
     return f"{bytes_val:.1f} PB"
+
+
+async def init_bot_pool():
+    """Initialize bot pool from UPLOAD_BOT_TOKENS"""
+    global bot_pool
+    with bot_pool_lock:
+        bot_pool.clear()
+        for token in UPLOAD_BOT_TOKENS:
+            try:
+                bot = Bot(token=token)
+                # Test bot validity
+                await bot.get_me()
+                bot_pool.append(bot)
+                log.info(f"Bot pool: Added bot (token ending ...{token[-8:]})")
+            except Exception as e:
+                log.error(f"Failed to add bot to pool: {e}")
+        
+        log.info(f"Bot pool initialized with {len(bot_pool)} bot(s)")
+        return len(bot_pool)
+
+
+def split_list_into_batches(items, num_batches):
+    """Split a list into roughly equal batches"""
+    if num_batches <= 0:
+        return [items]
+    if num_batches >= len(items):
+        return [[item] for item in items]
+    
+    batch_size = len(items) // num_batches
+    remainder = len(items) % num_batches
+    
+    batches = []
+    start = 0
+    for i in range(num_batches):
+        # Add 1 extra item to first 'remainder' batches
+        size = batch_size + (1 if i < remainder else 0)
+        batches.append(items[start:start + size])
+        start += size
+    
+    return batches
 
 
 # ─── Premium Management Commands (Owner Only) ─────────────────────────────────
@@ -444,9 +492,9 @@ def _get_best_m3u8(master_m3u8_content: str, prefer_height: int = 720) -> str | 
     return chosen[2]
 
 
-def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, client_id: str, progress_callback=None):
+def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, client_id: str, progress_callback=None, lecture_subset=None, batch_num=0):
     """
-    Download all lectures of a Udemy course by:
+    Download all or a subset of lectures of a Udemy course by:
     1. Using the Udemy subscriber-curriculum-items API to enumerate all chapters/lectures
     2. For each lecture, fetching the HLS stream URL via the lecture detail API
     3. Downloading each HLS stream with yt-dlp's generic HLS downloader (bypassing the
@@ -510,12 +558,21 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
     if not lectures:
         return False, ["No lectures found in curriculum"]
 
+    # Filter lectures if subset provided (for parallel downloads)
+    if lecture_subset is not None:
+        lecture_ids_to_process = {lec["id"] for lec in lecture_subset}
+    else:
+        lecture_ids_to_process = None  # Process all lectures
+
+    lectures_to_process = lecture_subset if lecture_subset is not None else lectures
+    
+    batch_prefix = f"[Batch {batch_num + 1}] " if batch_num > 0 else ""
     if progress_callback:
-        progress_callback(4, f"📋 {len(lectures)} lectures in {len(chapters)} chapters. Downloading...")
+        progress_callback(4, f"{batch_prefix}📋 {len(lectures_to_process)} lectures assigned. Downloading...")
 
     errors = []
     lecture_counter = [0]
-    total_lectures = len(lectures)
+    total_lectures = len(lectures_to_process)
 
     # Find chapter for each lecture (by order in curriculum)
     chapter_idx = [0]
@@ -541,6 +598,11 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
 
         lec = item
         lid = lec["id"]
+        
+        # Skip if not in subset (for parallel downloads)
+        if lecture_ids_to_process is not None and lid not in lecture_ids_to_process:
+            continue
+        
         ltitle = lec.get("title", f"Lecture {lid}")
         lindex = lec.get("object_index", lecture_counter[0] + 1)
         chap = current_chap[0]
@@ -740,6 +802,135 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
     return True, errors
 
 
+async def _download_course_parallel(course_url: str, out_dir: Path, access_token: str, client_id: str, num_workers: int, progress_callback=None):
+    """
+    Download course using multiple parallel workers (bots).
+    Each worker downloads a subset of lectures simultaneously.
+    Returns (ok: bool, errors: list[str]).
+    """
+    import yt_dlp, re, requests
+    
+    MOBILE_UA = "okhttp/4.10.0 UdemyAndroid 9.7.0(515) (phone)"
+    session = requests.Session()
+    session.cookies.update({"access_token": access_token, "client_id": client_id})
+    session.headers.update({
+        "User-Agent": MOBILE_UA,
+        "Accept": "application/json",
+        "Referer": "https://www.udemy.com/",
+    })
+
+    # Get course info and curriculum (same as single-bot version)
+    slug_or_id = _get_course_id_from_url(course_url)
+    if not slug_or_id:
+        return False, ["Cannot extract course identifier from URL"]
+
+    r_course = session.get(
+        f"https://www.udemy.com/api-2.0/courses/{slug_or_id}/?fields[course]=id,title",
+        timeout=20
+    )
+    if r_course.status_code != 200:
+        return False, [f"Cannot fetch course info: HTTP {r_course.status_code}"]
+    
+    course_data = r_course.json()
+    course_id = course_data.get("id")
+    course_title = course_data.get("title", slug_or_id)
+    
+    if not course_id:
+        return False, ["Cannot find course_id"]
+
+    # Get full curriculum
+    all_items = []
+    next_page = (
+        f"https://www.udemy.com/api-2.0/courses/{course_id}/subscriber-curriculum-items/"
+        f"?page_size=100"
+        f"&fields[lecture]=id,title,object_index,asset"
+        f"&fields[chapter]=id,title,object_index"
+        f"&fields[asset]=id,asset_type,filename,media_sources,is_downloadable"
+    )
+    while next_page:
+        r = session.get(next_page, timeout=20)
+        if r.status_code != 200:
+            break
+        data = r.json()
+        all_items.extend(data.get("results", []))
+        next_page = data.get("next")
+
+    lectures = [i for i in all_items if i.get("_class") == "lecture"]
+    
+    if not lectures:
+        return False, ["No lectures found in curriculum"]
+    
+    if progress_callback:
+        progress_callback(2, f"📚 Found {len(lectures)} lectures. Splitting into {num_workers} batches...")
+    
+    # Split lectures into batches
+    lecture_batches = split_list_into_batches(lectures, num_workers)
+    
+    # Create separate temp folders for each worker
+    batch_dirs = []
+    for i in range(num_workers):
+        batch_dir = out_dir / f"_batch_{i}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batch_dirs.append(batch_dir)
+    
+    # Run parallel downloads
+    if progress_callback:
+        progress_callback(5, f"🚀 Starting {num_workers} parallel downloads...")
+    
+    async def download_batch(batch_idx, batch_lectures, batch_dir):
+        """Download a batch of lectures"""
+        def batch_progress(pct, stage):
+            if progress_callback:
+                progress_callback(5 + int(pct * 0.75 / num_workers), stage)
+        
+        return await asyncio.to_thread(
+            _download_course_via_api,
+            course_url,
+            batch_dir,
+            access_token,
+            client_id,
+            batch_progress,
+            batch_lectures,
+            batch_idx
+        )
+    
+    # Execute all downloads in parallel
+    results = await asyncio.gather(
+        *[download_batch(i, batch_lectures, batch_dirs[i]) for i, batch_lectures in enumerate(lecture_batches)],
+        return_exceptions=True
+    )
+    
+    # Collect all errors
+    all_errors = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            all_errors.append(f"Batch {i+1} failed: {str(result)}")
+        elif isinstance(result, tuple):
+            ok, errors = result
+            if errors:
+                all_errors.extend(errors)
+    
+    if progress_callback:
+        progress_callback(85, f"🔄 Merging {num_workers} batches...")
+    
+    # Merge all batch folders into main out_dir
+    for batch_dir in batch_dirs:
+        if batch_dir.exists():
+            for item in batch_dir.rglob("*"):
+                if item.is_file():
+                    rel_path = item.relative_to(batch_dir)
+                    dest = out_dir / rel_path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(item), str(dest))
+            # Remove batch dir
+            shutil.rmtree(batch_dir, ignore_errors=True)
+    
+    if progress_callback:
+        progress_callback(90, "✅ All batches merged successfully!")
+    
+    return True, all_errors
+
+
 async def _start_course_archive(update, context, item, silent_start=False):
     """
     Background task:
@@ -851,14 +1042,29 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
         await _send_progress(3, "\U0001f680 Fetching curriculum and downloading lectures...")
 
-        ok, errs = await asyncio.to_thread(
-            _download_course_via_api,
-            course_url,
-            out_dir,
-            chosen["access_token"],
-            chosen.get("client_id") or DEFAULT_CLIENT_ID,
-            _sync_progress,
-        )
+        # Use parallel downloads if bot pool available, otherwise single-threaded
+        num_workers = len(bot_pool) if bot_pool else 0
+        
+        if num_workers > 1:
+            log.info(f"Using parallel download with {num_workers} workers")
+            ok, errs = await _download_course_parallel(
+                course_url,
+                out_dir,
+                chosen["access_token"],
+                chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                num_workers,
+                _sync_progress,
+            )
+        else:
+            log.info("Using single-threaded download (no bot pool configured)")
+            ok, errs = await asyncio.to_thread(
+                _download_course_via_api,
+                course_url,
+                out_dir,
+                chosen["access_token"],
+                chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                _sync_progress,
+            )
 
         if errs:
             err_summary = "\n".join(errs[:5])
