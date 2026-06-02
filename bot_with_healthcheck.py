@@ -67,6 +67,7 @@ from multiuser_enroller_bot import (
     cmd_channel_post,
     cmd_search_courses,
     cmd_download_queue,
+    cmd_downloads,
 )
 from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
 from movie_service import (
@@ -1660,6 +1661,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("channel_post", cmd_channel_post))
     app.add_handler(CommandHandler("search_courses", cmd_search_courses))
     app.add_handler(CommandHandler("download_queue", cmd_download_queue))
+    app.add_handler(CommandHandler("downloads", cmd_downloads))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))

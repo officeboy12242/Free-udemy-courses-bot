@@ -14,9 +14,17 @@ import zipfile
 import requests
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import ContextTypes, Application
+
+# Try to import psutil for disk/bandwidth monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 from udemy_enroller import Course, UdemyAutoEnroller
 from user_enroller import (
@@ -47,6 +55,35 @@ log = logging.getLogger(__name__)
 
 COURSES_API = "https://cdn.real.discount/api/courses"
 AUTO_ENROLL_INTERVAL = 120  # 2 minutes
+
+# Global tracker for active download/upload tasks
+active_tasks = {}
+active_tasks_lock = Lock()
+
+
+def get_disk_usage(path="/"):
+    """Get disk usage stats for the given path"""
+    if not PSUTIL_AVAILABLE:
+        return None
+    try:
+        usage = psutil.disk_usage(path)
+        return {
+            "total_gb": usage.total / (1024**3),
+            "used_gb": usage.used / (1024**3),
+            "free_gb": usage.free / (1024**3),
+            "percent": usage.percent
+        }
+    except Exception:
+        return None
+
+
+def format_bytes(bytes_val):
+    """Format bytes to human-readable string"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024.0:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024.0
+    return f"{bytes_val:.1f} PB"
 
 
 # ─── Premium Management Commands (Owner Only) ─────────────────────────────────
@@ -243,6 +280,51 @@ async def cmd_download_queue(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown"
     )
     await _show_download_queue(update.effective_message, queue)
+
+
+async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: View active download/upload tasks with system stats."""
+    if not update.effective_user or not update.effective_message:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only.")
+        return
+    
+    with active_tasks_lock:
+        tasks = dict(active_tasks)  # Copy to avoid lock issues
+    
+    if not tasks:
+        msg = "📊 **Active Tasks**\n\n✅ No active downloads or uploads.\n\n"
+    else:
+        msg = f"📊 **Active Tasks** ({len(tasks)})\n\n"
+        for task_id, task_info in tasks.items():
+            status = task_info.get("status", "unknown")
+            course = task_info.get("course", "Unknown")
+            progress = task_info.get("progress", 0)
+            speed = task_info.get("speed", "N/A")
+            eta = task_info.get("eta", "N/A")
+            stage = task_info.get("stage", "")
+            
+            bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
+            
+            msg += f"**{course[:35]}**\n"
+            msg += f"[{bar}] {progress}%\n"
+            if stage:
+                msg += f"{stage}\n"
+            if speed != "N/A":
+                msg += f"⚡ {speed}"
+            if eta != "N/A":
+                msg += f" | ⏱ {eta}"
+            msg += "\n\n"
+    
+    # Add system stats
+    disk = get_disk_usage()
+    if disk:
+        msg += f"💾 **Disk Usage**\n"
+        msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
+        msg += f"Free: {disk['free_gb']:.1f} GB\n"
+    
+    await update.effective_message.reply_text(msg[:4000], parse_mode="Markdown")
 
 
 async def _send_search_results(msg, context, results, query, page):
@@ -475,10 +557,10 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         if out_path.exists():
             continue  # already downloaded
 
-        # Get lecture detail for stream URL
+        # Get lecture detail including supplementary assets (attachments/resources)
         detail_url = (
             f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/lectures/{lid}/"
-            f"?fields[lecture]=@all&fields[asset]=@all"
+            f"?fields[lecture]=asset,supplementary_assets&fields[asset]=@all"
         )
         try:
             r_lec = session.get(detail_url, timeout=20)
@@ -597,9 +679,10 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                 "force_generic_extractor": use_generic_extractor,
                 "ignoreerrors": True,
                 "nooverwrites": True,
-                "retries": 3,
-                "fragment_retries": 5,
-                "concurrent_fragment_downloads": 4,
+                "retries": 5,
+                "fragment_retries": 10,
+                "concurrent_fragment_downloads": 8,  # Increased from 4 to 8 for faster downloads
+                "http_chunk_size": 10485760,  # 10MB chunks for better speed
                 "quiet": True,
                 "no_warnings": True,
                 "progress_hooks": [_hook],
@@ -607,6 +690,49 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([download_url])
+            
+            # Download supplementary assets (attachments/resources)
+            lecture_detail = r_lec.json()
+            supplementary_assets = lecture_detail.get("supplementary_assets") or []
+            
+            if supplementary_assets:
+                for idx, supp in enumerate(supplementary_assets, 1):
+                    try:
+                        supp_title = supp.get("title", f"resource_{idx}")
+                        supp_filename = supp.get("filename", supp_title)
+                        download_urls = supp.get("download_urls")
+                        
+                        if not download_urls:
+                            continue
+                        
+                        # Get the file URL (usually in 'File' or first available key)
+                        file_url = None
+                        if isinstance(download_urls, dict):
+                            file_url = download_urls.get("File") or download_urls.get(list(download_urls.keys())[0])
+                        elif isinstance(download_urls, list) and download_urls:
+                            file_url = download_urls[0].get("file")
+                        
+                        if not file_url:
+                            continue
+                        
+                        # Sanitize filename
+                        safe_filename = "".join(c if c.isalnum() or c in " -_." else "_" for c in supp_filename)[:100]
+                        if not any(safe_filename.endswith(ext) for ext in [".pdf", ".zip", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".html", ".htm", ".epub"]):
+                            # Try to get extension from URL
+                            ext_match = file_url.split("?")[0].split(".")[-1]
+                            if len(ext_match) <= 5:
+                                safe_filename += f".{ext_match}"
+                        
+                        resource_path = lec_dir / f"{safe_lec}_resource_{idx}_{safe_filename}"
+                        
+                        # Download resource
+                        r_res = session.get(file_url, stream=True, timeout=60)
+                        if r_res.status_code == 200:
+                            with open(resource_path, "wb") as f:
+                                for chunk in r_res.iter_content(chunk_size=8192):
+                                    f.write(chunk)
+                    except Exception as e_supp:
+                        log.warning(f"Failed to download supplementary asset {idx} for {ltitle}: {e_supp}")
 
         except Exception as e:
             errors.append(f"Error on {ltitle}: {e}")
@@ -651,6 +777,18 @@ async def _start_course_archive(update, context, item, silent_start=False):
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = work_dir / f"{safe_name}.zip"
 
+    # Register task in global tracker
+    task_id = f"{owner_id}_{udemy_id}"
+    with active_tasks_lock:
+        active_tasks[task_id] = {
+            "course": title,
+            "status": "initializing",
+            "progress": 0,
+            "speed": "N/A",
+            "eta": "N/A",
+            "stage": "Initializing..."
+        }
+
     progress_msg = None
     _last_edit = [0.0]
     progress_queue = asyncio.Queue()
@@ -663,7 +801,21 @@ async def _start_course_archive(update, context, item, silent_start=False):
             return
         _last_edit[0] = now
         bar = "\u2588" * (pct // 10) + "\u2591" * (10 - pct // 10)
-        txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}"
+        
+        # Update global task tracker
+        with active_tasks_lock:
+            if task_id in active_tasks:
+                active_tasks[task_id]["progress"] = pct
+                active_tasks[task_id]["stage"] = stage
+                active_tasks[task_id]["status"] = "downloading" if pct < 90 else "uploading"
+        
+        # Add disk usage to stage info
+        disk = get_disk_usage(str(work_dir))
+        disk_info = ""
+        if disk:
+            disk_info = f"\n💾 Free: {disk['free_gb']:.1f} GB"
+        
+        txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}{disk_info}"
         try:
             if progress_msg:
                 await progress_msg.edit_text(txt, parse_mode="Markdown")
@@ -865,6 +1017,9 @@ async def _start_course_archive(update, context, item, silent_start=False):
             await monitor_task
         except Exception:
             pass
+        # Remove task from global tracker
+        with active_tasks_lock:
+            active_tasks.pop(task_id, None)
         # Clean up temporary files
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
