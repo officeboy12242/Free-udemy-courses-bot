@@ -331,48 +331,81 @@ async def cmd_download_queue(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: View active download/upload tasks with system stats."""
+    """Owner-only: View active download/upload tasks with system stats - LIVE updates."""
     if not update.effective_user or not update.effective_message:
         return
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only.")
         return
     
-    with active_tasks_lock:
-        tasks = dict(active_tasks)  # Copy to avoid lock issues
+    # Send initial message
+    status_msg = await update.effective_message.reply_text("📊 Loading active tasks...", parse_mode="Markdown")
     
-    if not tasks:
-        msg = "📊 **Active Tasks**\n\n✅ No active downloads or uploads.\n\n"
-    else:
-        msg = f"📊 **Active Tasks** ({len(tasks)})\n\n"
-        for task_id, task_info in tasks.items():
-            status = task_info.get("status", "unknown")
-            course = task_info.get("course", "Unknown")
-            progress = task_info.get("progress", 0)
-            speed = task_info.get("speed", "N/A")
-            eta = task_info.get("eta", "N/A")
-            stage = task_info.get("stage", "")
-            
-            bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
-            
-            msg += f"**{course[:35]}**\n"
-            msg += f"[{bar}] {progress}%\n"
-            if stage:
-                msg += f"{stage}\n"
-            if speed != "N/A":
-                msg += f"⚡ {speed}"
-            if eta != "N/A":
-                msg += f" | ⏱ {eta}"
-            msg += "\n\n"
+    # Keep updating for 60 seconds (LIVE view)
+    import time
+    start_time = time.time()
     
-    # Add system stats
-    disk = get_disk_usage()
-    if disk:
-        msg += f"💾 **Disk Usage**\n"
-        msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
-        msg += f"Free: {disk['free_gb']:.1f} GB\n"
-    
-    await update.effective_message.reply_text(msg[:4000], parse_mode="Markdown")
+    while time.time() - start_time < 60:
+        with active_tasks_lock:
+            tasks = dict(active_tasks)  # Copy to avoid lock issues
+        
+        if not tasks:
+            msg = "📊 **Active Tasks**\n\n✅ No active downloads or uploads.\n\n"
+            msg += "_Monitoring stopped - no active tasks._"
+        else:
+            msg = f"📊 **Active Tasks** ({len(tasks)})\n\n"
+            for task_id, task_info in tasks.items():
+                status = task_info.get("status", "unknown")
+                course = task_info.get("course", "Unknown")
+                progress = task_info.get("progress", 0)
+                speed = task_info.get("speed", "N/A")
+                eta = task_info.get("eta", "N/A")
+                stage = task_info.get("stage", "")
+                bots = task_info.get("bots", {})
+                
+                bar = "█" * (progress // 10) + "░" * (10 - progress // 10)
+                
+                msg += f"**{course[:35]}**\n"
+                msg += f"[{bar}] {progress}%\n"
+                
+                # Show bot activity if parallel download
+                if bots and len(bots) > 1:
+                    msg += "\n🤖 **Bot Activity:**\n"
+                    for bot_num in sorted(bots.keys()):
+                        bot_info = bots[bot_num]
+                        bot_status_emoji = "⏳" if bot_info.get("status") == "downloading" else "✅"
+                        lecture = bot_info.get("current_lecture", "Idle")[:25]
+                        bot_pct = bot_info.get("progress", 0)
+                        msg += f"Bot {bot_num+1}: {bot_status_emoji} {bot_pct}% - `{lecture}`\n"
+                
+                if stage and not bots:
+                    msg += f"{stage[:60]}\n"
+                if speed != "N/A":
+                    msg += f"⚡ {speed}"
+                if eta != "N/A":
+                    msg += f" | ⏱ {eta}"
+                msg += "\n\n"
+        
+        # Add system stats
+        disk = get_disk_usage()
+        if disk:
+            msg += f"💾 **Disk Usage**\n"
+            msg += f"Used: {disk['used_gb']:.1f} GB / {disk['total_gb']:.1f} GB ({disk['percent']:.1f}%)\n"
+            msg += f"Free: {disk['free_gb']:.1f} GB\n\n"
+        
+        elapsed = int(time.time() - start_time)
+        msg += f"_Live view • Refreshing... ({60-elapsed}s remaining)_"
+        
+        try:
+            await status_msg.edit_text(msg[:4000], parse_mode="Markdown")
+        except Exception:
+            pass  # Message not modified or rate limited
+        
+        # Stop if no tasks
+        if not tasks:
+            break
+        
+        await asyncio.sleep(3)  # Update every 3 seconds
 
 
 async def _send_search_results(msg, context, results, query, page):
@@ -873,15 +906,38 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
         batch_dir.mkdir(parents=True, exist_ok=True)
         batch_dirs.append(batch_dir)
     
+    # Shared bot status tracking
+    bot_status = {}
+    for i in range(num_workers):
+        bot_status[i] = {"progress": 0, "current_lecture": "Starting...", "status": "initializing"}
+    
     # Run parallel downloads
     if progress_callback:
-        progress_callback(5, f"🚀 Starting {num_workers} parallel downloads...")
+        progress_callback(5, f"🚀 Starting {num_workers} parallel downloads...", bot_status.copy())
     
     async def download_batch(batch_idx, batch_lectures, batch_dir):
         """Download a batch of lectures"""
         def batch_progress(pct, stage):
+            # Extract lecture name from stage if possible
+            lecture_name = "Processing..."
+            if "📄 `" in stage:
+                try:
+                    lecture_name = stage.split("📄 `")[1].split("`")[0]
+                except:
+                    pass
+            
+            # Update bot status
+            bot_status[batch_idx] = {
+                "progress": int(pct * 0.85 / num_workers),  # Normalized to batch portion
+                "current_lecture": lecture_name,
+                "status": "downloading" if pct < 100 else "merging"
+            }
+            
+            # Calculate overall progress
+            overall_pct = 5 + sum(b["progress"] for b in bot_status.values())
+            
             if progress_callback:
-                progress_callback(5 + int(pct * 0.75 / num_workers), stage)
+                progress_callback(overall_pct, stage, bot_status.copy())
         
         return await asyncio.to_thread(
             _download_course_via_api,
@@ -977,14 +1033,15 @@ async def _start_course_archive(update, context, item, silent_start=False):
             "progress": 0,
             "speed": "N/A",
             "eta": "N/A",
-            "stage": "Initializing..."
+            "stage": "Initializing...",
+            "bots": {}  # Track per-bot status: {bot_num: {progress, current_lecture, status}}
         }
 
     progress_msg = None
     _last_edit = [0.0]
     progress_queue = asyncio.Queue()
 
-    async def _send_progress(pct, stage):
+    async def _send_progress(pct, stage, bot_info=None):
         nonlocal progress_msg
         import time
         now = time.time()
@@ -999,6 +1056,8 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 active_tasks[task_id]["progress"] = pct
                 active_tasks[task_id]["stage"] = stage
                 active_tasks[task_id]["status"] = "downloading" if pct < 90 else "uploading"
+                if bot_info:
+                    active_tasks[task_id]["bots"] = bot_info
         
         # Add disk usage to stage info
         disk = get_disk_usage(str(work_dir))
@@ -1007,6 +1066,17 @@ async def _start_course_archive(update, context, item, silent_start=False):
             disk_info = f"\n💾 Free: {disk['free_gb']:.1f} GB"
         
         txt = f"\U0001f4e5 **Downloading course**\n\n**{title}**\n\n[{bar}] {pct}%\n\n{stage}{disk_info}"
+        
+        # Add bot status if parallel downloads
+        if bot_info and len(bot_info) > 1:
+            txt += "\n\n**🤖 Bot Activity:**"
+            for bot_num in sorted(bot_info.keys()):
+                info = bot_info[bot_num]
+                status_emoji = "⏳" if info.get("status") == "downloading" else "✅"
+                lecture = info.get("current_lecture", "Idle")[:30]
+                bot_pct = info.get("progress", 0)
+                txt += f"\nBot {bot_num+1}: {status_emoji} {bot_pct}% - `{lecture}`"
+        
         try:
             if progress_msg:
                 await progress_msg.edit_text(txt, parse_mode="Markdown")
@@ -1019,17 +1089,28 @@ async def _start_course_archive(update, context, item, silent_start=False):
         """Background task that monitors the progress queue and sends updates"""
         while True:
             try:
-                pct, stage = await progress_queue.get()
-                if pct is None:  # Sentinel value to stop the monitor
+                data = await progress_queue.get()
+                if data is None or (isinstance(data, tuple) and len(data) >= 2 and data[0] is None):  # Sentinel value
                     break
-                await _send_progress(pct, stage)
+                
+                # Handle both (pct, stage) and (pct, stage, bot_info) formats
+                if isinstance(data, tuple):
+                    if len(data) == 3:
+                        pct, stage, bot_info = data
+                        await _send_progress(pct, stage, bot_info)
+                    elif len(data) == 2:
+                        pct, stage = data
+                        await _send_progress(pct, stage)
             except Exception:
                 pass
 
-    def _sync_progress(pct, stage):
+    def _sync_progress(pct, stage, bot_info=None):
         """Thread-safe progress callback - puts updates into queue"""
         try:
-            progress_queue.put_nowait((pct, stage))
+            if bot_info is not None:
+                progress_queue.put_nowait((pct, stage, bot_info))
+            else:
+                progress_queue.put_nowait((pct, stage))
         except Exception:
             pass
 
