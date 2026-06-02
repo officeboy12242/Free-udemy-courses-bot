@@ -632,18 +632,17 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         lec = item
         lid = lec["id"]
         
-        lecture_counter[0] += 1
-        lindex = lec.get("object_index", lecture_counter[0])
-        
         # Skip if not in subset (for parallel downloads)
         if lecture_ids_to_process is not None and lid not in lecture_ids_to_process:
             continue
         
         ltitle = lec.get("title", f"Lecture {lid}")
+        lindex = lec.get("object_index", lecture_counter[0] + 1)
         chap = current_chap[0]
         chap_num = chap_num_counter[0]
         chap_title = chap.get("title", "Uncategorized")
 
+        lecture_counter[0] += 1
         safe_chap = f"{chap_num:02d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in chap_title)[:50]
         safe_lec = f"{lindex:03d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in ltitle)[:55]
         lec_dir = out_dir / safe_chap
@@ -1001,20 +1000,22 @@ async def _download_course_parallel(course_url: str, out_dir: Path, access_token
     if progress_callback:
         progress_callback(85, f"🔄 Merging {num_workers} batches...")
     
-    # Merge all batch folders into main out_dir
+    # Merge all batch folders into main out_dir.
+    # Per-file try/except so one bad move never aborts the whole merge — we want
+    # to keep every successfully downloaded file for the final ZIP.
     for batch_dir in batch_dirs:
         if batch_dir.exists():
             for item in batch_dir.rglob("*"):
                 if item.is_file():
-                    rel_path = item.relative_to(batch_dir)
-                    dest = out_dir / rel_path
-                    dest.parent.mkdir(parents=True, exist_ok=True)
                     try:
+                        rel_path = item.relative_to(batch_dir)
+                        dest = out_dir / rel_path
+                        dest.parent.mkdir(parents=True, exist_ok=True)
                         if dest.exists():
-                            dest.unlink()  # Prevent FileExistsError on Windows
+                            continue
                         shutil.move(str(item), str(dest))
-                    except Exception as e:
-                        all_errors.append(f"Merge error for {item.name}: {e}")
+                    except Exception as mv_err:
+                        all_errors.append(f"Merge error for {item.name}: {mv_err}")
             # Remove batch dir
             shutil.rmtree(batch_dir, ignore_errors=True)
     
@@ -1160,29 +1161,53 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
         await _send_progress(3, "\U0001f680 Fetching curriculum and downloading lectures...")
 
-        # Use parallel downloads if bot pool available, otherwise single-threaded
+        # Use parallel downloads if bot pool available, otherwise single-threaded.
+        # IMPORTANT: even if the download phase raises (DRM, network, merge error, etc.),
+        # we must NOT abort — we still want to ZIP and share whatever was downloaded.
         num_workers = len(bot_pool) if bot_pool else 0
-        
-        if num_workers > 1:
-            log.info(f"Using parallel download with {num_workers} workers")
-            ok, errs = await _download_course_parallel(
-                course_url,
-                out_dir,
-                chosen["access_token"],
-                chosen.get("client_id") or DEFAULT_CLIENT_ID,
-                num_workers,
-                _sync_progress,
-            )
-        else:
-            log.info("Using single-threaded download (no bot pool configured)")
-            ok, errs = await asyncio.to_thread(
-                _download_course_via_api,
-                course_url,
-                out_dir,
-                chosen["access_token"],
-                chosen.get("client_id") or DEFAULT_CLIENT_ID,
-                _sync_progress,
-            )
+        ok, errs = False, []
+
+        try:
+            if num_workers > 1:
+                log.info(f"Using parallel download with {num_workers} workers")
+                ok, errs = await _download_course_parallel(
+                    course_url,
+                    out_dir,
+                    chosen["access_token"],
+                    chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                    num_workers,
+                    _sync_progress,
+                )
+            else:
+                log.info("Using single-threaded download (no bot pool configured)")
+                ok, errs = await asyncio.to_thread(
+                    _download_course_via_api,
+                    course_url,
+                    out_dir,
+                    chosen["access_token"],
+                    chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                    _sync_progress,
+                )
+        except Exception as dl_err:
+            # Download phase crashed partway — keep going and archive whatever we have.
+            log.exception(f"Download phase error for {title}: {dl_err}")
+            errs = (errs or []) + [f"Download interrupted: {dl_err}"]
+
+        # Safety net: if parallel batch dirs were left behind (e.g. merge crashed),
+        # flatten them into out_dir so nothing downloaded is lost.
+        try:
+            for leftover in list(out_dir.glob("_batch_*")):
+                if leftover.is_dir():
+                    for item in leftover.rglob("*"):
+                        if item.is_file():
+                            rel_path = item.relative_to(leftover)
+                            dest = out_dir / rel_path
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            if not dest.exists():
+                                shutil.move(str(item), str(dest))
+                    shutil.rmtree(leftover, ignore_errors=True)
+        except Exception as merge_err:
+            log.warning(f"Leftover batch merge cleanup failed for {title}: {merge_err}")
 
         if errs:
             drm_errs = [e for e in errs if "DRM protected" in e]
@@ -1321,13 +1346,16 @@ async def _start_course_archive(update, context, item, silent_start=False):
                     log.error(f"All upload methods failed for {p.name}: {e2}")
 
         remove_from_download_queue(owner_id, udemy_id)
+        drm_skipped = len([e for e in (errs or []) if "DRM protected" in e])
         done_txt = (
             f"\u2705 **Archive complete!**\n\n"
             f"\U0001f4da **{title}**\n"
             f"\U0001f4c2 {len(video_files)} lecture(s) \u2022 {size_mb} MB\n"
-            f"\U0001f4e6 {len(part_files)} ZIP part(s) uploaded\n\n"
-            "Item removed from queue."
+            f"\U0001f4e6 {len(part_files)} ZIP part(s) uploaded\n"
         )
+        if drm_skipped:
+            done_txt += f"\U0001f512 {drm_skipped} DRM lecture(s) skipped (not downloadable)\n"
+        done_txt += "\nItem removed from queue."
         try:
             if progress_msg:
                 await progress_msg.edit_text(done_txt, parse_mode="Markdown")
