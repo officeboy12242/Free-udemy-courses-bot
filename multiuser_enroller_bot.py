@@ -514,26 +514,43 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                 errors.append(f"DRM protected (skipped): {ltitle}")
                 continue
 
-            # Get M3U8 master URL
+            # Try to get M3U8 (HLS) source first
             m3u8_master_url = next(
                 (m["src"] for m in ms if "mpegURL" in m.get("type", "") or m.get("src","").endswith(".m3u8")),
                 None
             )
-            if not m3u8_master_url:
-                errors.append(f"No HLS source for: {ltitle}")
+            
+            download_url = None
+            use_generic_extractor = True
+            
+            if m3u8_master_url:
+                # Fetch master M3U8 to find quality variants
+                try:
+                    r_m3u8 = session.get(m3u8_master_url, timeout=20)
+                    if r_m3u8.status_code == 200:
+                        # Pick 720p variant (or best available)
+                        variant_url = _get_best_m3u8(r_m3u8.text, prefer_height=720)
+                        download_url = variant_url if variant_url else m3u8_master_url
+                except Exception as e:
+                    log.warning(f"M3U8 fetch failed for {ltitle}: {e}")
+            
+            # Fallback: Try direct MP4/video sources if HLS not available or failed
+            if not download_url:
+                # Look for direct video files (mp4, webm, etc.) - prefer higher quality
+                video_sources = [
+                    m for m in ms 
+                    if m.get("type") in ("video/mp4", "video/webm") or m.get("src","").endswith((".mp4", ".webm"))
+                ]
+                if video_sources:
+                    # Sort by quality/label if available, or just pick the first one
+                    video_sources.sort(key=lambda x: x.get("label", "0"), reverse=True)
+                    download_url = video_sources[0]["src"]
+                    use_generic_extractor = True  # yt-dlp can handle direct video links
+                    log.info(f"Using direct MP4 fallback for: {ltitle}")
+            
+            if not download_url:
+                errors.append(f"No HLS or MP4 source for: {ltitle}")
                 continue
-
-            # Fetch master M3U8 to find quality variants
-            r_m3u8 = session.get(m3u8_master_url, timeout=20)
-            if r_m3u8.status_code != 200:
-                errors.append(f"M3U8 fetch error {r_m3u8.status_code} for: {ltitle}")
-                continue
-
-            # Pick 720p variant (or best available)
-            variant_url = _get_best_m3u8(r_m3u8.text, prefer_height=720)
-            if not variant_url:
-                # No variants - M3U8 might be a segment list directly
-                variant_url = m3u8_master_url
 
             # Compute progress
             pct_base = int((lecture_counter[0] / total_lectures) * 85)
@@ -577,7 +594,7 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                 },
                 "format": "best",
                 "merge_output_format": "mp4",
-                "force_generic_extractor": True,
+                "force_generic_extractor": use_generic_extractor,
                 "ignoreerrors": True,
                 "nooverwrites": True,
                 "retries": 3,
@@ -589,7 +606,7 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([variant_url])
+                ydl.download([download_url])
 
         except Exception as e:
             errors.append(f"Error on {ltitle}: {e}")
