@@ -13,5 +13,5 @@ playwright>=1.40.0
 pymongo>=4.6.0
 dnspython>=2.4.0
 yt-dlp>=2024.12.0
-pyrogram>=2.1.0
+pyrogram>=2.0.0
 tgcrypto>=1.2.5
