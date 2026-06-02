@@ -335,86 +335,266 @@ def _build_udemy_cookies_file(work_dir, access_token, client_id):
     return cookie_file
 
 
-def _download_course_with_ytdlp(course_url, out_dir, cookie_file, progress_callback=None):
+def _get_course_id_from_url(course_url: str) -> str | None:
+    """Extract Udemy course slug or numeric ID from a course URL."""
+    import re
+    # /course/draft/1234567/ or /course/slug-name/
+    m = re.search(r"/course/(?:draft/)?([^/]+)", course_url)
+    return m.group(1) if m else None
+
+
+def _get_best_m3u8(master_m3u8_content: str, prefer_height: int = 720) -> str | None:
+    """Parse an HLS master playlist and pick the best quality variant URL."""
+    import re
+    lines = master_m3u8_content.strip().split("\n")
+    variants = []  # (bandwidth, resolution_height, url)
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(lines):
+            url = lines[i + 1].strip()
+            bw = int(re.search(r"BANDWIDTH=(\d+)", line).group(1)) if re.search(r"BANDWIDTH=(\d+)", line) else 0
+            h = int(re.search(r"RESOLUTION=\d+x(\d+)", line).group(1)) if re.search(r"RESOLUTION=\d+x(\d+)", line) else 0
+            variants.append((bw, h, url))
+    if not variants:
+        return None
+    # Prefer the target height; if not found, pick highest
+    preferred = [v for v in variants if v[1] == prefer_height]
+    chosen = max(preferred or variants, key=lambda v: v[0])
+    return chosen[2]
+
+
+def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, client_id: str, progress_callback=None):
     """
-    Download all lectures of a Udemy course using yt-dlp.
-    Returns (ok: bool, error_msg: str | None).
+    Download all lectures of a Udemy course by:
+    1. Using the Udemy subscriber-curriculum-items API to enumerate all chapters/lectures
+    2. For each lecture, fetching the HLS stream URL via the lecture detail API
+    3. Downloading each HLS stream with yt-dlp's generic HLS downloader (bypassing the
+       Udemy extractor which 403s on the course webpage)
+
+    Returns (ok: bool, errors: list[str]).
     Output structure: Chapter folder / lecture-index - title.mp4
     """
-    import yt_dlp
+    import yt_dlp, re
 
-    outtmpl = str(out_dir / "%(chapter_number)s - %(chapter)s" / "%(playlist_index)s - %(title)s.%(ext)s")
-    last_pct = [0]
+    MOBILE_UA = "okhttp/4.10.0 UdemyAndroid 9.7.0(515) (phone)"
+    session = requests.Session()
+    session.cookies.update({"access_token": access_token, "client_id": client_id})
+    session.headers.update({
+        "User-Agent": MOBILE_UA,
+        "Accept": "application/json",
+        "Referer": "https://www.udemy.com/",
+    })
+
+    # Resolve course ID
+    slug_or_id = _get_course_id_from_url(course_url)
+    if not slug_or_id:
+        return False, ["Cannot extract course identifier from URL"]
+
+    # Try to get numeric course_id from search or by fetching the course info
+    r_course = session.get(
+        f"https://www.udemy.com/api-2.0/courses/{slug_or_id}/?fields[course]=id,title",
+        timeout=20
+    )
+    if r_course.status_code != 200:
+        return False, [f"Cannot fetch course info: HTTP {r_course.status_code}"]
+    course_data = r_course.json()
+    course_id = course_data.get("id")
+    course_title = course_data.get("title", slug_or_id)
+    if not course_id:
+        return False, ["Cannot find course_id"]
+
+    if progress_callback:
+        progress_callback(2, f"📚 Found course: **{course_title}**\nFetching curriculum...")
+
+    # Get full curriculum
+    all_items = []
+    next_page = (
+        f"https://www.udemy.com/api-2.0/courses/{course_id}/subscriber-curriculum-items/"
+        f"?page_size=100"
+        f"&fields[lecture]=id,title,object_index,asset"
+        f"&fields[chapter]=id,title,object_index"
+        f"&fields[asset]=id,asset_type,filename,media_sources,is_downloadable"
+    )
+    while next_page:
+        r = session.get(next_page, timeout=20)
+        if r.status_code != 200:
+            break
+        data = r.json()
+        all_items.extend(data.get("results", []))
+        next_page = data.get("next")
+
+    chapters = {i["id"]: i for i in all_items if i.get("_class") == "chapter"}
+    lectures = [i for i in all_items if i.get("_class") == "lecture"]
+
+    if not lectures:
+        return False, ["No lectures found in curriculum"]
+
+    if progress_callback:
+        progress_callback(4, f"📋 {len(lectures)} lectures in {len(chapters)} chapters. Downloading...")
+
+    errors = []
     lecture_counter = [0]
+    total_lectures = len(lectures)
 
-    def _hook(d):
-        if progress_callback is None:
-            return
-        status = d.get("status", "")
-        if status == "downloading":
-            try:
-                pct = float((d.get("_percent_str") or "0").replace("%", "").strip())
-            except Exception:
-                pct = last_pct[0]
-            last_pct[0] = pct
+    # Find chapter for each lecture (by order in curriculum)
+    chapter_idx = [0]
+    chapter_num = [0]
+    current_chapter = [{"object_index": 0, "title": "Uncategorized"}]
 
-            speed = d.get("_speed_str") or d.get("speed_str") or ""
-            eta   = d.get("_eta_str")   or d.get("eta_str")   or ""
-            downloaded = d.get("_downloaded_bytes_str") or ""
-            total      = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or ""
-            fname = Path(d.get("filename", "")).name
-            # Strip path noise – keep just filename
-            if "/" in fname:
-                fname = fname.rsplit("/", 1)[-1]
-            if "\\" in fname:
-                fname = fname.rsplit("\\", 1)[-1]
-            fname = fname[:50]
+    for item in all_items:
+        if item.get("_class") == "chapter":
+            current_chapter[0] = item
+            chapter_num[0] += 1
 
-            stage_lines = [f"📄 `{fname}`"]
-            if downloaded and total:
-                stage_lines.append(f"📦 {downloaded} / {total}")
-            if speed:
-                stage_lines.append(f"⚡ {speed}")
-            if eta:
-                stage_lines.append(f"⏱ ETA {eta}")
+    # We'll iterate all_items in order to track chapter context
+    chap_num_counter = [0]
+    current_chap = [{"title": "Uncategorized", "object_index": 0}]
 
-            progress_callback(int(pct * 0.88), "\n".join(stage_lines))
+    for item in all_items:
+        if item.get("_class") == "chapter":
+            chap_num_counter[0] += 1
+            current_chap[0] = item
+            continue
+        if item.get("_class") != "lecture":
+            continue
 
-        elif status == "finished":
-            lecture_counter[0] += 1
-            progress_callback(
-                int(last_pct[0] * 0.88),
-                f"🔀 Merging lecture #{lecture_counter[0]}..."
+        lec = item
+        lid = lec["id"]
+        ltitle = lec.get("title", f"Lecture {lid}")
+        lindex = lec.get("object_index", lecture_counter[0] + 1)
+        chap = current_chap[0]
+        chap_num = chap_num_counter[0]
+        chap_title = chap.get("title", "Uncategorized")
+
+        lecture_counter[0] += 1
+        safe_chap = f"{chap_num:02d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in chap_title)[:50]
+        safe_lec = f"{lindex:03d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in ltitle)[:55]
+        lec_dir = out_dir / safe_chap
+        lec_dir.mkdir(parents=True, exist_ok=True)
+        out_path = lec_dir / f"{safe_lec}.mp4"
+
+        if out_path.exists():
+            continue  # already downloaded
+
+        # Get lecture detail for stream URL
+        detail_url = (
+            f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/lectures/{lid}/"
+            f"?fields[lecture]=@all&fields[asset]=@all"
+        )
+        try:
+            r_lec = session.get(detail_url, timeout=20)
+            if r_lec.status_code != 200:
+                errors.append(f"Lecture {lid} API error {r_lec.status_code}")
+                continue
+
+            asset = r_lec.json().get("asset") or {}
+            atype = asset.get("asset_type", "")
+            ms = asset.get("media_sources") or []
+
+            if atype == "Article":
+                # Save article text as .html
+                body = asset.get("body") or lec.get("description") or ""
+                html_path = lec_dir / f"{safe_lec}.html"
+                if body:
+                    html_path.write_text(f"<html><body>{body}</body></html>", encoding="utf-8")
+                continue
+
+            if atype in ("SourceCode", "File"):
+                # Save external URL as reference
+                ext_url = asset.get("external_url") or asset.get("source_url") or ""
+                if ext_url:
+                    ref_path = lec_dir / f"{safe_lec}_url.txt"
+                    ref_path.write_text(ext_url, encoding="utf-8")
+                continue
+
+            if not ms:
+                errors.append(f"No media for: {ltitle}")
+                continue
+
+            if asset.get("asset_is_drmed") or asset.get("course_is_drmed"):
+                errors.append(f"DRM protected (skipped): {ltitle}")
+                continue
+
+            # Get M3U8 master URL
+            m3u8_master_url = next(
+                (m["src"] for m in ms if "mpegURL" in m.get("type", "") or m.get("src","").endswith(".m3u8")),
+                None
             )
+            if not m3u8_master_url:
+                errors.append(f"No HLS source for: {ltitle}")
+                continue
 
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        "cookiefile": str(cookie_file),
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "writethumbnail": False,
-        "writesubtitles": True,
-        "subtitleslangs": ["en"],
-        "ignoreerrors": True,
-        "nooverwrites": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "http_chunk_size": 10485760,
-        "concurrent_fragment_downloads": 4,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [_hook],
-    }
-    try:
-        full_url = course_url if course_url.startswith("http") else f"https://www.udemy.com{course_url}"
-        # yt-dlp wants the landing/course page URL, not the /learn/ page
-        if "/learn" in full_url:
-            full_url = full_url.split("/learn")[0].rstrip("/") + "/"
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([full_url])
-        return True, None
-    except Exception as e:
-        return False, str(e)
+            # Fetch master M3U8 to find quality variants
+            r_m3u8 = session.get(m3u8_master_url, timeout=20)
+            if r_m3u8.status_code != 200:
+                errors.append(f"M3U8 fetch error {r_m3u8.status_code} for: {ltitle}")
+                continue
+
+            # Pick 720p variant (or best available)
+            variant_url = _get_best_m3u8(r_m3u8.text, prefer_height=720)
+            if not variant_url:
+                # No variants - M3U8 might be a segment list directly
+                variant_url = m3u8_master_url
+
+            # Compute progress
+            pct_base = int((lecture_counter[0] / total_lectures) * 85)
+
+            last_pct_lec = [0]
+            def _hook(d, _chap=safe_chap, _lec=safe_lec, _pb=pct_base):
+                if progress_callback is None:
+                    return
+                status = d.get("status", "")
+                if status == "downloading":
+                    try:
+                        p = float((d.get("_percent_str") or "0").replace("%","").strip())
+                    except Exception:
+                        p = last_pct_lec[0]
+                    last_pct_lec[0] = p
+                    speed = d.get("_speed_str") or ""
+                    eta   = d.get("_eta_str") or ""
+                    dl    = d.get("_downloaded_bytes_str") or ""
+                    total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or ""
+                    stage = (
+                        f"📚 Lecture {lecture_counter[0]}/{total_lectures}\n"
+                        f"📄 `{_lec[:45]}`"
+                    )
+                    if dl and total:
+                        stage += f"\n📦 {dl} / {total}"
+                    if speed:
+                        stage += f"\n⚡ {speed}"
+                    if eta:
+                        stage += f"\n⏱ ETA {eta}"
+                    progress_callback(_pb + int(p * 0.12), stage)
+                elif status == "finished":
+                    progress_callback(_pb + 12, f"🔀 Merging: `{_lec[:45]}`")
+
+            ydl_opts = {
+                "outtmpl": str(out_path),
+                "cookiefile": None,  # not needed - segments don't require auth
+                "http_headers": {
+                    "User-Agent": MOBILE_UA,
+                    "Referer": "https://www.udemy.com/",
+                    "Cookie": f"access_token={access_token}; client_id={client_id}",
+                },
+                "format": "best",
+                "merge_output_format": "mp4",
+                "force_generic_extractor": True,
+                "ignoreerrors": True,
+                "nooverwrites": True,
+                "retries": 3,
+                "fragment_retries": 5,
+                "concurrent_fragment_downloads": 4,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [_hook],
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([variant_url])
+
+        except Exception as e:
+            errors.append(f"Error on {ltitle}: {e}")
+
+    return True, errors
 
 
 async def _start_course_archive(update, context, item, silent_start=False):
@@ -481,28 +661,29 @@ async def _start_course_archive(update, context, item, silent_start=False):
         if not silent_start:
             await _send_progress(1, f"\U0001f510 Preparing cookies for: **{chosen.get('name')}**")
 
-        cookie_file = _build_udemy_cookies_file(
-            work_dir,
-            chosen["access_token"],
-            chosen.get("client_id") or DEFAULT_CLIENT_ID,
-        )
+        await _send_progress(3, "\U0001f680 Fetching curriculum and downloading lectures...")
 
-        await _send_progress(3, "\U0001f680 Starting yt-dlp (all lectures)...")
-
-        ok, err = await asyncio.to_thread(
-            _download_course_with_ytdlp,
+        ok, errs = await asyncio.to_thread(
+            _download_course_via_api,
             course_url,
             out_dir,
-            cookie_file,
+            chosen["access_token"],
+            chosen.get("client_id") or DEFAULT_CLIENT_ID,
             _sync_progress,
         )
 
-        if not ok and err:
-            await context.bot.send_message(
-                owner_id,
-                f"\u26a0\ufe0f yt-dlp warning (some lectures may still be present):\n`{err[:300]}`",
-                parse_mode="Markdown"
-            )
+        if errs:
+            err_summary = "\n".join(errs[:5])
+            if len(errs) > 5:
+                err_summary += f"\n... +{len(errs)-5} more"
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"\u26a0\ufe0f Some lectures skipped ({len(errs)} issues):\n`{err_summary[:400]}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
 
         all_files = [f for f in out_dir.rglob("*") if f.is_file()]
         video_files = [f for f in all_files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4v", ".avi")]
