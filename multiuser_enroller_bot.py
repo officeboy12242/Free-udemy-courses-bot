@@ -39,8 +39,9 @@ from user_enroller import (
     is_channel_posting_enabled, toggle_channel_posting,
 )
 
-import os
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
 
 log = logging.getLogger(__name__)
 
@@ -436,15 +437,18 @@ async def _start_course_archive(update: Update, context: ContextTypes.DEFAULT_TY
         size = zip_path.stat().st_size
         _update_progress(99, f"ZIP ready ({size // (1024*1024)} MB)")
 
-        # 4. Split if necessary (we use a conservative 45 MiB to be safe for most Telegram setups)
-        MAX_PART = 45 * 1024 * 1024
+        # 4. Split if necessary.
+        # We target ~2GB single file support (matching common Telegram "large file" limits for documents).
+        # If the archive is larger than 2GB we still chunk it (very rare for a single Udemy course zip).
+        MAX_PART = 2000 * 1024 * 1024  # ~2 GiB
         part_files = []
         if size <= MAX_PART:
             part_files = [zip_path]
         else:
             part_files = _split_file_into_parts(zip_path, work_dir, MAX_PART)
 
-        # 5. Upload parts to channel (or owner if no CHANNEL_ID)
+        # 5. Upload parts to channel (or owner if no CHANNEL_ID).
+        # Uses Pyrogram (if API_ID/API_HASH provided) so we can send single files up to ~2GB.
         target_chat = CHANNEL_ID or owner_id
         for i, p in enumerate(part_files, 1):
             caption = (
@@ -453,23 +457,14 @@ async def _start_course_archive(update: Update, context: ContextTypes.DEFAULT_TY
                 f"Udemy: https://www.udemy.com{course_url}\n\n"
                 f"{'Join parts with: cat *.part*.zip > full.zip (or 7-Zip)' if len(part_files) > 1 else ''}"
             )
-            try:
-                with open(p, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=target_chat,
-                        document=f,
-                        filename=p.name,
-                        caption=caption[:1020],
-                        parse_mode="Markdown"
-                    )
-            except Exception as e:
-                log.error(f"Upload part failed: {e}")
-                # Try sending to owner as fallback
+            ok = await _upload_file_to_chat(target_chat, p, caption, p.name)
+            if not ok:
+                # Fallback to owner DM using the regular bot client (may still fail if >50MB)
                 try:
                     with open(p, "rb") as f:
-                        await context.bot.send_document(owner_id, f, filename=p.name)
-                except Exception:
-                    pass
+                        await context.bot.send_document(owner_id, f, filename=p.name, caption=caption[:1020], parse_mode="Markdown")
+                except Exception as e2:
+                    log.error(f"Fallback DM upload failed: {e2}")
 
         # 6. Notify owner of completion and clean queue item
         remove_from_download_queue(owner_id, udemy_id)
@@ -517,6 +512,61 @@ def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
             parts.append(part_name)
             part_num += 1
     return parts
+
+
+async def _upload_file_to_chat(chat_id: int, file_path: Path, caption: str, filename: str | None = None) -> bool:
+    """
+    Upload a (potentially large) file to a chat.
+    - If API_ID + API_HASH are configured, use Pyrogram (MTProto) which supports files up to ~2GB.
+    - Otherwise fall back to the regular Bot API send_document (limited to ~50MB).
+    Returns True on success.
+    """
+    file_size = file_path.stat().st_size
+
+    # Try Pyrogram large file upload first
+    if API_ID and API_HASH:
+        try:
+            from pyrogram import Client
+            # We use a unique session name per call to avoid lock issues in long-running bot
+            session_name = f"archive_uploader_{int(datetime.utcnow().timestamp())}"
+            async with Client(
+                session_name,
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                bot_token=os.getenv("BOT_TOKEN"),
+                in_memory=True,   # don't write session files
+            ) as client:
+                await client.send_document(
+                    chat_id=chat_id,
+                    document=str(file_path),
+                    caption=caption[:1020] if caption else None,
+                    file_name=filename,
+                    force_document=True,
+                )
+            log.info(f"Pyrogram upload succeeded for {file_path.name} ({file_size // (1024*1024)} MB)")
+            return True
+        except Exception as e:
+            log.error(f"Pyrogram large upload failed for {file_path.name}: {e}")
+            # fall through to bot API fallback
+
+    # Fallback: regular python-telegram-bot (will fail gracefully if >~50MB)
+    try:
+        bot_token = os.getenv("BOT_TOKEN")
+        if bot_token:
+            ptb_bot = Bot(token=bot_token)
+            with open(file_path, "rb") as f:
+                await ptb_bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=filename or file_path.name,
+                    caption=caption[:1020] if caption else None,
+                    parse_mode="Markdown"
+                )
+            return True
+    except Exception as e:
+        log.error(f"Bot API fallback upload failed for {file_path.name}: {e}")
+
+    return False
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
