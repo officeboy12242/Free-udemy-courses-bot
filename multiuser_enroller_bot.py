@@ -15,7 +15,7 @@ from udemy_enroller import Course, UdemyAutoEnroller
 from user_enroller import (
     init_enroller_db,
     add_account, get_user_accounts, get_account, remove_account, toggle_auto_enroll,
-    get_all_auto_enroll_accounts,
+    get_all_auto_enroll_accounts, find_existing_account, update_account_token,
     set_user_setup_state, get_user_setup_state, clear_user_setup_state,
     get_auto_enroll_state, set_auto_enroll_enabled, update_auto_enroll_state,
     log_enrollment, is_course_enrolled, get_recently_enrolled,
@@ -244,7 +244,8 @@ async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Show verifying message
     verify_msg = await update.effective_message.reply_text("🔄 Verifying token...")
     
-    # Try to get actual Udemy username
+    # Try to get actual Udemy username and user ID
+    udemy_user_id = None
     try:
         enroller = UdemyAutoEnroller(token)
         is_valid = await asyncio.to_thread(enroller.verify_login)
@@ -252,23 +253,41 @@ async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await verify_msg.edit_text("❌ Invalid token or Udemy login failed.")
             return
         
-        udemy_name = await asyncio.to_thread(enroller.get_user_name)
-        name = udemy_name or "Udemy Account"
+        udemy_info = await asyncio.to_thread(enroller.get_user_info)
+        if udemy_info:
+            udemy_user_id = udemy_info.get("id")
+            name = udemy_info.get("name") or "Udemy Account"
+        else:
+            name = "Udemy Account"
     except Exception:
         name = "Udemy Account"
     
-    acc_id = add_account(user_id, name, token, None)
-    clear_user_setup_state(user_id)
-    
-    await verify_msg.edit_text(
-        f"🎉 **Setup Complete!**\n\n"
-        f"✅ **{name}** added successfully\n"
-        f"🚀 Auto-enrollment STARTED!\n\n"
-        f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
-        f"You'll receive notifications when courses are enrolled.\n\n"
-        f"📊 `/enroll_status` — View your stats",
-        parse_mode="Markdown"
-    )
+    # Check if the account already exists for this user
+    existing_acc = find_existing_account(user_id, token, udemy_user_id)
+    if existing_acc:
+        # Update existing account's token and name
+        update_account_token(existing_acc["id"], token, name)
+        clear_user_setup_state(user_id)
+        await verify_msg.edit_text(
+            f"🔄 **Account Updated!**\n\n"
+            f"Your Udemy account **{name}** was already registered. I have successfully updated its access token to the new one you provided! ✅\n\n"
+            f"🚀 Auto-enrollment is active!\n\n"
+            f"📊 `/enroll_status` — View your stats",
+            parse_mode="Markdown"
+        )
+    else:
+        # Add as new account
+        acc_id = add_account(user_id, name, token, None, udemy_user_id)
+        clear_user_setup_state(user_id)
+        await verify_msg.edit_text(
+            f"🎉 **Setup Complete!**\n\n"
+            f"✅ **{name}** added successfully\n"
+            f"🚀 Auto-enrollment STARTED!\n\n"
+            f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
+            f"You'll receive notifications when courses are enrolled.\n\n"
+            f"📊 `/enroll_status` — View your stats",
+            parse_mode="Markdown"
+        )
 
 
 # ─── Message Handler for Interactive Setup ───────────────────────────────────
@@ -294,7 +313,8 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
         # Show verifying message
         verify_msg = await update.effective_message.reply_text("🔄 Verifying token...")
         
-        # Try to get actual Udemy username
+        # Try to get actual Udemy username and user ID
+        udemy_user_id = None
         try:
             enroller = UdemyAutoEnroller(text)  # Uses default client_id
             
@@ -304,26 +324,44 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await verify_msg.edit_text("❌ Invalid token or Udemy login failed. Please check and try again.")
                 return
             
-            # Get actual Udemy username
-            udemy_name = await asyncio.to_thread(enroller.get_user_name)
-            name = udemy_name or extra or "Udemy Account"
+            # Get actual Udemy username and ID
+            udemy_info = await asyncio.to_thread(enroller.get_user_info)
+            if udemy_info:
+                udemy_user_id = udemy_info.get("id")
+                name = udemy_info.get("name") or extra or "Udemy Account"
+            else:
+                name = extra or "Udemy Account"
         except Exception as e:
             log.error(f"Token verification error: {e}")
             name = extra or "Udemy Account"
         
-        # Add account with actual name
-        acc_id = add_account(user_id, name, text, None)
-        clear_user_setup_state(user_id)
-        
-        await verify_msg.edit_text(
-            f"🎉 **Setup Complete!**\n\n"
-            f"✅ **{name}** added successfully\n"
-            f"🚀 Auto-enrollment STARTED!\n\n"
-            f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
-            f"You'll receive notifications when courses are enrolled.\n\n"
-            f"📊 `/enroll_status` — View your stats",
-            parse_mode="Markdown"
-        )
+        # Check if the account already exists for this user
+        existing_acc = find_existing_account(user_id, text, udemy_user_id)
+        if existing_acc:
+            # Update existing account's token and name
+            update_account_token(existing_acc["id"], text, name)
+            clear_user_setup_state(user_id)
+            await verify_msg.edit_text(
+                f"🔄 **Account Updated!**\n\n"
+                f"Your Udemy account **{name}** was already registered. I have successfully updated its access token to the new one you provided! ✅\n\n"
+                f"🚀 Auto-enrollment is active!\n\n"
+                f"📊 `/enroll_status` — View your stats",
+                parse_mode="Markdown"
+            )
+        else:
+            # Add account with actual name and udemy_user_id
+            acc_id = add_account(user_id, name, text, None, udemy_user_id)
+            clear_user_setup_state(user_id)
+            
+            await verify_msg.edit_text(
+                f"🎉 **Setup Complete!**\n\n"
+                f"✅ **{name}** added successfully\n"
+                f"🚀 Auto-enrollment STARTED!\n\n"
+                f"The bot will now automatically enroll you in free courses every 2 minutes.\n"
+                f"You'll receive notifications when courses are enrolled.\n\n"
+                f"📊 `/enroll_status` — View your stats",
+                parse_mode="Markdown"
+            )
 
 
 # ─── Account Management ──────────────────────────────────────────────────────

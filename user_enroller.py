@@ -112,7 +112,7 @@ def init_enroller_db():
 DEFAULT_CLIENT_ID = "bd2565cb7b0c313f5e9bae44961e8db2"
 
 
-def add_account(user_id: int, account_name: str, access_token: str, client_id: str = None) -> int:
+def add_account(user_id: int, account_name: str, access_token: str, client_id: str = None, udemy_user_id: int = None) -> int:
     """Add a new Udemy account for user. Returns account ID. Uses default client_id if not provided."""
     db = _get_db()
     
@@ -131,6 +131,7 @@ def add_account(user_id: int, account_name: str, access_token: str, client_id: s
         "account_name": account_name,
         "access_token": access_token,
         "client_id": client_id or DEFAULT_CLIENT_ID,
+        "udemy_user_id": udemy_user_id,
         "is_active": True,
         "auto_enroll": True,
         "created_at": datetime.utcnow(),
@@ -138,6 +139,49 @@ def add_account(user_id: int, account_name: str, access_token: str, client_id: s
     })
     
     return account_id
+
+
+def find_existing_account(user_id: int, access_token: str, udemy_user_id: int = None) -> dict:
+    """Find an existing account for the user by access token or Udemy user ID"""
+    db = _get_db()
+    or_conditions = [{"access_token": access_token}]
+    if udemy_user_id is not None:
+        or_conditions.append({"udemy_user_id": udemy_user_id})
+    
+    query = {
+        "user_id": user_id,
+        "$or": or_conditions
+    }
+    
+    a = db.user_accounts.find_one(query)
+    if a:
+        return {
+            "id": a["_id"],
+            "user_id": a["user_id"],
+            "name": a["account_name"],
+            "access_token": a["access_token"],
+            "client_id": a["client_id"],
+            "udemy_user_id": a.get("udemy_user_id"),
+            "is_active": a.get("is_active", True),
+            "auto_enroll": a.get("auto_enroll", True)
+        }
+    return None
+
+
+def update_account_token(account_id: int, access_token: str, account_name: str = None) -> None:
+    """Update access token and name of an existing account"""
+    db = _get_db()
+    update_data = {
+        "access_token": access_token,
+        "updated_at": datetime.utcnow()
+    }
+    if account_name:
+        update_data["account_name"] = account_name
+        
+    db.user_accounts.update_one(
+        {"_id": account_id},
+        {"$set": update_data}
+    )
 
 
 def get_user_accounts(user_id: int) -> list:
@@ -150,6 +194,7 @@ def get_user_accounts(user_id: int) -> list:
             "name": a["account_name"],
             "access_token": a["access_token"],
             "client_id": a["client_id"],
+            "udemy_user_id": a.get("udemy_user_id"),
             "is_active": a.get("is_active", True),
             "auto_enroll": a.get("auto_enroll", True)
         }
@@ -168,6 +213,7 @@ def get_account(account_id: int) -> dict:
             "name": a["account_name"],
             "access_token": a["access_token"],
             "client_id": a["client_id"],
+            "udemy_user_id": a.get("udemy_user_id"),
             "is_active": a.get("is_active", True),
             "auto_enroll": a.get("auto_enroll", True)
         }

@@ -156,6 +156,23 @@ class UdemyAutoEnroller:
         except Exception as e:
             log.debug(f"Failed to get user name: {e}")
             return None
+
+    def get_user_info(self) -> dict:
+        """Get the Udemy user's info (id, display_name)"""
+        try:
+            r = self._get("https://www.udemy.com/api-2.0/users/me/?fields[user]=id,display_name,name,title")
+            if r and r.status_code == 200:
+                data = r.json()
+                uid = data.get("id")
+                name = data.get("display_name") or data.get("name") or data.get("title")
+                return {
+                    "id": uid,
+                    "name": name.strip() if name else None
+                }
+            return None
+        except Exception as e:
+            log.debug(f"Failed to get user info: {e}")
+            return None
     
     @staticmethod
     def _extract_slug(url: str) -> str:
@@ -275,8 +292,8 @@ class UdemyAutoEnroller:
         headers = {
             "Content-Type": "application/json",
             "Referer": "https://www.udemy.com/payment/checkout/",
-            "Origin": "https://www.udemy.com",
-            "Host": "www.udemy.com",
+                "Origin": "https://www.udemy.com",
+                "Host": "www.udemy.com",
             "x-checkout-is-mobile-app": "false",
             "X-CSRF-Token": csrf,
         }
@@ -317,11 +334,11 @@ class UdemyAutoEnroller:
             {
                 "buyable": {"id": str(cid), "type": "course"},
                 "discountInfo": {"code": coup} if coup else {},
-                "price": {"amount": 0, "currency": self.currency.upper()},
-            }
+                        "price": {"amount": 0, "currency": self.currency.upper()},
+                    }
             for cid, coup, _ in courses_to_enroll
         ]
-        
+
         payload = {
             "checkout_environment": "Marketplace",
             "checkout_event": "Submit",
@@ -341,7 +358,7 @@ class UdemyAutoEnroller:
             r = self._post("https://www.udemy.com/payment/checkout-submit/", json=payload, headers=headers)
             if not r:
                 continue
-            if r.status_code == 504:
+                if r.status_code == 504:
                 return [t for _, _, t in courses_to_enroll]
             try:
                 if r.json().get("status") == "succeeded":
