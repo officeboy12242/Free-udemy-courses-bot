@@ -636,6 +636,7 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     progress_msg = None
     _last_edit = [0.0]
+    progress_queue = asyncio.Queue()
 
     async def _send_progress(pct, stage):
         nonlocal progress_msg
@@ -654,8 +655,26 @@ async def _start_course_archive(update, context, item, silent_start=False):
         except Exception:
             pass
 
+    async def _progress_monitor():
+        """Background task that monitors the progress queue and sends updates"""
+        while True:
+            try:
+                pct, stage = await progress_queue.get()
+                if pct is None:  # Sentinel value to stop the monitor
+                    break
+                await _send_progress(pct, stage)
+            except Exception:
+                pass
+
     def _sync_progress(pct, stage):
-        asyncio.create_task(_send_progress(pct, stage))
+        """Thread-safe progress callback - puts updates into queue"""
+        try:
+            progress_queue.put_nowait((pct, stage))
+        except Exception:
+            pass
+
+    # Start the progress monitor task
+    monitor_task = asyncio.create_task(_progress_monitor())
 
     try:
         if not silent_start:
@@ -813,6 +832,13 @@ async def _start_course_archive(update, context, item, silent_start=False):
         except Exception:
             pass
     finally:
+        # Stop the progress monitor task
+        try:
+            progress_queue.put_nowait((None, None))  # Sentinel value
+            await monitor_task
+        except Exception:
+            pass
+        # Clean up temporary files
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
