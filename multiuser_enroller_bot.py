@@ -55,8 +55,11 @@ API_HASH = os.getenv("API_HASH")
 # Multiple bot tokens for parallel operations (comma-separated)
 UPLOAD_BOT_TOKENS_STR = os.getenv("UPLOAD_BOT_TOKENS", "")
 UPLOAD_BOT_TOKENS = [t.strip() for t in UPLOAD_BOT_TOKENS_STR.split(",") if t.strip()] if UPLOAD_BOT_TOKENS_STR else []
-ARCHIVE_WORK_DIR = Path(os.getenv("ARCHIVE_WORK_DIR", str(Path(tempfile.gettempdir()) / "udemy_archives")))
+_default_archive_dir = Path("/var/data/udemy_archives") if Path("/var/data").exists() else Path(tempfile.gettempdir()) / "udemy_archives"
+ARCHIVE_WORK_DIR = Path(os.getenv("ARCHIVE_WORK_DIR", str(_default_archive_dir)))
 ARCHIVE_STUCK_AFTER_SECONDS = int(os.getenv("ARCHIVE_STUCK_AFTER_SECONDS", "900"))
+ARCHIVE_MIN_FREE_GB = float(os.getenv("ARCHIVE_MIN_FREE_GB", "1.5"))
+ALLOW_TMP_ARCHIVES = os.getenv("ALLOW_TMP_ARCHIVES", "0").strip().lower() in ("1", "true", "yes", "on")
 
 log = logging.getLogger(__name__)
 
@@ -80,10 +83,22 @@ bot_pool_lock = Lock()
 
 def get_disk_usage(path="/"):
     """Get disk usage stats for the given path"""
-    if not PSUTIL_AVAILABLE:
-        return None
     try:
-        usage = psutil.disk_usage(path)
+        target = Path(path)
+        # disk_usage needs an existing path on some platforms.
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        if PSUTIL_AVAILABLE:
+            usage = psutil.disk_usage(str(target))
+        else:
+            usage = shutil.disk_usage(str(target))
+            percent = (usage.used / usage.total * 100) if usage.total else 0
+            usage = type("Usage", (), {
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+                "percent": percent,
+            })()
         return {
             "total_gb": usage.total / (1024**3),
             "used_gb": usage.used / (1024**3),
@@ -92,6 +107,46 @@ def get_disk_usage(path="/"):
         }
     except Exception:
         return None
+
+
+def _is_tmp_path(path: Path) -> bool:
+    """Return True when path is under the OS temporary directory."""
+    try:
+        tmp = Path(tempfile.gettempdir()).resolve()
+        return tmp == path.resolve() or tmp in path.resolve().parents
+    except Exception:
+        return False
+
+
+def ensure_archive_storage_ready(path: Path) -> tuple[bool, str]:
+    """Preflight archive storage to avoid Render /tmp eviction crashes."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return False, f"Cannot create archive work directory `{path}`: {e}"
+
+    disk = get_disk_usage(str(path))
+    if not disk:
+        return True, ""
+
+    if disk["free_gb"] < ARCHIVE_MIN_FREE_GB:
+        return False, (
+            f"Not enough free disk for archive work. Free: {disk['free_gb']:.1f} GB; "
+            f"required: {ARCHIVE_MIN_FREE_GB:.1f} GB. Clear storage or increase disk."
+        )
+
+    # Render's /tmp is often 2GB and evicts the whole instance when exceeded.
+    # Block by default unless the owner explicitly opts in for small-test archives.
+    if _is_tmp_path(path) and disk["total_gb"] <= 3 and not ALLOW_TMP_ARCHIVES:
+        return False, (
+            "Archive work directory is on small temporary storage (`/tmp`, about "
+            f"{disk['total_gb']:.1f} GB). Render can evict the instance when this fills.\n\n"
+            "Fix: add a Render persistent disk and set:\n"
+            "`ARCHIVE_WORK_DIR=/var/data/udemy_archives`\n\n"
+            "For small testing only, set `ALLOW_TMP_ARCHIVES=1`."
+        )
+
+    return True, ""
 
 
 def get_cpu_usage():
@@ -1311,6 +1366,34 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
     work_dir = Path(job.get("work_dir")) if job and job.get("work_dir") else ARCHIVE_WORK_DIR / str(owner_id) / str(udemy_id)
+    storage_ok, storage_msg = ensure_archive_storage_ready(work_dir)
+    if not storage_ok:
+        await asyncio.to_thread(
+            upsert_archive_job,
+            owner_id,
+            udemy_id,
+            title=title,
+            course_url=course_url,
+            source_account_id=source_acc_id,
+            status="failed",
+            work_dir=str(work_dir),
+            progress=0,
+            stage="Storage limit - configure persistent disk",
+            last_error=storage_msg[:500],
+            last_heartbeat=datetime.utcnow(),
+        )
+        try:
+            await context.bot.send_message(
+                owner_id,
+                f"⚠️ **Archive paused before download**\n\n"
+                f"**{title}**\n\n"
+                f"{storage_msg}\n\n"
+                "After configuring storage, click Archive/Resume again.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return
     out_dir = work_dir / safe_name
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = work_dir / f"{safe_name}.zip"
@@ -1560,6 +1643,36 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 "\u2022 Course uses Widevine DRM (not extractable by yt-dlp)"
             )
             return
+
+        if all_files and not (zip_path.exists() and zip_path.stat().st_size > 0):
+            downloaded_bytes = sum(f.stat().st_size for f in all_files if f.exists())
+            disk = get_disk_usage(str(work_dir))
+            free_bytes = (disk["free_gb"] * (1024**3)) if disk else None
+            # ZIP_STORED still needs a second file roughly the same size as the
+            # downloaded tree. Keep a small safety buffer to avoid platform eviction.
+            zip_buffer_bytes = int(ARCHIVE_MIN_FREE_GB * (1024**3))
+            if free_bytes is not None and free_bytes < (downloaded_bytes + zip_buffer_bytes):
+                needed_gb = (downloaded_bytes + zip_buffer_bytes) / (1024**3)
+                await asyncio.to_thread(
+                    upsert_archive_job,
+                    owner_id,
+                    udemy_id,
+                    status="failed",
+                    stage="Downloaded files kept - need more disk to create ZIP",
+                    progress=90,
+                    last_error=f"Need {needed_gb:.1f} GB free to create ZIP; have {disk['free_gb']:.1f} GB",
+                    last_heartbeat=datetime.utcnow(),
+                )
+                await context.bot.send_message(
+                    owner_id,
+                    f"⚠️ **Not enough disk to create ZIP**\n\n"
+                    f"Downloaded files were kept for resume.\n"
+                    f"Free: {disk['free_gb']:.1f} GB\n"
+                    f"Needed: {needed_gb:.1f} GB\n\n"
+                    f"Fix storage (`ARCHIVE_WORK_DIR=/var/data/udemy_archives`) and click Archive/Resume again.",
+                    parse_mode="Markdown",
+                )
+                return
 
         if zip_path.exists() and zip_path.stat().st_size > 0:
             await _send_progress(90, f"\u2705 Existing ZIP found. Uploading without rebuilding...")
