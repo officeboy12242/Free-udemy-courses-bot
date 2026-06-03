@@ -12,7 +12,7 @@ import shutil
 import tempfile
 import zipfile
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
 
@@ -32,6 +32,7 @@ from user_enroller import (
     add_account, get_user_accounts, get_account, remove_account, toggle_auto_enroll,
     get_all_auto_enroll_accounts, find_existing_account, update_account_token,
     add_to_download_queue, get_owner_download_queue, remove_from_download_queue, clear_owner_download_queue,
+    get_archive_job, upsert_archive_job, mark_archive_job_heartbeat, mark_archive_job_posted,
     set_user_setup_state, get_user_setup_state, clear_user_setup_state,
     DEFAULT_CLIENT_ID,
     get_auto_enroll_state, set_auto_enroll_enabled, update_auto_enroll_state,
@@ -54,6 +55,8 @@ API_HASH = os.getenv("API_HASH")
 # Multiple bot tokens for parallel operations (comma-separated)
 UPLOAD_BOT_TOKENS_STR = os.getenv("UPLOAD_BOT_TOKENS", "")
 UPLOAD_BOT_TOKENS = [t.strip() for t in UPLOAD_BOT_TOKENS_STR.split(",") if t.strip()] if UPLOAD_BOT_TOKENS_STR else []
+ARCHIVE_WORK_DIR = Path(os.getenv("ARCHIVE_WORK_DIR", str(Path(tempfile.gettempdir()) / "udemy_archives")))
+ARCHIVE_STUCK_AFTER_SECONDS = int(os.getenv("ARCHIVE_STUCK_AFTER_SECONDS", "900"))
 
 log = logging.getLogger(__name__)
 
@@ -557,10 +560,23 @@ async def _show_download_queue(query_or_msg, queue: list):
         keyboard = []
         for item in queue[:12]:  # show up to 12
             title = item["title"][:50]
-            lines.append(f"• **{title}**")
+            status = item.get("job_status")
+            if status == "posted":
+                badge = f"✅ Posted ({item.get('zip_size_mb', 0)} MB)"
+            elif status == "zip_ready":
+                badge = "📦 ZIP ready - resume upload"
+            elif status == "upload_failed":
+                badge = "⚠️ Upload failed - resume upload"
+            elif status == "failed":
+                badge = "🔁 Failed - resume download"
+            elif status == "running":
+                badge = f"⏳ Running {item.get('job_progress', 0)}%"
+            else:
+                badge = "🆕 New"
+            lines.append(f"• **{title}**\n  `{badge}`")
             uid = item["udemy_course_id"]
             keyboard.append([
-                InlineKeyboardButton(f"🚀 Archive “{title[:25]}”", callback_data=f"dl_start_{uid}"),
+                InlineKeyboardButton(f"🚀 Archive/Resume “{title[:20]}”", callback_data=f"dl_start_{uid}"),
                 InlineKeyboardButton("🗑️", callback_data=f"dl_remove_{uid}"),
             ])
         if len(queue) > 12:
@@ -1228,6 +1244,34 @@ async def _start_course_archive(update, context, item, silent_start=False):
     title = item.get("title", f"Course-{udemy_id}")
     course_url = item.get("course_url", "")
     source_acc_id = item.get("source_account_id")
+    task_id = f"{owner_id}_{udemy_id}"
+
+    with active_tasks_lock:
+        already_active = task_id in active_tasks
+    if already_active:
+        if not silent_start:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"⏳ Archive is already running for “{title}”. Use /status to watch the live progress.",
+                )
+            except Exception:
+                pass
+        return
+
+    job = await asyncio.to_thread(get_archive_job, owner_id, udemy_id)
+    if job and job.get("status") == "posted":
+        if not silent_start:
+            try:
+                await context.bot.send_message(
+                    owner_id,
+                    f"✅ “{title}” was already completed and posted to the channel.\n"
+                    f"ZIP size: {job.get('zip_size_mb', 0)} MB • Parts: {job.get('part_count', 0)}",
+                )
+            except Exception:
+                pass
+        remove_from_download_queue(owner_id, udemy_id)
+        return
 
     accounts = get_user_accounts(owner_id)
     chosen = None
@@ -1266,13 +1310,29 @@ async def _start_course_archive(update, context, item, silent_start=False):
             log.warning(f"Enrolled-account check failed for {title}: {_e}")
 
     safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
-    work_dir = Path(tempfile.mkdtemp(prefix="udemy_"))
+    work_dir = Path(job.get("work_dir")) if job and job.get("work_dir") else ARCHIVE_WORK_DIR / str(owner_id) / str(udemy_id)
     out_dir = work_dir / safe_name
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = work_dir / f"{safe_name}.zip"
+    existing_zip = zip_path.exists() and zip_path.stat().st_size > 0
+
+    await asyncio.to_thread(
+        upsert_archive_job,
+        owner_id,
+        udemy_id,
+        title=title,
+        course_url=course_url,
+        source_account_id=source_acc_id,
+        status="running",
+        work_dir=str(work_dir),
+        out_dir=str(out_dir),
+        zip_path=str(zip_path),
+        progress=0,
+        stage="Initializing",
+        last_heartbeat=datetime.utcnow(),
+    )
 
     # Register task in global tracker
-    task_id = f"{owner_id}_{udemy_id}"
     with active_tasks_lock:
         active_tasks[task_id] = {
             "course": title,
@@ -1286,6 +1346,7 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     progress_msg = None
     _last_edit = [0.0]
+    _last_job_write = [0.0]
     progress_queue = asyncio.Queue()
 
     async def _send_progress(pct, stage, bot_info=None):
@@ -1305,6 +1366,11 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 active_tasks[task_id]["status"] = "downloading" if pct < 90 else "uploading"
                 if bot_info:
                     active_tasks[task_id]["bots"] = bot_info
+        if (now - _last_job_write[0]) >= 15:
+            _last_job_write[0] = now
+            asyncio.create_task(asyncio.to_thread(
+                mark_archive_job_heartbeat, owner_id, udemy_id, stage, pct
+            ))
         
         # Add CPU + disk usage to stage info
         sys_info = ""
@@ -1366,48 +1432,53 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     # Start the progress monitor task
     monitor_task = asyncio.create_task(_progress_monitor())
+    archive_completed = False
 
     try:
         if not silent_start:
             await _send_progress(1, f"\U0001f510 Preparing cookies for: **{chosen.get('name')}**")
 
-        await _send_progress(3, "\U0001f680 Fetching curriculum and downloading lectures...")
+        if existing_zip:
+            await _send_progress(80, "\U0001f501 Found existing ZIP from previous run. Resuming from upload...")
+            ok, errs = True, []
+        else:
+            await _send_progress(3, "\U0001f680 Fetching curriculum and downloading lectures...")
 
-        # Use parallel downloads if bot pool available, otherwise single-threaded.
-        # IMPORTANT: even if the download phase raises (DRM, network, merge error, etc.),
-        # we must NOT abort — we still want to ZIP and share whatever was downloaded.
-        num_workers = len(bot_pool) if bot_pool else 0
-        ok, errs = False, []
+            # Use parallel downloads if bot pool available, otherwise single-threaded.
+            # IMPORTANT: even if the download phase raises (DRM, network, merge error, etc.),
+            # we must NOT abort — we still want to ZIP and share whatever was downloaded.
+            num_workers = len(bot_pool) if bot_pool else 0
+            ok, errs = False, []
 
-        try:
-            if num_workers > 1:
-                log.info(f"Using parallel download with {num_workers} workers")
-                ok, errs = await _download_course_parallel(
-                    course_url,
-                    out_dir,
-                    chosen["access_token"],
-                    chosen.get("client_id") or DEFAULT_CLIENT_ID,
-                    num_workers,
-                    _sync_progress,
-                    udemy_id,  # known numeric course id → robust resolution
-                )
-            else:
-                log.info("Using single-threaded download (no bot pool configured)")
-                ok, errs = await asyncio.to_thread(
-                    _download_course_via_api,
-                    course_url,
-                    out_dir,
-                    chosen["access_token"],
-                    chosen.get("client_id") or DEFAULT_CLIENT_ID,
-                    _sync_progress,
-                    None,        # lecture_subset
-                    0,           # batch_num
-                    udemy_id,    # course_id_hint
-                )
-        except Exception as dl_err:
-            # Download phase crashed partway — keep going and archive whatever we have.
-            log.exception(f"Download phase error for {title}: {dl_err}")
-            errs = (errs or []) + [f"Download interrupted: {dl_err}"]
+            try:
+                if num_workers > 1:
+                    log.info(f"Using parallel download with {num_workers} workers")
+                    ok, errs = await _download_course_parallel(
+                        course_url,
+                        out_dir,
+                        chosen["access_token"],
+                        chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                        num_workers,
+                        _sync_progress,
+                        udemy_id,  # known numeric course id → robust resolution
+                    )
+                else:
+                    log.info("Using single-threaded download (no bot pool configured)")
+                    ok, errs = await asyncio.to_thread(
+                        _download_course_via_api,
+                        course_url,
+                        out_dir,
+                        chosen["access_token"],
+                        chosen.get("client_id") or DEFAULT_CLIENT_ID,
+                        _sync_progress,
+                        None,        # lecture_subset
+                        0,           # batch_num
+                        udemy_id,    # course_id_hint
+                    )
+            except Exception as dl_err:
+                # Download phase crashed partway — keep going and archive whatever we have.
+                log.exception(f"Download phase error for {title}: {dl_err}")
+                errs = (errs or []) + [f"Download interrupted: {dl_err}"]
 
         # Safety net: if parallel batch dirs were left behind (e.g. merge crashed),
         # flatten them into out_dir so nothing downloaded is lost.
@@ -1469,7 +1540,17 @@ async def _start_course_archive(update, context, item, silent_start=False):
         all_files = [f for f in out_dir.rglob("*") if f.is_file()]
         video_files = [f for f in all_files if f.suffix.lower() in (".mp4", ".mkv", ".webm", ".m4v", ".avi")]
 
-        if not all_files:
+        if not all_files and not (zip_path.exists() and zip_path.stat().st_size > 0):
+            await asyncio.to_thread(
+                upsert_archive_job,
+                owner_id,
+                udemy_id,
+                status="failed",
+                stage="No files downloaded - ready to retry",
+                progress=0,
+                last_error="No files downloaded",
+                last_heartbeat=datetime.utcnow(),
+            )
             await context.bot.send_message(
                 owner_id,
                 f"\u274c **No files downloaded** for \u201c{title}\u201d.\n\n"
@@ -1480,20 +1561,35 @@ async def _start_course_archive(update, context, item, silent_start=False):
             )
             return
 
-        await _send_progress(90, f"\u2705 {len(video_files)} video(s) downloaded. Creating ZIP...")
+        if zip_path.exists() and zip_path.stat().st_size > 0:
+            await _send_progress(90, f"\u2705 Existing ZIP found. Uploading without rebuilding...")
+        else:
+            await _send_progress(90, f"\u2705 {len(video_files)} video(s) downloaded. Creating ZIP...")
 
-        def _zip_tree(src, dst):
-            # Use ZIP_STORED (no compression). Course content is mostly already-
-            # compressed video (mp4/m3u8) — deflating it burns lots of CPU for
-            # almost zero size saving. Storing keeps CPU usage minimal.
-            with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
-                for root, _, files in os.walk(src):
-                    for fname in sorted(files):
-                        full = Path(root) / fname
-                        zf.write(full, full.relative_to(src))
+            def _zip_tree(src, dst):
+                # Use ZIP_STORED (no compression). Course content is mostly already-
+                # compressed video (mp4/m3u8) — deflating it burns lots of CPU for
+                # almost zero size saving. Storing keeps CPU usage minimal.
+                with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+                    for root, _, files in os.walk(src):
+                        for fname in sorted(files):
+                            full = Path(root) / fname
+                            zf.write(full, full.relative_to(src))
 
-        await asyncio.to_thread(_zip_tree, out_dir, zip_path)
+            await asyncio.to_thread(_zip_tree, out_dir, zip_path)
         size_mb = zip_path.stat().st_size // (1024 * 1024)
+        await asyncio.to_thread(
+            upsert_archive_job,
+            owner_id,
+            udemy_id,
+            status="zip_ready",
+            zip_path=str(zip_path),
+            zip_size_mb=size_mb,
+            video_count=len(video_files),
+            stage="ZIP ready",
+            progress=95,
+            last_heartbeat=datetime.utcnow(),
+        )
         await _send_progress(95, f"\U0001f4e6 ZIP ready: {size_mb} MB. Uploading...")
 
         MAX_PART = 2000 * 1024 * 1024
@@ -1503,6 +1599,7 @@ async def _start_course_archive(update, context, item, silent_start=False):
             part_files = await asyncio.to_thread(_split_file_into_parts, zip_path, work_dir, MAX_PART)
 
         raw_target = CHANNEL_ID if CHANNEL_ID else None
+        uploaded_all = True
 
         for i, p in enumerate(part_files, 1):
             part_mb = p.stat().st_size // (1024 * 1024)
@@ -1571,9 +1668,32 @@ async def _start_course_archive(update, context, item, silent_start=False):
                             caption=caption[:1020],
                             parse_mode="Markdown",
                         )
+                    upload_ok = True
                 except Exception as e2:
                     log.error(f"All upload methods failed for {p.name}: {e2}")
+                    uploaded_all = False
+                    await asyncio.to_thread(
+                        upsert_archive_job,
+                        owner_id,
+                        udemy_id,
+                        status="upload_failed",
+                        stage=f"Upload failed for {p.name}",
+                        progress=95,
+                        last_error=str(e2)[:500],
+                        last_heartbeat=datetime.utcnow(),
+                    )
+                    break
 
+        if not uploaded_all:
+            await context.bot.send_message(
+                owner_id,
+                f"⚠️ Upload failed for “{title}”. The ZIP was kept for resume.\n"
+                f"Run Archive again from /download_queue to resume from upload instead of re-downloading.",
+            )
+            return
+
+        await asyncio.to_thread(mark_archive_job_posted, owner_id, udemy_id, len(part_files), size_mb)
+        archive_completed = True
         remove_from_download_queue(owner_id, udemy_id)
         drm_skipped = len([e for e in (errs or []) if "DRM protected" in e])
         done_txt = (
@@ -1595,16 +1715,20 @@ async def _start_course_archive(update, context, item, silent_start=False):
 
     except Exception as e:
         log.exception(f"Archive failed for {title}: {e}")
-        # Remove from queue even on failure (to avoid accumulating failed items)
-        try:
-            remove_from_download_queue(owner_id, udemy_id)
-        except Exception:
-            pass
+        await asyncio.to_thread(
+            upsert_archive_job,
+            owner_id,
+            udemy_id,
+            status="failed",
+            stage="Failed - ready to resume",
+            last_error=str(e)[:500],
+            last_heartbeat=datetime.utcnow(),
+        )
         try:
             await context.bot.send_message(
                 owner_id, 
                 f"\u274c Archive failed for \u201c{title}\u201d:\n`{str(e)[:300]}`\n\n"
-                f"Item removed from queue.",
+                f"Item kept in queue. Select Archive again to resume from downloaded files/ZIP.",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -1619,11 +1743,13 @@ async def _start_course_archive(update, context, item, silent_start=False):
         # Remove task from global tracker
         with active_tasks_lock:
             active_tasks.pop(task_id, None)
-        # Clean up temporary files
-        try:
-            shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
+        # Keep files on failure/stuck so the next Archive click can resume.
+        # Only remove after confirmed posted.
+        if archive_completed:
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
     """Split a large file into sequentially named .partXX.zip files."""
@@ -2445,6 +2571,11 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         title = match.get("title", "Course")
         url = match.get("url", "")
         src_acc = match.get("source_account_id")
+
+        job = await asyncio.to_thread(get_archive_job, user_id, udemy_id)
+        if job and job.get("status") == "posted":
+            await query.answer("Already archived and posted.", show_alert=True)
+            return
 
         added = add_to_download_queue(user_id, udemy_id, title, url, src_acc)
         if added:

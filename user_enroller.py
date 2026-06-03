@@ -105,6 +105,8 @@ def init_enroller_db():
         # Owner course archive / download queue
         db.owner_download_queue.create_index([("owner_id", 1)])
         db.owner_download_queue.create_index([("owner_id", 1), ("udemy_course_id", 1)], unique=True)
+        db.owner_archive_jobs.create_index([("owner_id", 1), ("udemy_course_id", 1)], unique=True)
+        db.owner_archive_jobs.create_index([("owner_id", 1), ("status", 1)])
         
         log.info("MongoDB indexes created successfully")
     except Exception as e:
@@ -671,16 +673,26 @@ def get_owner_download_queue(owner_id: int) -> list:
     """Return list of selected courses for the owner, newest first."""
     db = _get_db()
     docs = db.owner_download_queue.find({"owner_id": owner_id}).sort("added_at", -1)
-    return [
-        {
+    items = []
+    for d in docs:
+        job = db.owner_archive_jobs.find_one(
+            {"owner_id": owner_id, "udemy_course_id": d["udemy_course_id"]},
+            {"status": 1, "progress": 1, "stage": 1, "posted_at": 1, "zip_size_mb": 1, "part_count": 1},
+        ) or {}
+        items.append({
             "udemy_course_id": d["udemy_course_id"],
             "title": d.get("title", "Untitled"),
             "course_url": d.get("course_url", ""),
             "source_account_id": d.get("source_account_id"),
-            "added_at": d.get("added_at")
-        }
-        for d in docs
-    ]
+            "added_at": d.get("added_at"),
+            "job_status": job.get("status"),
+            "job_progress": job.get("progress", 0),
+            "job_stage": job.get("stage", ""),
+            "posted_at": job.get("posted_at"),
+            "zip_size_mb": job.get("zip_size_mb", 0),
+            "part_count": job.get("part_count", 0),
+        })
+    return items
 
 
 def remove_from_download_queue(owner_id: int, udemy_course_id: int) -> bool:
@@ -703,6 +715,65 @@ def clear_owner_download_queue(owner_id: int) -> int:
     except Exception as e:
         log.error(f"clear_owner_download_queue error: {e}")
         return 0
+
+
+def get_archive_job(owner_id: int, udemy_course_id: int) -> dict | None:
+    """Return persisted archive job state for a course, if any."""
+    try:
+        db = _get_db()
+        return db.owner_archive_jobs.find_one({"owner_id": owner_id, "udemy_course_id": udemy_course_id})
+    except Exception as e:
+        log.error(f"get_archive_job error: {e}")
+        return None
+
+
+def upsert_archive_job(owner_id: int, udemy_course_id: int, **fields) -> bool:
+    """Create/update archive job state. Used to resume stuck/partial archives."""
+    try:
+        db = _get_db()
+        now = datetime.utcnow()
+        update = {
+            "$set": {**fields, "updated_at": now},
+            "$setOnInsert": {
+                "owner_id": owner_id,
+                "udemy_course_id": udemy_course_id,
+                "created_at": now,
+            },
+        }
+        db.owner_archive_jobs.update_one(
+            {"owner_id": owner_id, "udemy_course_id": udemy_course_id},
+            update,
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        log.error(f"upsert_archive_job error: {e}")
+        return False
+
+
+def mark_archive_job_heartbeat(owner_id: int, udemy_course_id: int, stage: str = None, progress: int = None) -> bool:
+    """Update liveness/progress timestamp for an archive job."""
+    fields = {"last_heartbeat": datetime.utcnow()}
+    if stage is not None:
+        fields["stage"] = stage
+    if progress is not None:
+        fields["progress"] = progress
+    return upsert_archive_job(owner_id, udemy_course_id, **fields)
+
+
+def mark_archive_job_posted(owner_id: int, udemy_course_id: int, part_count: int = 0, zip_size_mb: int = 0) -> bool:
+    """Mark archive job complete and posted to Telegram."""
+    return upsert_archive_job(
+        owner_id,
+        udemy_course_id,
+        status="posted",
+        posted_at=datetime.utcnow(),
+        part_count=part_count,
+        zip_size_mb=zip_size_mb,
+        progress=100,
+        stage="Posted to channel",
+        last_heartbeat=datetime.utcnow(),
+    )
 
 
 # Initialize on import
