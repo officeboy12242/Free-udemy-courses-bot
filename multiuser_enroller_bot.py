@@ -57,6 +57,7 @@ UPLOAD_BOT_TOKENS_STR = os.getenv("UPLOAD_BOT_TOKENS", "")
 UPLOAD_BOT_TOKENS = [t.strip() for t in UPLOAD_BOT_TOKENS_STR.split(",") if t.strip()] if UPLOAD_BOT_TOKENS_STR else []
 _default_archive_dir = Path("/var/data/udemy_archives") if Path("/var/data").exists() else Path(tempfile.gettempdir()) / "udemy_archives"
 ARCHIVE_WORK_DIR = Path(os.getenv("ARCHIVE_WORK_DIR", str(_default_archive_dir)))
+ARCHIVE_FALLBACK_WORK_DIR = Path(os.getenv("ARCHIVE_FALLBACK_WORK_DIR", str(Path.cwd() / "archive_work")))
 ARCHIVE_STUCK_AFTER_SECONDS = int(os.getenv("ARCHIVE_STUCK_AFTER_SECONDS", "900"))
 ARCHIVE_MIN_FREE_GB = float(os.getenv("ARCHIVE_MIN_FREE_GB", "1.5"))
 ALLOW_TMP_ARCHIVES = os.getenv("ALLOW_TMP_ARCHIVES", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -147,6 +148,33 @@ def ensure_archive_storage_ready(path: Path) -> tuple[bool, str]:
         )
 
     return True, ""
+
+
+def resolve_archive_work_dir(owner_id: int, udemy_id: int, saved_work_dir: str | None = None) -> tuple[Path, bool, str]:
+    """Return a writable archive work dir, trying fallback if primary is unusable.
+
+    This handles the common Render case where ARCHIVE_WORK_DIR=/var/data/... is
+    configured before a persistent disk is actually mounted, causing EACCES.
+    """
+    candidates = []
+    if saved_work_dir:
+        candidates.append(Path(saved_work_dir))
+    candidates.append(ARCHIVE_WORK_DIR / str(owner_id) / str(udemy_id))
+    candidates.append(ARCHIVE_FALLBACK_WORK_DIR / str(owner_id) / str(udemy_id))
+
+    seen = set()
+    failures = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        ok, msg = ensure_archive_storage_ready(candidate)
+        if ok:
+            return candidate, True, ""
+        failures.append(f"- `{candidate}`: {msg}")
+
+    return candidates[-1], False, "No usable archive storage found:\n" + "\n".join(failures)
 
 
 def get_cpu_usage():
@@ -1365,8 +1393,9 @@ async def _start_course_archive(update, context, item, silent_start=False):
             log.warning(f"Enrolled-account check failed for {title}: {_e}")
 
     safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
-    work_dir = Path(job.get("work_dir")) if job and job.get("work_dir") else ARCHIVE_WORK_DIR / str(owner_id) / str(udemy_id)
-    storage_ok, storage_msg = ensure_archive_storage_ready(work_dir)
+    work_dir, storage_ok, storage_msg = resolve_archive_work_dir(
+        owner_id, udemy_id, job.get("work_dir") if job else None
+    )
     if not storage_ok:
         await asyncio.to_thread(
             upsert_archive_job,
@@ -1388,7 +1417,8 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 f"⚠️ **Archive paused before download**\n\n"
                 f"**{title}**\n\n"
                 f"{storage_msg}\n\n"
-                "After configuring storage, click Archive/Resume again.",
+                "Fix: add a Render Persistent Disk mounted at `/var/data`, or set a writable "
+                "`ARCHIVE_WORK_DIR` / `ARCHIVE_FALLBACK_WORK_DIR`, then click Archive/Resume again.",
                 parse_mode="Markdown",
             )
         except Exception:
