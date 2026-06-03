@@ -306,16 +306,40 @@ def update_auto_enroll_state(user_id: int, last_course_id: str = None, enrolled_
 
 # ─── Enrolled Course Tracking ────────────────────────────────────────────────
 
-def log_enrollment(user_id: int, account_id: int, course_url: str, course_title: str) -> None:
-    """Log a course enrollment"""
+def log_enrollment(user_id: int, account_id: int, course_url: str, course_title: str, slug: str = None) -> None:
+    """Log a course enrollment. Uses upsert by slug to avoid duplicate notifications."""
     db = _get_db()
-    db.enrolled_courses.insert_one({
-        "user_id": user_id,
-        "account_id": account_id,
-        "course_url": course_url,
-        "course_title": course_title,
-        "enrolled_at": datetime.utcnow()
-    })
+    # Extract slug from URL if not provided
+    if not slug and course_url:
+        parts = course_url.strip("/").split("/")
+        # URL format: /course/slug/ or just slug
+        slug = parts[-1] if parts else None
+        if slug == "draft" and len(parts) > 1:
+            slug = parts[-2]
+    
+    if slug:
+        # Upsert by user_id + slug to prevent duplicate entries
+        db.enrolled_courses.update_one(
+            {"user_id": user_id, "slug": slug},
+            {"$set": {
+                "user_id": user_id,
+                "account_id": account_id,
+                "course_url": course_url,
+                "course_title": course_title,
+                "slug": slug,
+                "enrolled_at": datetime.utcnow()
+            }},
+            upsert=True
+        )
+    else:
+        # Fallback: insert without slug (legacy behavior)
+        db.enrolled_courses.insert_one({
+            "user_id": user_id,
+            "account_id": account_id,
+            "course_url": course_url,
+            "course_title": course_title,
+            "enrolled_at": datetime.utcnow()
+        })
 
 
 def get_recently_enrolled(user_id: int, limit: int = 20) -> list:
@@ -338,6 +362,19 @@ def is_course_enrolled(user_id: int, course_url: str) -> bool:
     """Check if a course is already enrolled by user"""
     db = _get_db()
     return db.enrolled_courses.find_one({"user_id": user_id, "course_url": course_url}) is not None
+
+
+def is_course_enrolled_by_slug(user_id: int, slug: str) -> bool:
+    """Check if a course is already enrolled by user (by slug - more reliable)"""
+    db = _get_db()
+    return db.enrolled_courses.find_one({"user_id": user_id, "slug": slug}) is not None
+
+
+def get_enrolled_slugs_for_user(user_id: int) -> set:
+    """Get all enrolled course slugs for a user (for fast local dedup)"""
+    db = _get_db()
+    docs = db.enrolled_courses.find({"user_id": user_id, "slug": {"$exists": True}}, {"slug": 1})
+    return {d["slug"] for d in docs if d.get("slug")}
 
 
 # ─── Setup State ─────────────────────────────────────────────────────────────

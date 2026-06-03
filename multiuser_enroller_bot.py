@@ -36,7 +36,8 @@ from user_enroller import (
     set_user_setup_state, get_user_setup_state, clear_user_setup_state,
     DEFAULT_CLIENT_ID,
     get_auto_enroll_state, set_auto_enroll_enabled, update_auto_enroll_state,
-    log_enrollment, is_course_enrolled, get_recently_enrolled,
+    log_enrollment, is_course_enrolled, get_recently_enrolled, 
+    is_course_enrolled_by_slug, get_enrolled_slugs_for_user,
     user_has_credentials, get_user_stats,
     validate_token_format, validate_client_id_format, get_setup_instructions,
     delete_user_data,
@@ -2888,7 +2889,6 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def _fetch_courses_from_api(limit: int = 50) -> list:
     """Fetch latest free Udemy courses from real.discount API"""
     courses = []
-    seen_slugs = set()
     page = 1
     
     while len(courses) < limit:
@@ -2913,11 +2913,6 @@ def _fetch_courses_from_api(limit: int = 50) -> list:
                     continue
                 
                 url = item.get("url", "")
-                slug = UdemyAutoEnroller._extract_slug(url)
-                if slug and slug in seen_slugs:
-                    continue
-                if slug:
-                    seen_slugs.add(slug)
                 coupon = url.split("couponCode=")[1].split("&")[0] if "couponCode=" in url else None
                 courses.append(Course(
                     title=item.get("name", "Untitled"),
@@ -2946,8 +2941,12 @@ def _progress_bar(current: int, total: int, width: int = 15) -> str:
     return f"{bar} {int(pct * 100)}%"
 
 
-def _enroll_account_in_courses(account: dict, courses: list) -> dict:
-    """Enroll a single account in the given courses. Returns results dict."""
+def _enroll_account_in_courses(account: dict, courses: list, local_enrolled_slugs: set = None) -> dict:
+    """Enroll a single account in the given courses. Returns results dict.
+    
+    local_enrolled_slugs: Set of slugs already enrolled locally (for extra dedup beyond Udemy API)
+    """
+    local_enrolled_slugs = local_enrolled_slugs or set()
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     enroller = UdemyAutoEnroller(
@@ -2961,7 +2960,7 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
     enroller._get_enrolled_courses()
     log.info(f"Pre-fetched {len(enroller.enrolled_slugs)} enrolled courses")
     
-    enrolled = []
+    enrolled = []  # List of (slug, title) tuples
     already = 0
     expired = 0
     failed = 0
@@ -2978,6 +2977,10 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         if slug in enroller.enrolled_slugs:
             already += 1
             continue
+        # Also check local DB (Udemy API can be slow to update)
+        if slug in local_enrolled_slugs:
+            already += 1
+            continue
         courses_to_process.append((course, slug))
     
     # Step 2: Validate courses in PARALLEL (4 threads)
@@ -2986,51 +2989,43 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         coupon = course.coupon_code or enroller._extract_coupon(course.url)
         course_id, is_free = enroller._get_course_id_from_page(slug)
         if not course_id:
-            return ("failed", course, None, None, None)
-        if str(course_id) in enroller.enrolled_course_ids:
-            return ("already", course, course_id, None, None)
-        subscribed = enroller._is_subscribed(course_id)
-        if subscribed is True:
-            return ("already", course, course_id, None, None)
-        if subscribed is None:
-            return ("failed", course, None, None, None)
+            return ("failed", course, slug, None, None, None)
         if is_free:
-            return ("free", course, course_id, None, None)
+            return ("free", course, slug, course_id, None, None)
         if not coupon:
-            return ("failed", course, None, None, None)
+            return ("failed", course, slug, None, None, None)
         if not enroller._check_coupon(course_id, coupon):
-            return ("expired", course, None, None, None)
-        return ("valid", course, course_id, coupon, course.title)
+            return ("expired", course, slug, None, None, None)
+        return ("valid", course, slug, course_id, coupon, course.title)
     
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(validate_course, cs): cs for cs in courses_to_process}
         for future in as_completed(futures):
             try:
-                status, course, course_id, coupon, title = future.result()
+                status, course, slug, course_id, coupon, title = future.result()
                 if status == "failed":
                     failed += 1
-                elif status == "already":
-                    already += 1
                 elif status == "expired":
                     expired += 1
                 elif status == "free":
                     free_courses.append((course, course_id))
                 elif status == "valid":
-                    batch.append((course_id, coupon, title))
+                    batch.append((course_id, coupon, title, slug))
             except Exception:
                 failed += 1
     
     # Step 3: Enroll FREE courses in parallel
     def enroll_free(course_tuple):
         course, course_id = course_tuple
-        return enroller._free_checkout(course_id), course.title
+        slug = enroller._extract_slug(course.url)
+        return enroller._free_checkout(course_id), course.title, slug
     
     if free_courses:
         with ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(enroll_free, free_courses))
-            for result, title in results:
+            for result, title, slug in results:
                 if result == "enrolled":
-                    enrolled.append(title)
+                    enrolled.append((slug, title))
                     log.info(f"Free enrolled: {title[:40]}")
                 elif result == "already":
                     already += 1
@@ -3040,12 +3035,18 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
     # Step 4: Bulk checkout coupon courses (batch of 10)
     if batch:
         log.info(f"Processing {len(batch)} coupon courses in batches of 10")
+        # Build a title->slug lookup for this batch
+        title_to_slug = {item[2]: item[3] for item in batch}  # title -> slug
         while batch:
             chunk = batch[:10]
             batch = batch[10:]
             log.info(f"Processing chunk of {len(chunk)} courses")
-            titles = enroller._bulk_checkout(chunk)
-            enrolled.extend(titles)
+            # _bulk_checkout expects (course_id, coupon, title) tuples
+            checkout_chunk = [(c[0], c[1], c[2]) for c in chunk]
+            titles = enroller._bulk_checkout(checkout_chunk)
+            for title in titles:
+                slug = title_to_slug.get(title, "")
+                enrolled.append((slug, title))
             if titles:
                 log.info(f"Chunk enrolled {len(titles)}: {titles}")
             failed += len(chunk) - len(titles)
@@ -3121,17 +3122,20 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception:
             pass
         
+        # Get locally enrolled slugs for extra dedup
+        local_slugs = await asyncio.to_thread(get_enrolled_slugs_for_user, user_id)
+        
         # Enroll ALL accounts SIMULTANEOUSLY using asyncio.gather
-        async def enroll_single_account(account, courses_list):
+        async def enroll_single_account(account, courses_list, local_enrolled):
             """Enroll a single account - runs in parallel with others"""
             try:
-                result = await asyncio.to_thread(_enroll_account_in_courses, account, courses_list)
+                result = await asyncio.to_thread(_enroll_account_in_courses, account, courses_list, local_enrolled)
                 return {"account": account, "result": result, "error": None}
             except Exception as e:
                 return {"account": account, "result": None, "error": str(e)}
         
         # Launch all accounts in parallel
-        tasks = [enroll_single_account(acc, courses_for_enrollment) for acc in accounts]
+        tasks = [enroll_single_account(acc, courses_for_enrollment, local_slugs) for acc in accounts]
         results = await asyncio.gather(*tasks)
         
         # Process results from all parallel enrollments
@@ -3150,11 +3154,11 @@ async def _run_enroll_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
                 failed_accounts.append(account["name"])
                 continue
             
-            # Log enrollments
-            for title in result["enrolled"]:
-                log_enrollment(user_id, account["id"], "", title)
+            # Log enrollments with slug for proper dedup
+            for slug, title in result["enrolled"]:
+                log_enrollment(user_id, account["id"], "", title, slug=slug)
             
-            total_enrolled.extend([(t, account["name"]) for t in result["enrolled"]])
+            total_enrolled.extend([(title, account["name"]) for slug, title in result["enrolled"]])
             total_already += result["already"]
             total_expired += result["expired"]
             total_failed += result["failed"]
@@ -3286,19 +3290,22 @@ async def auto_enroll_job(app: Application) -> None:
                 else:
                     courses_for_user = courses
                 
+                # Get locally enrolled slugs for this user (extra dedup beyond Udemy API)
+                local_slugs = await asyncio.to_thread(get_enrolled_slugs_for_user, user_id)
+                
                 # Enroll ALL accounts SIMULTANEOUSLY using asyncio.gather
-                async def enroll_single_account(acc, courses_list):
+                async def enroll_single_account(acc, courses_list, local_enrolled):
                     """Enroll a single account - runs in parallel with others"""
                     try:
                         result = await asyncio.to_thread(
-                            _enroll_account_in_courses, acc, courses_list
+                            _enroll_account_in_courses, acc, courses_list, local_enrolled
                         )
                         return {"acc": acc, "result": result, "error": None}
                     except Exception as e:
                         return {"acc": acc, "result": None, "error": str(e)}
                 
                 # Launch all accounts in parallel
-                tasks = [enroll_single_account(acc, courses_for_user) for acc in user_accs]
+                tasks = [enroll_single_account(acc, courses_for_user, local_slugs) for acc in user_accs]
                 results = await asyncio.gather(*tasks)
                 
                 # Process results
@@ -3317,8 +3324,8 @@ async def auto_enroll_job(app: Application) -> None:
                         continue
                     
                     enrolled_count = len(result["enrolled"])
-                    for title in result["enrolled"]:
-                        log_enrollment(user_id, acc["id"], title, title)
+                    for slug, title in result["enrolled"]:
+                        log_enrollment(user_id, acc["id"], "", title, slug=slug)
                         all_enrolled.append((title, acc["name"]))
                     total_enrolled += enrolled_count
                 
