@@ -73,6 +73,7 @@ class UdemyAutoEnroller:
         })
         self.currency = "inr"
         self.enrolled_slugs = set()
+        self.enrolled_course_ids = set()
     
     def _get(self, url: str, **kwargs) -> requests.Response:
         for _ in range(3):
@@ -113,7 +114,7 @@ class UdemyAutoEnroller:
     
     def _get_enrolled_courses(self):
         """Pre-fetch enrolled course slugs"""
-        next_page = "https://www.udemy.com/api-2.0/users/me/subscribed-courses/?ordering=-enroll_time&fields[course]=enrollment_time,url&page_size=100"
+        next_page = "https://www.udemy.com/api-2.0/users/me/subscribed-courses/?ordering=-enroll_time&fields[course]=id,enrollment_time,url&page_size=100"
         while next_page:
             r = self._get(next_page)
             if not r or r.status_code != 200:
@@ -123,13 +124,25 @@ class UdemyAutoEnroller:
             except Exception:
                 break
             for course in data.get("results", []):
-                url_parts = course.get("url", "").split("/")
-                slug = url_parts[2] if len(url_parts) > 2 else None
-                if slug == "draft" and len(url_parts) > 3:
-                    slug = url_parts[3]
+                slug = self._extract_slug(course.get("url", ""))
                 if slug:
                     self.enrolled_slugs.add(slug)
+                course_id = course.get("id")
+                if course_id:
+                    self.enrolled_course_ids.add(str(course_id))
             next_page = data.get("next")
+
+    def _is_subscribed(self, course_id: str):
+        """Return True/False for enrollment, or None if Udemy did not answer clearly."""
+        check = self._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
+        if not check:
+            return None
+        if check.status_code == 200:
+            self.enrolled_course_ids.add(str(course_id))
+            return True
+        if check.status_code == 404:
+            return False
+        return None
     
     def get_total_courses_count(self) -> int:
         """Get total number of courses in the Udemy account"""
@@ -291,8 +304,8 @@ class UdemyAutoEnroller:
     def _free_checkout(self, course_id: str) -> str:
         """Enroll in a naturally free course. Returns 'enrolled', 'already', or 'failed'."""
         # Check if already enrolled first
-        check = self._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
-        if check and check.status_code == 200:
+        subscribed = self._is_subscribed(course_id)
+        if subscribed is True:
             return "already"
         
         self._get(f"https://www.udemy.com/course/subscribe/?courseId={course_id}")
@@ -301,6 +314,7 @@ class UdemyAutoEnroller:
             f"?fields%5Bcourse%5D=%40default%2Cbuyable_object_type%2Cprimary_subcategory%2Cis_private"
         )
         if r and r.status_code == 200:
+            self.enrolled_course_ids.add(str(course_id))
             return "enrolled"
         return "failed"
     
@@ -352,8 +366,8 @@ class UdemyAutoEnroller:
             _time.sleep(2)
         
         # Check if now subscribed - if we weren't before, this means checkout worked
-        check = self._get(f"https://www.udemy.com/api-2.0/users/me/subscribed-courses/{course_id}/")
-        if check and check.status_code == 200:
+        subscribed = self._is_subscribed(course_id)
+        if subscribed is True:
             # If wasn't enrolled before checkout attempt, it means we enrolled it now
             return "enrolled" if not was_enrolled_before else "already"
         return "failed"
@@ -399,20 +413,30 @@ class UdemyAutoEnroller:
             if not r:
                 continue
             if r.status_code == 504:
-                return [t for _, _, t in courses_to_enroll]
+                break
             try:
                 if r.json().get("status") == "succeeded":
-                    return [t for _, _, t in courses_to_enroll]
+                    break
             except Exception:
                 pass
             self._get("https://www.udemy.com/payment/checkout/")
             _time.sleep(3 + attempt)
+        else:
+            # Fallback: one-by-one (we know these weren't enrolled before)
+            enrolled = []
+            for cid, coup, title in courses_to_enroll:
+                result = self._checkout_single(cid, coup, was_enrolled_before=False)
+                if result == "enrolled":
+                    enrolled.append(title)
+                _time.sleep(1)
+            return enrolled
         
-        # Fallback: one-by-one (we know these weren't enrolled before)
+        # Bulk checkout can report success even when some items were already in
+        # the account/cart. Verify each course before sending "newly enrolled".
         enrolled = []
         for cid, coup, title in courses_to_enroll:
-            result = self._checkout_single(cid, coup, was_enrolled_before=False)
-            if result == "enrolled":
+            subscribed = self._is_subscribed(cid)
+            if subscribed is True:
                 enrolled.append(title)
             _time.sleep(1)
         return enrolled

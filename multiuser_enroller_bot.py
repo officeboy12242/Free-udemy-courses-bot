@@ -2888,6 +2888,7 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def _fetch_courses_from_api(limit: int = 50) -> list:
     """Fetch latest free Udemy courses from real.discount API"""
     courses = []
+    seen_slugs = set()
     page = 1
     
     while len(courses) < limit:
@@ -2912,6 +2913,11 @@ def _fetch_courses_from_api(limit: int = 50) -> list:
                     continue
                 
                 url = item.get("url", "")
+                slug = UdemyAutoEnroller._extract_slug(url)
+                if slug and slug in seen_slugs:
+                    continue
+                if slug:
+                    seen_slugs.add(slug)
                 coupon = url.split("couponCode=")[1].split("&")[0] if "couponCode=" in url else None
                 courses.append(Course(
                     title=item.get("name", "Untitled"),
@@ -2981,6 +2987,13 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
         course_id, is_free = enroller._get_course_id_from_page(slug)
         if not course_id:
             return ("failed", course, None, None, None)
+        if str(course_id) in enroller.enrolled_course_ids:
+            return ("already", course, course_id, None, None)
+        subscribed = enroller._is_subscribed(course_id)
+        if subscribed is True:
+            return ("already", course, course_id, None, None)
+        if subscribed is None:
+            return ("failed", course, None, None, None)
         if is_free:
             return ("free", course, course_id, None, None)
         if not coupon:
@@ -2996,6 +3009,8 @@ def _enroll_account_in_courses(account: dict, courses: list) -> dict:
                 status, course, course_id, coupon, title = future.result()
                 if status == "failed":
                     failed += 1
+                elif status == "already":
+                    already += 1
                 elif status == "expired":
                     expired += 1
                 elif status == "free":
