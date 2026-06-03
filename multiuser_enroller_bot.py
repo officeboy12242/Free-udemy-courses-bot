@@ -1735,25 +1735,62 @@ async def _start_course_archive(update, context, item, silent_start=False):
         )
         await _send_progress(95, f"\U0001f4e6 ZIP ready: {size_mb} MB. Uploading...")
 
+        # Once the ZIP exists, delete the extracted course folder to avoid holding
+        # both copies. If upload fails, the ZIP remains and the next run resumes
+        # from upload without re-downloading.
+        if out_dir.exists():
+            try:
+                await asyncio.to_thread(shutil.rmtree, out_dir, True)
+                all_files = []
+            except Exception as cleanup_err:
+                log.warning(f"Could not remove extracted folder after ZIP creation: {cleanup_err}")
+
         MAX_PART = 2000 * 1024 * 1024
-        if zip_path.stat().st_size <= MAX_PART:
-            part_files = [zip_path]
-        else:
-            part_files = await asyncio.to_thread(_split_file_into_parts, zip_path, work_dir, MAX_PART)
+        zip_size = zip_path.stat().st_size
+        total_parts = max(1, (zip_size + MAX_PART - 1) // MAX_PART)
+
+        def _write_zip_part(src: Path, part_num: int, max_bytes: int) -> Path:
+            """Create a single split part, upload it, then caller deletes it.
+
+            We intentionally do NOT create all parts at once because that doubles
+            disk usage for large courses. Keep only full ZIP + one current part.
+            """
+            part_path = work_dir / f"{src.stem}.part{part_num:02d}{src.suffix}"
+            remaining = max_bytes
+            with open(src, "rb") as source:
+                source.seek((part_num - 1) * max_bytes)
+                with open(part_path, "wb") as part:
+                    while remaining > 0:
+                        chunk = source.read(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        part.write(chunk)
+                        remaining -= len(chunk)
+            return part_path
 
         raw_target = CHANNEL_ID if CHANNEL_ID else None
         uploaded_all = True
 
-        for i, p in enumerate(part_files, 1):
+        video_count_for_caption = len(video_files) or (job or {}).get("video_count", 0)
+
+        for i in range(1, total_parts + 1):
+            if total_parts == 1:
+                p = zip_path
+                delete_part_after_upload = False
+            else:
+                await _send_progress(95, f"✂️ Preparing upload part {i}/{total_parts}...")
+                p = await asyncio.to_thread(_write_zip_part, zip_path, i, MAX_PART)
+                delete_part_after_upload = True
+
             part_mb = p.stat().st_size // (1024 * 1024)
-            part_label = f"Part {i}/{len(part_files)} \u2022 " if len(part_files) > 1 else ""
+            part_label = f"Part {i}/{total_parts} \u2022 " if total_parts > 1 else ""
             caption = (
                 f"\U0001f4da **{title}**\n"
                 f"{part_label}{part_mb} MB\n"
-                f"\U0001f4c2 {len(video_files)} lecture(s)\n"
+                f"\U0001f4c2 {video_count_for_caption} lecture(s)\n"
                 f"\U0001f517 udemy.com{course_url.split('/learn')[0]}"
             )
-            if len(part_files) > 1:
+            if total_parts > 1:
                 caption += "\n\n\U0001f4a1 Join: `cat *.part*.zip > full.zip`"
 
             # Convert channel ID to int if possible (Pyrogram requires numeric peer)
@@ -1793,12 +1830,12 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 bar = "█" * (pct_ul // 10) + "░" * (10 - pct_ul // 10)
 
                 stage = (
-                    f"⬆️ Uploading part {i}/{len(part_files)}\n"
+                    f"⬆️ Uploading part {i}/{total_parts}\n"
                     f"[{bar}] {pct_ul}%\n"
                     f"📦 {uploaded_mb:.1f} / {total_mb:.1f} MB\n"
                     f"⚡ {speed_str}   ⏱ ETA {eta_str}"
                 )
-                asyncio.create_task(_send_progress(95 + int(i * 4 / len(part_files)), stage))
+                asyncio.create_task(_send_progress(95 + int(i * 4 / total_parts), stage))
 
             upload_ok = await _upload_file_to_chat(target, p, caption, p.name, progress_cb=_upload_progress_cb)
             if not upload_ok:
@@ -1826,6 +1863,11 @@ async def _start_course_archive(update, context, item, silent_start=False):
                         last_heartbeat=datetime.utcnow(),
                     )
                     break
+            if upload_ok and delete_part_after_upload:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         if not uploaded_all:
             await context.bot.send_message(
@@ -1835,15 +1877,15 @@ async def _start_course_archive(update, context, item, silent_start=False):
             )
             return
 
-        await asyncio.to_thread(mark_archive_job_posted, owner_id, udemy_id, len(part_files), size_mb)
+        await asyncio.to_thread(mark_archive_job_posted, owner_id, udemy_id, total_parts, size_mb)
         archive_completed = True
         remove_from_download_queue(owner_id, udemy_id)
         drm_skipped = len([e for e in (errs or []) if "DRM protected" in e])
         done_txt = (
             f"\u2705 **Archive complete!**\n\n"
             f"\U0001f4da **{title}**\n"
-            f"\U0001f4c2 {len(video_files)} lecture(s) \u2022 {size_mb} MB\n"
-            f"\U0001f4e6 {len(part_files)} ZIP part(s) uploaded\n"
+            f"\U0001f4c2 {video_count_for_caption} lecture(s) \u2022 {size_mb} MB\n"
+            f"\U0001f4e6 {total_parts} ZIP part(s) uploaded\n"
         )
         if drm_skipped:
             done_txt += f"\U0001f512 {drm_skipped} DRM lecture(s) skipped (not downloadable)\n"
