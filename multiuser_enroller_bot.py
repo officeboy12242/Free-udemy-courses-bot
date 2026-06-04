@@ -469,7 +469,7 @@ async def cmd_download_queue(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Use the buttons below or search with /search_courses.",
         parse_mode="Markdown"
     )
-    await _show_download_queue(update.effective_message, queue)
+    await _show_download_queue(update.effective_message, queue, context)
 
 
 def _build_status_text(remaining: int | None = None) -> str:
@@ -591,9 +591,33 @@ async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         status_live_owners.discard(owner_id)
 
 
-async def _send_search_results(msg, context, results, query, page):
+async def _restore_search_results(query, context) -> bool:
+    """Re-show the current search results page (after queue or selection)."""
+    state = context.user_data.get("dl_search")
+    if not state:
+        await query.answer("Search session expired. Use /search_courses again.", show_alert=True)
+        return False
+    all_res = state.get("results", [])
+    page = state.get("page", 1)
+    start = (page - 1) * 10
+    page_results = all_res[start : start + 10]
+    await query.answer()
+    await _send_search_results(
+        query.message,
+        context,
+        page_results,
+        state.get("query", ""),
+        page,
+        status_note=state.get("last_added"),
+    )
+    return True
+
+
+async def _send_search_results(msg, context, results, query, page, status_note: str = None):
     """Render a page of search results with Select buttons."""
     lines = [f"🔍 **Search results for “{query}”** (page {page})\n"]
+    if status_note:
+        lines.append(f"✅ **Added to queue:** {status_note[:60]}\n")
     keyboard = []
 
     for idx, r in enumerate(results):
@@ -623,6 +647,9 @@ async def _send_search_results(msg, context, results, query, page):
         InlineKeyboardButton("📋 View Queue", callback_data="dl_queue"),
         InlineKeyboardButton("🗑️ Clear Queue", callback_data="dl_clear"),
     ])
+    keyboard.append([
+        InlineKeyboardButton("❌ Close", callback_data="dl_close"),
+    ])
 
     text = "\n".join(lines)
     if len(text) > 3800:
@@ -634,11 +661,17 @@ async def _send_search_results(msg, context, results, query, page):
         await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
-async def _show_download_queue(query_or_msg, queue: list):
+async def _show_download_queue(query_or_msg, queue: list, context: ContextTypes.DEFAULT_TYPE = None):
     """Display the current download queue with action buttons."""
+    has_search_session = bool(context and context.user_data.get("dl_search"))
     if not queue:
         text = "📋 **Download / Archive Queue**\n\nQueue is empty.\nUse `/search_courses <query>` to find courses from your accounts."
         keyboard = []
+        if has_search_session:
+            keyboard.append([
+                InlineKeyboardButton("◀️ Back to results", callback_data="dl_back_search"),
+                InlineKeyboardButton("❌ Close", callback_data="dl_close"),
+            ])
     else:
         lines = ["📋 **Download / Archive Queue**\n"]
         keyboard = []
@@ -670,6 +703,13 @@ async def _show_download_queue(query_or_msg, queue: list):
             InlineKeyboardButton("🗑️ Clear All", callback_data="dl_clear"),
         ])
         text = "\n".join(lines)
+
+    nav_row = []
+    if has_search_session:
+        nav_row.append(InlineKeyboardButton("◀️ Back to results", callback_data="dl_back_search"))
+    nav_row.append(InlineKeyboardButton("❌ Close", callback_data="dl_close"))
+    if nav_row:
+        keyboard.append(nav_row)
 
     markup = InlineKeyboardMarkup(keyboard) if keyboard else None
     try:
@@ -2766,11 +2806,42 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         added = add_to_download_queue(user_id, udemy_id, title, url, src_acc)
         if added:
             await query.answer(f"✅ Added: {title[:40]}")
-            # Show the queue immediately
-            queue = get_owner_download_queue(user_id)
-            await _show_download_queue(query, queue)
+            search_state = context.user_data.get("dl_search", {})
+            search_state["last_added"] = title
+            context.user_data["dl_search"] = search_state
+            page = search_state.get("page", 1)
+            all_res = search_state.get("results", [])
+            start = (page - 1) * 10
+            page_results = all_res[start : start + 10]
+            await _send_search_results(
+                query.message,
+                context,
+                page_results,
+                search_state.get("query", ""),
+                page,
+                status_note=title,
+            )
         else:
             await query.answer("Could not add (maybe duplicate?)")
+
+    elif data == "dl_back_search":
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        await _restore_search_results(query, context)
+
+    elif data == "dl_close":
+        if not is_owner(user_id):
+            await query.answer("Owner only!", show_alert=True)
+            return
+        await query.answer("Closed")
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_text("✅ Closed.", reply_markup=None)
+            except Exception:
+                pass
 
     elif data in ("dl_next", "dl_prev"):
         if not is_owner(user_id):
@@ -2794,7 +2865,7 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Owner only!", show_alert=True)
             return
         queue = get_owner_download_queue(user_id)
-        await _show_download_queue(query, queue)
+        await _show_download_queue(query, queue, context)
 
     elif data == "dl_clear":
         if not is_owner(user_id):
@@ -2814,7 +2885,7 @@ async def profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         remove_from_download_queue(user_id, uid)
         queue = get_owner_download_queue(user_id)
-        await _show_download_queue(query, queue)
+        await _show_download_queue(query, queue, context)
 
     elif data.startswith("dl_start_"):
         if not is_owner(user_id):
