@@ -63,7 +63,95 @@ ARCHIVE_STUCK_AFTER_SECONDS = int(os.getenv("ARCHIVE_STUCK_AFTER_SECONDS", "900"
 ARCHIVE_MIN_FREE_GB = float(os.getenv("ARCHIVE_MIN_FREE_GB", "1.5"))
 ALLOW_TMP_ARCHIVES = os.getenv("ALLOW_TMP_ARCHIVES", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Branding for archived course files and channel posts
+BRAND_NAME = os.getenv("BRAND_NAME", "CoursesDrivee")
+BRAND_PREFIX = os.getenv("BRAND_PREFIX", "Telegram - CoursesDrivee")
+BRAND_CHANNEL_URL = os.getenv("BRAND_CHANNEL_URL", "https://t.me/CoursesDrivee")
+
 log = logging.getLogger(__name__)
+
+
+def _sanitize_path_part(text: str, max_len: int = 55) -> str:
+    return "".join(c if c.isalnum() or c in " -_." else "_" for c in (text or ""))[:max_len].strip(" _")
+
+
+def _brand_file_name(name: str, max_len: int = 180) -> str:
+    """Prefix file/folder names with brand (idempotent)."""
+    name = (name or "").strip()
+    if not name:
+        return BRAND_PREFIX[:max_len]
+    if name.startswith(BRAND_PREFIX):
+        return name[:max_len]
+    combined = f"{BRAND_PREFIX} - {name}"
+    return combined[:max_len].strip(" _")
+
+
+def _branded_course_folder_name(title: str) -> str:
+    base = _sanitize_path_part(title, 60).strip("_").strip()
+    return _brand_file_name(base, max_len=100)
+
+
+def _branded_upload_filename(title: str, part_num: int = None, total_parts: int = 1) -> str:
+    stem = _branded_course_folder_name(title)
+    if total_parts > 1 and part_num is not None:
+        return f"{stem}.part{part_num:02d}.zip"
+    return f"{stem}.zip"
+
+
+def _brand_join_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"📢 Join {BRAND_NAME}", url=BRAND_CHANNEL_URL),
+    ]])
+
+
+def _pyrogram_reply_markup(markup: InlineKeyboardMarkup):
+    """Convert python-telegram-bot inline keyboard for Pyrogram uploads."""
+    if not markup:
+        return None
+    try:
+        from pyrogram.types import InlineKeyboardButton as PBtn, InlineKeyboardMarkup as PMarkup
+        rows = []
+        for row in markup.inline_keyboard:
+            prow = []
+            for btn in row:
+                if btn.url:
+                    prow.append(PBtn(btn.text, url=btn.url))
+                elif btn.callback_data:
+                    prow.append(PBtn(btn.text, callback_data=btn.callback_data))
+            if prow:
+                rows.append(prow)
+        return PMarkup(rows) if rows else None
+    except Exception as e:
+        log.debug(f"Pyrogram markup conversion failed: {e}")
+        return None
+
+
+def _archive_upload_caption(
+    title: str,
+    part_mb: int,
+    video_count: int,
+    course_url: str,
+    part_label: str = "",
+    total_parts: int = 1,
+) -> str:
+    udemy_link = course_url.split("/learn")[0] if course_url else ""
+    lines = [
+        f"📚 **{title}**",
+    ]
+    if part_label:
+        lines.append(part_label.rstrip())
+    lines.extend([
+        f"📦 {part_mb} MB",
+        f"📂 {video_count} lecture(s)",
+    ])
+    if udemy_link:
+        lines.append(f"🔗 udemy.com{udemy_link}")
+    lines.append("")
+    lines.append(f"🎓 Found this course? Join **{BRAND_NAME}** for more free Udemy courses!")
+    if total_parts > 1:
+        lines.append("")
+        lines.append("💡 Join parts: `cat *.part*.zip > full.zip`")
+    return "\n".join(lines)
 
 COURSES_API = "https://cdn.real.discount/api/courses"
 AUTO_ENROLL_INTERVAL = 120  # 2 minutes
@@ -970,8 +1058,8 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
         chap_title = chap.get("title", "Uncategorized")
 
         lecture_counter[0] += 1
-        safe_chap = f"{chap_num:02d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in chap_title)[:50]
-        safe_lec = f"{lindex:03d} - " + "".join(c if c.isalnum() or c in " -_." else "_" for c in ltitle)[:55]
+        safe_chap = _brand_file_name(f"{chap_num:02d} - {_sanitize_path_part(chap_title, 50)}", max_len=80)
+        safe_lec = _brand_file_name(f"{lindex:03d} - {_sanitize_path_part(ltitle, 55)}", max_len=95)
         lec_dir = out_dir / safe_chap
         lec_dir.mkdir(parents=True, exist_ok=True)
         out_path = lec_dir / f"{safe_lec}.mp4"
@@ -1031,7 +1119,10 @@ def _download_course_via_api(course_url: str, out_dir: Path, access_token: str, 
                         s_file_url = s_urls[0].get("file") if isinstance(s_urls[0], dict) else s_urls[0]
                     if not s_file_url:
                         continue
-                    safe_s = "".join(c if c.isalnum() or c in " -_." else "_" for c in supp_filename)[:90]
+                    safe_s = _brand_file_name(
+                        "".join(c if c.isalnum() or c in " -_." else "_" for c in supp_filename)[:90],
+                        max_len=120,
+                    )
                     if not any(safe_s.lower().endswith(ext) for ext in (".pdf", ".zip", ".rar", ".7z", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".html", ".htm", ".epub", ".py", ".js", ".json", ".csv")):
                         guess = str(s_file_url).split("?")[0].rsplit(".", 1)[-1]
                         if 1 < len(guess) <= 6:
@@ -1433,7 +1524,7 @@ async def _start_course_archive(update, context, item, silent_start=False):
         except Exception as _e:
             log.warning(f"Enrolled-account check failed for {title}: {_e}")
 
-    safe_name = "".join(c if c.isalnum() or c in " -_." else "_" for c in title)[:60].strip("_").strip()
+    safe_name = _branded_course_folder_name(title)
     work_dir, storage_ok, storage_msg = resolve_archive_work_dir(
         owner_id, udemy_id, job.get("work_dir") if job else None
     )
@@ -1754,11 +1845,14 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 # Use ZIP_STORED (no compression). Course content is mostly already-
                 # compressed video (mp4/m3u8) — deflating it burns lots of CPU for
                 # almost zero size saving. Storing keeps CPU usage minimal.
+                zip_root = _brand_file_name(src.name or "Course", max_len=100)
                 with zipfile.ZipFile(dst, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
                     for root, _, files in os.walk(src):
                         for fname in sorted(files):
                             full = Path(root) / fname
-                            zf.write(full, full.relative_to(src))
+                            rel = full.relative_to(src)
+                            arcname = str(Path(zip_root) / rel).replace("\\", "/")
+                            zf.write(full, arcname)
 
             await asyncio.to_thread(_zip_tree, out_dir, zip_path)
         size_mb = zip_path.stat().st_size // (1024 * 1024)
@@ -1824,15 +1918,17 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 delete_part_after_upload = True
 
             part_mb = p.stat().st_size // (1024 * 1024)
-            part_label = f"Part {i}/{total_parts} \u2022 " if total_parts > 1 else ""
-            caption = (
-                f"\U0001f4da **{title}**\n"
-                f"{part_label}{part_mb} MB\n"
-                f"\U0001f4c2 {video_count_for_caption} lecture(s)\n"
-                f"\U0001f517 udemy.com{course_url.split('/learn')[0]}"
+            part_label = f"Part {i}/{total_parts} • {part_mb} MB\n" if total_parts > 1 else ""
+            caption = _archive_upload_caption(
+                title,
+                part_mb,
+                video_count_for_caption,
+                course_url,
+                part_label=part_label,
+                total_parts=total_parts,
             )
-            if total_parts > 1:
-                caption += "\n\n\U0001f4a1 Join: `cat *.part*.zip > full.zip`"
+            upload_filename = _branded_upload_filename(title, i if total_parts > 1 else None, total_parts)
+            post_markup = _brand_join_markup()
 
             # Convert channel ID to int if possible (Pyrogram requires numeric peer)
             target = raw_target
@@ -1878,16 +1974,21 @@ async def _start_course_archive(update, context, item, silent_start=False):
                 )
                 asyncio.create_task(_send_progress(95 + int(i * 4 / total_parts), stage))
 
-            upload_ok = await _upload_file_to_chat(target, p, caption, p.name, progress_cb=_upload_progress_cb)
+            upload_ok = await _upload_file_to_chat(
+                target, p, caption, upload_filename,
+                progress_cb=_upload_progress_cb,
+                reply_markup=post_markup,
+            )
             if not upload_ok:
                 try:
                     with open(p, "rb") as f:
                         await context.bot.send_document(
                             chat_id=owner_id,
                             document=f,
-                            filename=p.name,
+                            filename=upload_filename,
                             caption=caption[:1020],
                             parse_mode="Markdown",
+                            reply_markup=post_markup,
                         )
                     upload_ok = True
                 except Exception as e2:
@@ -1927,15 +2028,19 @@ async def _start_course_archive(update, context, item, silent_start=False):
             f"\U0001f4da **{title}**\n"
             f"\U0001f4c2 {video_count_for_caption} lecture(s) \u2022 {size_mb} MB\n"
             f"\U0001f4e6 {total_parts} ZIP part(s) uploaded\n"
+            f"\n\U0001f3af Found this course? Join **{BRAND_NAME}** for more!"
         )
         if drm_skipped:
             done_txt += f"\U0001f512 {drm_skipped} DRM lecture(s) skipped (not downloadable)\n"
         done_txt += "\nItem removed from queue."
+        done_markup = _brand_join_markup()
         try:
             if progress_msg:
-                await progress_msg.edit_text(done_txt, parse_mode="Markdown")
+                await progress_msg.edit_text(done_txt, parse_mode="Markdown", reply_markup=done_markup)
             else:
-                await context.bot.send_message(owner_id, done_txt, parse_mode="Markdown")
+                await context.bot.send_message(
+                    owner_id, done_txt, parse_mode="Markdown", reply_markup=done_markup
+                )
         except Exception:
             pass
 
@@ -1994,7 +2099,14 @@ def _split_file_into_parts(src: Path, work_dir: Path, max_bytes: int) -> list:
     return parts
 
 
-async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=None, progress_cb=None) -> bool:
+async def _upload_file_to_chat(
+    chat_id,
+    file_path: Path,
+    caption: str,
+    filename=None,
+    progress_cb=None,
+    reply_markup: InlineKeyboardMarkup = None,
+) -> bool:
     """
     Upload a (potentially large) file to a chat.
     - If API_ID + API_HASH configured → Pyrogram (MTProto, up to ~2GB, with upload progress).
@@ -2015,6 +2127,7 @@ async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=
         try:
             from pyrogram import Client
             session_name = f"arc_{int(datetime.utcnow().timestamp())}"
+            pyro_markup = _pyrogram_reply_markup(reply_markup)
             async with Client(
                 session_name,
                 api_id=int(API_ID),
@@ -2029,6 +2142,7 @@ async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=
                     file_name=filename,
                     force_document=True,
                     progress=progress_cb,   # Pyrogram calls this with (current, total)
+                    reply_markup=pyro_markup,
                 )
             log.info(f"Pyrogram upload OK: {file_path.name} ({size_mb} MB)")
             return True
@@ -2047,7 +2161,8 @@ async def _upload_file_to_chat(chat_id, file_path: Path, caption: str, filename=
                     document=f,
                     filename=filename or file_path.name,
                     caption=caption[:1020] if caption else None,
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup,
                 )
             return True
     except Exception as e:
