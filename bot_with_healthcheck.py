@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 from aiohttp import web
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ from market_service import (
     run_market_monitor,
 )
 from market_backtest import run_backtest
+from fno_entry_service import build_all_entries_async, format_entry_telegram_html
 from news_service import (
     ensure_news_table,
     scrape_inshorts,
@@ -266,6 +268,7 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 
 <b>📈 Market Commands:</b>
 /market — live market snapshot
+/entry — scalp entry/exit premiums (all indices)
 /testdip — sample dip alert
 /testalert — test alert delivery
 
@@ -457,6 +460,7 @@ Reuses the same live message (no spam):
 
 <b>📈 MARKET</b>
 /market — live market snapshot
+/entry — scalp entry/exit premiums (all indices)
 /testdip — sample dip alert
 /testalert — test alert delivery
 """
@@ -485,6 +489,19 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     status = await build_dip_status_async()
     await update.effective_message.reply_text(format_dip_status_telegram(status))
+
+
+async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scalp entry/exit premiums for all index F&O. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
+        return
+    await update.effective_message.reply_text("⏳ Building scalp sheet (15m + NSE OI)...")
+    payload = await build_all_entries_async()
+    text = format_entry_telegram_html(payload)
+    await reply_html_chunked(update.effective_message, text)
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1650,7 +1667,8 @@ async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_telegram_application() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("myid", cmd_myid))
@@ -1658,6 +1676,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("testalert", cmd_testalert))
     app.add_handler(CommandHandler("updateapi", cmd_updateapi))
     app.add_handler(CommandHandler("market", cmd_market))
+    app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("movietest", cmd_movietest))
     app.add_handler(CommandHandler("search", cmd_search))
@@ -2315,7 +2334,16 @@ async def main():
     await start_http_server(app)
 
     tg_app = build_telegram_application()
-    await tg_app.initialize()
+    for attempt in range(1, 6):
+        try:
+            log.info("Connecting to Telegram API (attempt %d/5)...", attempt)
+            await tg_app.initialize()
+            break
+        except TelegramError as e:
+            log.warning("Telegram connect attempt %d failed: %s", attempt, e)
+            if attempt == 5:
+                raise
+            await asyncio.sleep(3 * attempt)
     await tg_app.start()
     await tg_app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
