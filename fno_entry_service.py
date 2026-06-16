@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import sqlite3
+import time
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -39,7 +40,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from jugaad_data.nse import NSELive
 
-from market_service import fetch_snapshot, get_all_subscribers, remove_subscriber
+from market_service import get_all_subscribers, remove_subscriber
 
 load_dotenv()
 
@@ -47,6 +48,10 @@ log = logging.getLogger(__name__)
 
 DB_FILE = os.getenv("DB_FILE", "posted_courses.db")
 FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
+FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
+
+# In-memory cache: yahoo_symbol -> (timestamp, tech dict)
+_intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
@@ -56,7 +61,7 @@ FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "FINNIFTY", "yahoo": "NIFTY_FIN_SERVICE.NS", "name": "Fin Nifty",
      "step": 50, "prem_min": 120, "prem_max": 380},
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
-     "step": 25, "prem_min": 80, "prem_max": 260},
+     "step": 25, "prem_min": 80, "prem_max": 260, "nse_only_fallback": True},
 ]
 
 SL_MULT = 0.86
@@ -183,47 +188,101 @@ def _vwap_bands(df: pd.DataFrame) -> tuple[float | None, float | None, float | N
 
 # ════════════════════ Data fetching ════════════════════
 
-def _fetch_intraday(yahoo_symbol: str) -> dict[str, Any]:
-    """15m intraday candles with full technicals for all 3 strategies."""
+def _minimal_tech(nse_spot: float) -> dict[str, Any]:
+    """Fallback when Yahoo is unavailable — NSE spot + OI strategies still work."""
+    return {
+        "spot": round(nse_spot, 2),
+        "pct_change": 0.0,
+        "mom_pct": 0.0,
+        "rsi": None,
+        "ema9": None,
+        "ema21": None,
+        "vwap": None,
+        "vwap_upper": None,
+        "vwap_lower": None,
+        "orb_high": None,
+        "orb_low": None,
+        "timeframe": "nse",
+        "yahoo_skipped": True,
+    }
+
+
+def _yf_history(ticker: yf.Ticker, **kwargs) -> pd.DataFrame:
+    """yfinance history with rate-limit aware retry."""
+    last_err: Exception | None = None
+    for wait in (0, 2, 5):
+        if wait:
+            time.sleep(wait)
+        try:
+            df = ticker.history(**kwargs)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_err = e
+            if "too many" in str(e).lower() or "rate" in str(e).lower():
+                log.debug("Yahoo rate limit on history, retry in %ss", wait)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return pd.DataFrame()
+
+
+def _fetch_intraday(
+    yahoo_symbol: str,
+    *,
+    nse_spot: float | None = None,
+    nse_only_fallback: bool = False,
+) -> dict[str, Any]:
+    """15m intraday candles. Uses cache + NSE spot to avoid extra Yahoo calls."""
+    cache_key = yahoo_symbol
+    now = time.time()
+    cached = _intraday_cache.get(cache_key)
+    if cached and now - cached[0] < FNO_YAHOO_CACHE_TTL:
+        tech = dict(cached[1])
+        if nse_spot is not None:
+            tech["spot"] = round(nse_spot, 2)
+        return tech
+
     out: dict[str, Any] = {"yahoo": yahoo_symbol}
     try:
         t = yf.Ticker(yahoo_symbol)
-        df = t.history(period="5d", interval="15m")
-        use_intraday = df is not None and not df.empty and len(df) >= 25
+        df = _yf_history(t, period="5d", interval="15m")
+        use_intraday = not df.empty and len(df) >= 25
         if not use_intraday:
-            df = t.history(period="30d", interval="1d")
-        if df is None or df.empty or len(df) < 10:
+            df = _yf_history(t, period="30d", interval="1d")
+        if df.empty or len(df) < 10:
+            if nse_spot is not None:
+                out = _minimal_tech(nse_spot)
+                _intraday_cache[cache_key] = (now, dict(out))
+                return out
             return out
 
         close = df["Close"].dropna()
-        high = df["High"].dropna()
-        low = df["Low"].dropna()
         last = float(close.iloc[-1])
 
         rsi_val = _rsi(close, 7 if use_intraday else 14)
         ema9 = _ema(close, 9)
         ema21 = _ema(close, 21 if use_intraday else 20)
-
         vwap_val, vwap_upper, vwap_lower = _vwap_bands(df) if use_intraday else (None, None, None)
 
         lookback = 4 if use_intraday else 2
         ref = float(close.iloc[-1 - lookback]) if len(close) > lookback else last
         mom = (last - ref) / ref * 100.0 if ref else 0.0
 
-        # ORB: first 15m candle of today (9:15-9:30 IST)
         orb_high = orb_low = None
         if use_intraday:
-            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            today_str = now_ist.strftime("%Y-%m-%d")
+            today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
             today_candles = df[df.index.strftime("%Y-%m-%d") == today_str]
             if len(today_candles) >= 1:
                 orb_high = float(today_candles["High"].iloc[0])
                 orb_low = float(today_candles["Low"].iloc[0])
 
-        snap = fetch_snapshot(yahoo_symbol, yahoo_symbol)
-        if snap:
-            last = float(snap["last"])
-            day_pct = float(snap["pct_change"])
+        # Prefer NSE live spot; avoid extra Yahoo snapshot call (reduces rate limits)
+        if nse_spot is not None:
+            last = float(nse_spot)
+            prev = float(close.iloc[-2]) if len(close) >= 2 else last
+            day_pct = (last - prev) / prev * 100.0 if prev else 0.0
         else:
             prev = float(close.iloc[-2]) if len(close) >= 2 else last
             day_pct = (last - prev) / prev * 100.0 if prev else 0.0
@@ -242,15 +301,31 @@ def _fetch_intraday(yahoo_symbol: str) -> dict[str, Any]:
             "orb_low": round(orb_low, 2) if orb_low is not None else None,
             "timeframe": "15m" if use_intraday else "1d",
         })
+        _intraday_cache[cache_key] = (now, dict(out))
     except Exception as e:
+        err = str(e).lower()
+        if cached:
+            log.warning("Yahoo fetch failed for %s, using cached data: %s", yahoo_symbol, e)
+            tech = dict(cached[1])
+            if nse_spot is not None:
+                tech["spot"] = round(nse_spot, 2)
+            return tech
+        if nse_spot is not None and (nse_only_fallback or "too many" in err or "rate" in err):
+            log.warning(
+                "Yahoo unavailable for %s (%s) — using NSE spot only for this index",
+                yahoo_symbol, e,
+            )
+            out = _minimal_tech(nse_spot)
+            _intraday_cache[cache_key] = (now, dict(out))
+            return out
         log.warning("Intraday fetch failed for %s: %s", yahoo_symbol, e)
     return out
 
 
-def _parse_option_chain(nse_symbol: str) -> dict[str, Any] | None:
+def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str, Any] | None:
+    client = nse or NSELive()
     try:
-        nse = NSELive()
-        raw = nse.index_option_chain(nse_symbol)
+        raw = client.index_option_chain(nse_symbol)
         rec = raw.get("records")
         if not rec:
             return None
@@ -602,14 +677,21 @@ def _check_pcr_extreme(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, An
 
 # ════════════════════ Scan all strategies ════════════════════
 
-def scan_index(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str, Any]]:
     """Run all 3 strategies on one index. Returns list of triggered signals."""
-    tech = _fetch_intraday(cfg["yahoo"])
-    chain = _parse_option_chain(cfg["nse"])
-    if not chain or not tech.get("spot"):
+    chain = _parse_option_chain(cfg["nse"], nse)
+    if not chain:
         return []
 
     spot = float(chain["spot"])
+    tech = _fetch_intraday(
+        cfg["yahoo"],
+        nse_spot=spot,
+        nse_only_fallback=bool(cfg.get("nse_only_fallback")),
+    )
+    if not tech.get("spot"):
+        tech["spot"] = round(spot, 2)
+
     rows = chain["rows"]
     oi = _oi_analysis(rows, spot, cfg["step"])
 
@@ -654,9 +736,12 @@ def scan_all_indices() -> list[dict[str, Any]]:
     """Scan all indices with all strategies. Returns only triggered signals."""
     ensure_fno_tables()
     all_signals: list[dict[str, Any]] = []
-    for cfg in FNO_INDICES:
+    nse = NSELive()
+    for i, cfg in enumerate(FNO_INDICES):
         try:
-            all_signals.extend(scan_index(cfg))
+            if i > 0:
+                time.sleep(0.5)
+            all_signals.extend(scan_index(cfg, nse))
         except Exception as e:
             log.exception("Scan failed for %s: %s", cfg["name"], e)
     return all_signals
@@ -668,14 +753,22 @@ async def scan_all_indices_async() -> list[dict[str, Any]]:
 
 # ════════════════════ On-demand /entry (all indices) ════════════════════
 
-def analyze_index(cfg: dict[str, Any]) -> dict[str, Any]:
+def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any]:
     """Full analysis for /entry command (shows all indices regardless of signal)."""
-    tech = _fetch_intraday(cfg["yahoo"])
-    chain = _parse_option_chain(cfg["nse"])
+    chain = _parse_option_chain(cfg["nse"], nse)
     if not chain:
+        tech = _fetch_intraday(cfg["yahoo"], nse_only_fallback=bool(cfg.get("nse_only_fallback")))
         return {"name": cfg["name"], "nse": cfg["nse"], "error": "Option chain unavailable", "tech": tech}
 
     spot = float(chain["spot"])
+    tech = _fetch_intraday(
+        cfg["yahoo"],
+        nse_spot=spot,
+        nse_only_fallback=bool(cfg.get("nse_only_fallback")),
+    )
+    if not tech.get("spot"):
+        tech["spot"] = round(spot, 2)
+
     rows = chain["rows"]
     oi = _oi_analysis(rows, spot, cfg["step"])
 
@@ -712,9 +805,12 @@ def analyze_index(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def build_all_entries() -> dict[str, Any]:
     results: list[dict[str, Any]] = []
-    for cfg in FNO_INDICES:
+    nse = NSELive()
+    for i, cfg in enumerate(FNO_INDICES):
         try:
-            results.append(analyze_index(cfg))
+            if i > 0:
+                time.sleep(0.5)
+            results.append(analyze_index(cfg, nse))
         except Exception as e:
             log.exception("Entry analysis failed for %s: %s", cfg["name"], e)
             results.append({"name": cfg["name"], "nse": cfg["nse"], "error": str(e)})
