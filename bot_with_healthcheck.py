@@ -36,7 +36,12 @@ from market_service import (
     run_market_monitor,
 )
 from market_backtest import run_backtest
-from fno_entry_service import build_all_entries_async, format_entry_telegram_html
+from fno_entry_service import (
+    build_all_entries_async,
+    format_entry_telegram_html,
+    run_fno_monitor,
+    ensure_fno_tables,
+)
 from news_service import (
     ensure_news_table,
     scrape_inshorts,
@@ -268,7 +273,7 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 
 <b>📈 Market Commands:</b>
 /market — live market snapshot
-/entry — scalp entry/exit premiums (all indices)
+/entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
 /testdip — sample dip alert
 /testalert — test alert delivery
 
@@ -460,7 +465,7 @@ Reuses the same live message (no spam):
 
 <b>📈 MARKET</b>
 /market — live market snapshot
-/entry — scalp entry/exit premiums (all indices)
+/entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
 /testdip — sample dip alert
 /testalert — test alert delivery
 """
@@ -498,7 +503,7 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
-    await update.effective_message.reply_text("⏳ Building scalp sheet (15m + NSE OI)...")
+    await update.effective_message.reply_text("⏳ Scanning all indices (Confluence + ORB + PCR)...")
     payload = await build_all_entries_async()
     text = format_entry_telegram_html(payload)
     await reply_html_chunked(update.effective_message, text)
@@ -2371,6 +2376,11 @@ async def main():
                 run_market_monitor(bot, MARKET_ALERT_CHAT_ID)
             )
         )
+        ensure_fno_tables()
+        tasks.append(
+            asyncio.create_task(run_fno_monitor(bot))
+        )
+        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR Extreme)")
     else:
         log.info("Market features off (MARKET_FEATURES_ENABLED).")
 
