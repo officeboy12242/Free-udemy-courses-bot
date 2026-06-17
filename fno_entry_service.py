@@ -19,7 +19,8 @@ Auto-monitor runs every ~3 min during market hours.
 Only STRONG setups (strategy-specific thresholds) trigger Telegram alerts.
 Each setup is de-duped so you don't get spammed the same signal.
 
-Data: Yahoo Finance 15m candles  +  NSE option chain (jugaad-data).
+Data: Yahoo Finance 15m candles  +  NSE option chain (jugaad-data)
+       +  BSE Sensex option chain (Dhan API when configured).
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from jugaad_data.nse import NSELive
 
+from dhan_service import dhan_configured, parse_dhan_option_chain, verify_dhan_credentials
 from market_service import get_all_subscribers, remove_subscriber
 
 load_dotenv()
@@ -62,6 +64,9 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 50, "prem_min": 120, "prem_max": 380},
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
      "step": 25, "prem_min": 80, "prem_max": 260, "nse_only_fallback": True},
+    {"nse": "SENSEX", "yahoo": "^BSESN", "name": "Sensex",
+     "step": 100, "prem_min": 180, "prem_max": 550,
+     "dhan_underlying_id": 51, "dhan_segment": "IDX_I"},
 ]
 
 SL_MULT = 0.86
@@ -86,6 +91,9 @@ INDEX_ALIASES: dict[str, str] = {
     "midcap": "MIDCPNIFTY",
     "midcapnifty": "MIDCPNIFTY",
     "mid": "MIDCPNIFTY",
+    "sensex": "SENSEX",
+    "bsesn": "SENSEX",
+    "sx": "SENSEX",
     "all": "ALL",
 }
 
@@ -285,6 +293,7 @@ def format_user_alert_prefs_html(chat_id: int) -> str:
         "<code>/alert nifty</code> — Nifty only\n"
         "<code>/alert banknifty</code> — Bank Nifty only\n"
         "<code>/alert nifty banknifty</code> — both\n"
+        "<code>/alert sensex</code> — Sensex only\n"
         "<code>/alert all</code> or <code>/clearalert</code> — all indices"
     )
 
@@ -308,7 +317,7 @@ def format_alert_usage_html() -> str:
         "<code>/alert all</code>\n"
         "<code>/clearalert</code> — back to all indices\n"
         "<code>/myalerts</code> — show current choice\n\n"
-        "<b>Names:</b> nifty · banknifty · finnifty · midcap"
+        "<b>Names:</b> nifty · banknifty · finnifty · midcap · sensex"
     )
 
 
@@ -573,6 +582,16 @@ def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str
     except Exception as e:
         log.warning("Option chain failed for %s: %s", nse_symbol, e)
         return None
+
+
+def _parse_chain_for_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any] | None:
+    dhan_id = cfg.get("dhan_underlying_id")
+    if dhan_id is not None:
+        if not dhan_configured():
+            log.debug("Skipping %s — Dhan API not configured", cfg["name"])
+            return None
+        return parse_dhan_option_chain(int(dhan_id), cfg.get("dhan_segment", "IDX_I"))
+    return _parse_option_chain(cfg["nse"], nse)
 
 
 def _leg_quote(row: dict, side: str) -> dict[str, Any]:
@@ -914,7 +933,7 @@ def _check_pcr_extreme(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, An
 
 def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str, Any]]:
     """Run all 3 strategies on one index. Returns list of triggered signals."""
-    chain = _parse_option_chain(cfg["nse"], nse)
+    chain = _parse_chain_for_index(cfg, nse)
     if not chain:
         return []
 
@@ -990,10 +1009,16 @@ async def scan_all_indices_async() -> list[dict[str, Any]]:
 
 def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any]:
     """Full analysis for /entry command (shows all indices regardless of signal)."""
-    chain = _parse_option_chain(cfg["nse"], nse)
+    chain = _parse_chain_for_index(cfg, nse)
     if not chain:
         tech = _fetch_intraday(cfg["yahoo"], nse_only_fallback=bool(cfg.get("nse_only_fallback")))
-        return {"name": cfg["name"], "nse": cfg["nse"], "error": "Option chain unavailable", "tech": tech}
+        err = "Option chain unavailable"
+        if cfg.get("dhan_underlying_id"):
+            if not dhan_configured():
+                err = "Sensex needs Dhan API — set DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID"
+            else:
+                err = "Dhan Sensex option chain unavailable (check token / Data API plan)"
+        return {"name": cfg["name"], "nse": cfg["nse"], "error": err, "tech": tech}
 
     spot = float(chain["spot"])
     tech = _fetch_intraday(
@@ -1460,6 +1485,10 @@ async def run_fno_monitor(bot):
     ensure_fno_tables()
     interval = max(60, FNO_SCAN_INTERVAL)
     log.info("FnO monitor started: scanning every %ds during market hours", interval)
+    if dhan_configured():
+        verify_dhan_credentials()
+    else:
+        log.info("FnO: Sensex alerts disabled until DHAN_ACCESS_TOKEN + DHAN_CLIENT_ID are set")
 
     from telegram.error import TelegramError
 
