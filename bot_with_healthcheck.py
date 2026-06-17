@@ -44,6 +44,14 @@ from fno_entry_service import (
     ensure_fno_tables,
     build_eod_summary_async,
     format_eod_summary_html,
+    filter_eod_summary_for_user,
+    parse_index_tokens,
+    set_user_alert_indices,
+    clear_user_alert_indices,
+    format_user_alert_prefs_html,
+    format_alert_prefs_set_html,
+    format_alert_usage_html,
+    ALL_NSE_SYMBOLS,
 )
 from news_service import (
     ensure_news_table,
@@ -278,6 +286,9 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 /market — live market snapshot
 /entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
 /summary — today's trade win/loss summary
+/alert — choose which index alerts (nifty, banknifty, …)
+/clearalert — reset to all indices
+/myalerts — show your alert filter
 /testdip — sample dip alert
 /testalert — test alert delivery
 
@@ -471,6 +482,9 @@ Reuses the same live message (no spam):
 /market — live market snapshot
 /entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
 /summary — today's trade win/loss summary
+/alert — choose which index alerts (nifty, banknifty, …)
+/clearalert — reset to all indices
+/myalerts — show your alert filter
 /testdip — sample dip alert
 /testalert — test alert delivery
 """
@@ -526,7 +540,59 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not summary:
         await update.effective_message.reply_text("No F&O alerts recorded today yet.")
         return
-    await reply_html_chunked(update.effective_message, format_eod_summary_html(summary))
+    user_summary = filter_eod_summary_for_user(summary, update.effective_chat.id)
+    if not user_summary:
+        await update.effective_message.reply_text(
+            "No alerts today for your selected indices. Use /myalerts to check."
+        )
+        return
+    await reply_html_chunked(update.effective_message, format_eod_summary_html(user_summary))
+
+
+async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Choose which index F&O alerts to receive."""
+    if not update.effective_message or not update.effective_chat:
+        return
+    ensure_fno_tables()
+    symbols, err = parse_index_tokens(context.args or [])
+    if err == "usage":
+        await update.effective_message.reply_html(format_alert_usage_html())
+        return
+    if err:
+        await update.effective_message.reply_html(f"❌ {err}")
+        return
+    if symbols is None:
+        await update.effective_message.reply_html(format_alert_usage_html())
+        return
+    if set(symbols) == ALL_NSE_SYMBOLS:
+        clear_user_alert_indices(update.effective_chat.id)
+        await update.effective_message.reply_html(
+            "<b>✅ F&amp;O alerts reset</b>\n\nYou will receive alerts for <b>all indices</b>."
+        )
+        return
+    set_user_alert_indices(update.effective_chat.id, symbols)
+    await update.effective_message.reply_html(format_alert_prefs_set_html(symbols))
+
+
+async def cmd_clearalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset F&O alerts to all indices."""
+    if not update.effective_message or not update.effective_chat:
+        return
+    ensure_fno_tables()
+    clear_user_alert_indices(update.effective_chat.id)
+    await update.effective_message.reply_html(
+        "<b>✅ F&amp;O alerts cleared</b>\n\nYou will receive alerts for <b>all indices</b> again."
+    )
+
+
+async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show which index F&O alerts you receive."""
+    if not update.effective_message or not update.effective_chat:
+        return
+    ensure_fno_tables()
+    await update.effective_message.reply_html(
+        format_user_alert_prefs_html(update.effective_chat.id)
+    )
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1703,6 +1769,9 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("clearalert", cmd_clearalert))
+    app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("movietest", cmd_movietest))
     app.add_handler(CommandHandler("search", cmd_search))

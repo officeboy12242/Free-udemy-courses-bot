@@ -72,6 +72,26 @@ STRATEGY_CONFLUENCE = "EMA+RSI+OI+VWAP Confluence"
 STRATEGY_ORB = "ORB (Opening Range Breakout)"
 STRATEGY_PCR_REVERSAL = "PCR Extreme Reversal"
 
+# User-facing aliases → NSE symbol
+INDEX_ALIASES: dict[str, str] = {
+    "nifty": "NIFTY",
+    "nifty50": "NIFTY",
+    "n50": "NIFTY",
+    "banknifty": "BANKNIFTY",
+    "bank": "BANKNIFTY",
+    "bnf": "BANKNIFTY",
+    "bn": "BANKNIFTY",
+    "finnifty": "FINNIFTY",
+    "fin": "FINNIFTY",
+    "midcap": "MIDCPNIFTY",
+    "midcapnifty": "MIDCPNIFTY",
+    "mid": "MIDCPNIFTY",
+    "all": "ALL",
+}
+
+NSE_TO_NAME: dict[str, str] = {c["nse"]: c["name"] for c in FNO_INDICES}
+ALL_NSE_SYMBOLS: frozenset[str] = frozenset(c["nse"] for c in FNO_INDICES)
+
 
 # ════════════════════ DB for alert de-dupe ════════════════════
 
@@ -123,6 +143,13 @@ def ensure_fno_tables():
                 sent_at     TEXT NOT NULL
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fno_alert_prefs (
+                chat_id     INTEGER NOT NULL,
+                nse_symbol  TEXT NOT NULL,
+                PRIMARY KEY (chat_id, nse_symbol)
+            )
+        """)
         today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
         con.execute("DELETE FROM fno_alerts WHERE alert_date != ? AND summarized = 1", (today,))
         con.commit()
@@ -154,6 +181,135 @@ def _mark_eod_summary_sent():
         con.commit()
     finally:
         con.close()
+
+
+# ════════════════════ Per-user index alert prefs ════════════════════
+
+def parse_index_tokens(args: list[str]) -> tuple[list[str] | None, str | None]:
+    """
+    Parse /alert nifty banknifty → ['NIFTY','BANKNIFTY'].
+    None list + no error = use all indices. Error string if invalid token.
+    """
+    if not args:
+        return None, "usage"
+    tokens = []
+    for raw in " ".join(args).replace(",", " ").split():
+        key = raw.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+        if not key:
+            continue
+        sym = INDEX_ALIASES.get(key)
+        if sym == "ALL":
+            return list(ALL_NSE_SYMBOLS), None
+        if sym:
+            tokens.append(sym)
+        else:
+            return None, f"Unknown index: <code>{html.escape(raw)}</code>"
+    if not tokens:
+        return None, "usage"
+    # dedupe preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in tokens:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out, None
+
+
+def set_user_alert_indices(chat_id: int, nse_symbols: list[str]) -> None:
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute("DELETE FROM fno_alert_prefs WHERE chat_id = ?", (chat_id,))
+        for sym in nse_symbols:
+            con.execute(
+                "INSERT INTO fno_alert_prefs (chat_id, nse_symbol) VALUES (?, ?)",
+                (chat_id, sym),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
+def clear_user_alert_indices(chat_id: int) -> None:
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute("DELETE FROM fno_alert_prefs WHERE chat_id = ?", (chat_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_user_alert_indices(chat_id: int) -> set[str] | None:
+    """None = all indices (no custom filter)."""
+    con = sqlite3.connect(DB_FILE)
+    try:
+        rows = con.execute(
+            "SELECT nse_symbol FROM fno_alert_prefs WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        return {r[0] for r in rows}
+    finally:
+        con.close()
+
+
+def user_wants_index(chat_id: int, nse_symbol: str) -> bool:
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        return True
+    return nse_symbol in prefs
+
+
+def get_subscribers_for_index(nse_symbol: str) -> list[int]:
+    all_ids = get_all_subscribers()
+    return [cid for cid in all_ids if user_wants_index(cid, nse_symbol)]
+
+
+def format_user_alert_prefs_html(chat_id: int) -> str:
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        names = [c["name"] for c in FNO_INDICES]
+        body = "You receive alerts for <b>all indices</b>:\n" + "\n".join(
+            f"  • {html.escape(n)}" for n in names
+        )
+    else:
+        names = [NSE_TO_NAME.get(s, s) for s in sorted(prefs)]
+        body = "You receive alerts for:\n" + "\n".join(
+            f"  • <b>{html.escape(n)}</b>" for n in names
+        )
+    return (
+        "<b>📬 Your F&amp;O alert indices</b>\n\n"
+        f"{body}\n\n"
+        "<b>Commands:</b>\n"
+        "<code>/alert nifty</code> — Nifty only\n"
+        "<code>/alert banknifty</code> — Bank Nifty only\n"
+        "<code>/alert nifty banknifty</code> — both\n"
+        "<code>/alert all</code> or <code>/clearalert</code> — all indices"
+    )
+
+
+def format_alert_prefs_set_html(nse_symbols: list[str]) -> str:
+    names = [NSE_TO_NAME.get(s, s) for s in nse_symbols]
+    lines = "\n".join(f"  • <b>{html.escape(n)}</b>" for n in names)
+    return (
+        "<b>✅ F&amp;O alerts updated</b>\n\n"
+        f"You will now get trade alerts for:\n{lines}\n\n"
+        "<i>Use <code>/clearalert</code> to reset to all indices.</i>"
+    )
+
+
+def format_alert_usage_html() -> str:
+    return (
+        "<b>📬 Choose which indices to alert</b>\n\n"
+        "<code>/alert nifty</code>\n"
+        "<code>/alert banknifty</code>\n"
+        "<code>/alert nifty finnifty</code>\n"
+        "<code>/alert all</code>\n"
+        "<code>/clearalert</code> — back to all indices\n"
+        "<code>/myalerts</code> — show current choice\n\n"
+        "<b>Names:</b> nifty · banknifty · finnifty · midcap"
+    )
 
 
 def _already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> bool:
@@ -1190,6 +1346,16 @@ async def build_eod_summary_async() -> dict[str, Any] | None:
     return await asyncio.to_thread(build_eod_summary)
 
 
+def filter_eod_summary_for_user(summary: dict[str, Any], chat_id: int) -> dict[str, Any] | None:
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        return summary
+    trades = [t for t in summary["trades"] if t.get("nse_symbol") in prefs]
+    if not trades:
+        return None
+    return _summary_stats(trades)
+
+
 def _outcome_emoji(outcome: str) -> str:
     return {
         "T2 WIN": "\U0001f7e2",
@@ -1255,10 +1421,13 @@ async def run_fno_eod_summary(bot):
             if is_weekday and eod_start <= now_ist <= eod_end and not _eod_summary_sent_today():
                 summary = await build_eod_summary_async()
                 if summary and summary["total"] > 0:
-                    text = format_eod_summary_html(summary)
                     subscribers = get_all_subscribers()
                     sent = 0
                     for cid in subscribers:
+                        user_summary = filter_eod_summary_for_user(summary, cid)
+                        if not user_summary:
+                            continue
+                        text = format_eod_summary_html(user_summary)
                         try:
                             await bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
                             sent += 1
@@ -1312,10 +1481,13 @@ async def run_fno_monitor(bot):
                 await asyncio.sleep(interval)
                 continue
 
-            subscribers = get_all_subscribers()
             for sig in signals:
                 text = format_alert_html(sig)
                 _record_alert(sig)
+
+                subscribers = get_subscribers_for_index(sig["nse"])
+                if not subscribers:
+                    continue
 
                 sent = 0
                 for cid in subscribers:
