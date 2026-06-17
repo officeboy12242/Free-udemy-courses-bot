@@ -40,7 +40,10 @@ from fno_entry_service import (
     build_all_entries_async,
     format_entry_telegram_html,
     run_fno_monitor,
+    run_fno_eod_summary,
     ensure_fno_tables,
+    build_eod_summary_async,
+    format_eod_summary_html,
 )
 from news_service import (
     ensure_news_table,
@@ -274,6 +277,7 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 <b>📈 Market Commands:</b>
 /market — live market snapshot
 /entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
+/summary — today's trade win/loss summary
 /testdip — sample dip alert
 /testalert — test alert delivery
 
@@ -466,6 +470,7 @@ Reuses the same live message (no spam):
 <b>📈 MARKET</b>
 /market — live market snapshot
 /entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
+/summary — today's trade win/loss summary
 /testdip — sample dip alert
 /testalert — test alert delivery
 """
@@ -507,6 +512,21 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     payload = await build_all_entries_async()
     text = format_entry_telegram_html(payload)
     await reply_html_chunked(update.effective_message, text)
+
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Today's F&O alert win/loss summary. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
+        return
+    await update.effective_message.reply_text("⏳ Building today's trade summary...")
+    summary = await build_eod_summary_async()
+    if not summary:
+        await update.effective_message.reply_text("No F&O alerts recorded today yet.")
+        return
+    await reply_html_chunked(update.effective_message, format_eod_summary_html(summary))
 
 
 async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1682,6 +1702,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("updateapi", cmd_updateapi))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("movietest", cmd_movietest))
     app.add_handler(CommandHandler("search", cmd_search))
@@ -2380,7 +2401,10 @@ async def main():
         tasks.append(
             asyncio.create_task(run_fno_monitor(bot))
         )
-        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR Extreme)")
+        tasks.append(
+            asyncio.create_task(run_fno_eod_summary(bot))
+        )
+        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR Extreme + EOD summary)")
     else:
         log.info("Market features off (MARKET_FEATURES_ENABLED).")
 

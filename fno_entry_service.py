@@ -80,17 +80,77 @@ def ensure_fno_tables():
     try:
         con.execute("""
             CREATE TABLE IF NOT EXISTS fno_alerts (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                alert_date  TEXT NOT NULL,
-                nse_symbol  TEXT NOT NULL,
-                strategy    TEXT NOT NULL,
-                side        TEXT NOT NULL,
-                strike      INTEGER,
-                alerted_at  TEXT
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_date      TEXT NOT NULL,
+                nse_symbol      TEXT NOT NULL,
+                index_name      TEXT,
+                strategy        TEXT NOT NULL,
+                side            TEXT NOT NULL,
+                strike          INTEGER,
+                entry_premium   REAL,
+                sl_premium      REAL,
+                t1_premium      REAL,
+                t2_premium      REAL,
+                spot_at_entry   REAL,
+                expiry          TEXT,
+                alerted_at      TEXT,
+                close_premium   REAL,
+                outcome         TEXT,
+                pnl_pts         REAL,
+                summarized      INTEGER DEFAULT 0
+            )
+        """)
+        for col, typ in (
+            ("index_name", "TEXT"),
+            ("entry_premium", "REAL"),
+            ("sl_premium", "REAL"),
+            ("t1_premium", "REAL"),
+            ("t2_premium", "REAL"),
+            ("spot_at_entry", "REAL"),
+            ("expiry", "TEXT"),
+            ("close_premium", "REAL"),
+            ("outcome", "TEXT"),
+            ("pnl_pts", "REAL"),
+            ("summarized", "INTEGER DEFAULT 0"),
+        ):
+            try:
+                con.execute(f"ALTER TABLE fno_alerts ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fno_eod_sent (
+                alert_date  TEXT PRIMARY KEY,
+                sent_at     TEXT NOT NULL
             )
         """)
         today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-        con.execute("DELETE FROM fno_alerts WHERE alert_date != ?", (today,))
+        con.execute("DELETE FROM fno_alerts WHERE alert_date != ? AND summarized = 1", (today,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _eod_summary_sent_today() -> bool:
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            "SELECT 1 FROM fno_eod_sent WHERE alert_date = ?", (today,)
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+
+def _mark_eod_summary_sent():
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO fno_eod_sent (alert_date, sent_at) VALUES (?, ?)",
+            (today, now_ist),
+        )
         con.commit()
     finally:
         con.close()
@@ -109,14 +169,33 @@ def _already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> 
         con.close()
 
 
-def _record_alert(nse_symbol: str, strategy: str, side: str, strike: int):
+def _record_alert(signal: dict[str, Any]):
     today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
+    ex = signal.get("exits") or {}
     con = sqlite3.connect(DB_FILE)
     try:
         con.execute(
-            "INSERT INTO fno_alerts (alert_date, nse_symbol, strategy, side, strike, alerted_at) VALUES (?,?,?,?,?,?)",
-            (today, nse_symbol, strategy, side, strike, now_ist),
+            """INSERT INTO fno_alerts (
+                alert_date, nse_symbol, index_name, strategy, side, strike,
+                entry_premium, sl_premium, t1_premium, t2_premium,
+                spot_at_entry, expiry, alerted_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                today,
+                signal["nse"],
+                signal.get("name"),
+                signal["strategy"],
+                signal["side"],
+                signal["strike"],
+                signal.get("premium"),
+                ex.get("sl"),
+                ex.get("t1"),
+                ex.get("t2"),
+                signal.get("spot"),
+                signal.get("expiry"),
+                now_ist,
+            ),
         )
         con.commit()
     finally:
@@ -980,6 +1059,231 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
+# ════════════════════ EOD trade summary ════════════════════
+
+def _classify_outcome(entry: float, sl: float, t1: float, t2: float, close_ltp: float) -> tuple[str, float]:
+    """Return (outcome_label, pnl_pts) based on close premium vs entry/SL/T1/T2."""
+    pnl = round(close_ltp - entry, 2)
+    if close_ltp >= t2:
+        return "T2 WIN", pnl
+    if close_ltp >= t1:
+        return "T1 WIN", pnl
+    if close_ltp <= sl:
+        return "SL LOSS", pnl
+    if pnl > 0:
+        return "PARTIAL WIN", pnl
+    if pnl < 0:
+        return "PARTIAL LOSS", pnl
+    return "FLAT", pnl
+
+
+def _strike_close_ltp(
+    rows: list[dict], strike: int, side: str,
+) -> float | None:
+    for row in rows:
+        if int(row["strikePrice"]) != strike:
+            continue
+        q = _leg_quote(row, side)
+        if q["ltp"] > 0:
+            return float(q["ltp"])
+    return None
+
+
+def _get_today_alerts(unsummarized_only: bool = True) -> list[dict[str, Any]]:
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    con = sqlite3.connect(DB_FILE)
+    try:
+        q = """SELECT id, nse_symbol, index_name, strategy, side, strike,
+                      entry_premium, sl_premium, t1_premium, t2_premium,
+                      spot_at_entry, expiry, alerted_at,
+                      close_premium, outcome, pnl_pts, summarized
+               FROM fno_alerts WHERE alert_date = ?"""
+        params: tuple[Any, ...] = (today,)
+        if unsummarized_only:
+            q += " AND summarized = 0"
+        q += " ORDER BY alerted_at ASC"
+        rows = con.execute(q, params).fetchall()
+        return [
+            {
+                "id": r[0], "nse_symbol": r[1], "index_name": r[2] or r[1],
+                "strategy": r[3], "side": r[4], "strike": r[5],
+                "entry_premium": r[6], "sl_premium": r[7],
+                "t1_premium": r[8], "t2_premium": r[9],
+                "spot_at_entry": r[10], "expiry": r[11], "alerted_at": r[12],
+                "close_premium": r[13], "outcome": r[14], "pnl_pts": r[15],
+                "summarized": r[16],
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
+
+
+def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
+    wins = sum(1 for r in results if r.get("outcome") in ("T1 WIN", "T2 WIN", "PARTIAL WIN"))
+    losses = sum(1 for r in results if r.get("outcome") in ("SL LOSS", "PARTIAL LOSS"))
+    decided = wins + losses
+    win_rate = round(wins / decided * 100, 1) if decided else 0.0
+    net_pts = round(
+        sum(float(r.get("pnl_pts") or 0) for r in results if r.get("outcome") != "NO DATA"),
+        2,
+    )
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "as_of_ist": now.strftime("%Y-%m-%d %H:%M IST"),
+        "total": len(results),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "net_pts": net_pts,
+        "trades": results,
+    }
+
+
+def _update_alert_result(alert_id: int, close_ltp: float, outcome: str, pnl: float):
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            """UPDATE fno_alerts SET close_premium=?, outcome=?, pnl_pts=?, summarized=1
+               WHERE id=?""",
+            (close_ltp, outcome, pnl, alert_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def build_eod_summary() -> dict[str, Any] | None:
+    """Evaluate unsummarized alerts, return full day summary."""
+    pending = _get_today_alerts(unsummarized_only=True)
+    if not pending and not _get_today_alerts(unsummarized_only=False):
+        return None
+
+    if pending:
+        nse = NSELive()
+        chain_cache: dict[str, dict] = {}
+        for alert in pending:
+            sym = alert["nse_symbol"]
+            if sym not in chain_cache:
+                chain_cache[sym] = _parse_option_chain(sym, nse) or {}
+            rows = chain_cache[sym].get("rows") or []
+
+            close_ltp = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
+            entry = float(alert["entry_premium"] or 0)
+            sl = float(alert["sl_premium"] or entry * SL_MULT)
+            t1 = float(alert["t1_premium"] or entry * T1_MULT)
+            t2 = float(alert["t2_premium"] or entry * T2_MULT)
+
+            if close_ltp is None or close_ltp <= 0:
+                outcome, pnl = "NO DATA", 0.0
+                close_ltp = 0.0
+            else:
+                outcome, pnl = _classify_outcome(entry, sl, t1, t2, close_ltp)
+            _update_alert_result(alert["id"], close_ltp, outcome, pnl)
+
+    all_trades = _get_today_alerts(unsummarized_only=False)
+    return _summary_stats(all_trades)
+
+
+async def build_eod_summary_async() -> dict[str, Any] | None:
+    return await asyncio.to_thread(build_eod_summary)
+
+
+def _outcome_emoji(outcome: str) -> str:
+    return {
+        "T2 WIN": "\U0001f7e2",
+        "T1 WIN": "\U0001f7e2",
+        "PARTIAL WIN": "\U0001f7e1",
+        "FLAT": "\u26aa",
+        "PARTIAL LOSS": "\U0001f7e0",
+        "SL LOSS": "\U0001f534",
+        "NO DATA": "\u2753",
+    }.get(outcome, "\u2753")
+
+
+def format_eod_summary_html(summary: dict[str, Any]) -> str:
+    lines = [
+        "<b>\U0001f4ca DAILY F&amp;O TRADE SUMMARY</b>",
+        f"<i>{html.escape(summary['as_of_ist'])}</i>",
+        "",
+        f"<b>Total alerts:</b> {summary['total']}",
+        f"<b>Wins:</b> {summary['wins']}  \u00b7  <b>Losses:</b> {summary['losses']}",
+        f"<b>Win rate:</b> {summary['win_rate']}%",
+        f"<b>Net premium P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b> (at close)",
+        "",
+        "<i>P&amp;L based on premium at 3:30 PM close vs entry. "
+        "Intraday T1/SL may have hit earlier.</i>",
+        "",
+    ]
+
+    for t in summary["trades"]:
+        em = _outcome_emoji(t["outcome"])
+        entry = float(t["entry_premium"] or 0)
+        close = float(t["close_premium"] or 0)
+        pnl = float(t["pnl_pts"] or 0)
+        time_part = (t.get("alerted_at") or "")[11:16]
+        lines.append(
+            f"{em} <b>{html.escape(t['index_name'])}</b> "
+            f"<code>{t['strike']} {t['side']}</code>\n"
+            f"   {html.escape(t['strategy'][:28])}\n"
+            f"   Entry <b>{_ru(entry)}</b> \u2192 Close <b>{_ru(close) if close else 'N/A'}</b> "
+            f"({pnl:+.2f} pts) \u00b7 <b>{html.escape(t['outcome'])}</b>"
+            + (f" \u00b7 {time_part}" if time_part else "")
+            + "\n"
+        )
+
+    lines.append("")
+    lines.append("<i>\u26a0\ufe0f Paper-track only \u00b7 Not financial advice</i>")
+    return "\n".join(lines).strip()
+
+
+async def run_fno_eod_summary(bot):
+    """Send one end-of-day win/loss summary after market close (~3:35 PM IST)."""
+    ensure_fno_tables()
+    log.info("FnO EOD summary job started (sends once after 15:30 IST)")
+
+    from telegram.error import TelegramError
+
+    while True:
+        try:
+            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+            is_weekday = now_ist.weekday() < 5
+            eod_start = now_ist.replace(hour=15, minute=32, second=0, microsecond=0)
+            eod_end = now_ist.replace(hour=16, minute=15, second=0, microsecond=0)
+
+            if is_weekday and eod_start <= now_ist <= eod_end and not _eod_summary_sent_today():
+                summary = await build_eod_summary_async()
+                if summary and summary["total"] > 0:
+                    text = format_eod_summary_html(summary)
+                    subscribers = get_all_subscribers()
+                    sent = 0
+                    for cid in subscribers:
+                        try:
+                            await bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+                            sent += 1
+                            await asyncio.sleep(0.1)
+                        except TelegramError as e:
+                            log.error("EOD summary failed chat=%s: %s", cid, e)
+                            if "Forbidden" in str(e) or "blocked" in str(e).lower():
+                                remove_subscriber(cid)
+                    _mark_eod_summary_sent()
+                    log.info(
+                        "FnO EOD summary sent to %d users: %d trades, %dW/%dL, net %+.2f pts",
+                        sent, summary["total"], summary["wins"], summary["losses"], summary["net_pts"],
+                    )
+                elif summary is None:
+                    _mark_eod_summary_sent()
+                    log.info("FnO EOD summary: no alerts today, skipping message")
+                else:
+                    _mark_eod_summary_sent()
+
+        except Exception as e:
+            log.exception("FnO EOD summary error: %s", e)
+
+        await asyncio.sleep(180)
+
+
 # ════════════════════ Auto-monitor loop ════════════════════
 
 async def run_fno_monitor(bot):
@@ -1011,7 +1315,7 @@ async def run_fno_monitor(bot):
             subscribers = get_all_subscribers()
             for sig in signals:
                 text = format_alert_html(sig)
-                _record_alert(sig["nse"], sig["strategy"], sig["side"], sig["strike"])
+                _record_alert(sig)
 
                 sent = 0
                 for cid in subscribers:
