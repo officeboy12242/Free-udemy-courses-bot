@@ -53,10 +53,15 @@ FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
 # Stricter filters for auto-alerts only (/entry still shows all setups)
 FNO_STRICT_FILTERS = os.getenv("FNO_STRICT_FILTERS", "1").strip().lower() in ("1", "true", "yes")
-FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "50"))
-FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "8"))
-FNO_MIN_ADX = float(os.getenv("FNO_MIN_ADX", "18"))
-ORB_MIN_BREAK_PCT = float(os.getenv("ORB_MIN_BREAK_PCT", "0.04"))
+FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "25"))
+FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "12"))
+FNO_MIN_ADX = float(os.getenv("FNO_MIN_ADX", "14"))
+ORB_MIN_BREAK_PCT = float(os.getenv("ORB_MIN_BREAK_PCT", "0.02"))
+FNO_REQUIRE_EMA_ALIGN = os.getenv("FNO_REQUIRE_EMA_ALIGN", "0").strip().lower() in ("1", "true", "yes")
+FNO_CONFLUENCE_MIN_LAYERS = int(os.getenv("FNO_CONFLUENCE_MIN_LAYERS", "3"))
+FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true", "yes")
+# 0 = no cap (all strategies that pass quality); 3 = up to 3 per index per scan
+FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "0"))
 
 # In-memory cache: yahoo_symbol -> (timestamp, tech dict)
 _intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -991,14 +996,14 @@ def _check_pcr_extreme(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, An
 # ════════════════════ Quality filters (auto-alerts) ════════════════════
 
 def _is_prime_alert_window(now_ist: datetime | None = None) -> bool:
-    """Skip opening chop, lunch dead zone, and closing volatility."""
+    """Skip opening chop and closing volatility; optional lunch skip."""
     now = now_ist or datetime.now(ZoneInfo("Asia/Kolkata"))
     mins = now.hour * 60 + now.minute
-    if 9 * 60 + 15 <= mins < 9 * 60 + 25:
+    if 9 * 60 + 15 <= mins < 9 * 60 + 20:
         return False
-    if 12 * 60 <= mins < 12 * 60 + 45:
+    if FNO_SKIP_LUNCH and 12 * 60 <= mins < 12 * 60 + 45:
         return False
-    if 15 * 60 + 10 <= mins <= 15 * 60 + 30:
+    if 15 * 60 + 15 <= mins <= 15 * 60 + 30:
         return False
     return True
 
@@ -1083,20 +1088,31 @@ def _passes_auto_alert_quality(
 
     ema9, ema21, spot = tech.get("ema9"), tech.get("ema21"), tech.get("spot")
     if ema9 and ema21 and spot and strat in (STRATEGY_CONFLUENCE, STRATEGY_ORB):
-        if side == "CE" and not (ema9 > ema21 and spot > ema9):
+        aligned = (
+            (side == "CE" and ema9 > ema21 and spot > ema9)
+            or (side == "PE" and ema9 < ema21 and spot < ema9)
+        )
+        if FNO_REQUIRE_EMA_ALIGN and not aligned:
             return False, extras, 0
-        if side == "PE" and not (ema9 < ema21 and spot < ema9):
-            return False, extras, 0
-        score += 15
-        extras.append("EMA trend aligned with trade")
+        if aligned:
+            score += 15
+            extras.append("EMA trend aligned with trade")
 
     if strat == STRATEGY_CONFLUENCE:
-        layers = result.get("layers", "")
-        if layers != "4/4" and not (adx is not None and adx >= 22):
-            return False, extras, 0
-        if layers == "4/4":
+        layers_s = result.get("layers", "0/4")
+        try:
+            layer_n = int(str(layers_s).split("/")[0])
+        except (ValueError, IndexError):
+            layer_n = 0
+        if layer_n < FNO_CONFLUENCE_MIN_LAYERS:
+            if not (adx is not None and adx >= FNO_MIN_ADX + 4):
+                return False, extras, 0
+        if layer_n >= 4:
             score += 25
             extras.append("4/4 confluence layers agree")
+        elif layer_n >= 3:
+            score += 12
+            extras.append("3/4 confluence layers agree")
 
     score += 20
     return True, extras, score
@@ -1179,9 +1195,10 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
     if not candidates:
         return []
 
-    # One best setup per index per scan — avoids conflicting CE+PE spam
     candidates.sort(key=lambda x: x[0], reverse=True)
-    return [candidates[0][1]]
+    if FNO_MAX_ALERTS_PER_INDEX > 0:
+        candidates = candidates[:FNO_MAX_ALERTS_PER_INDEX]
+    return [sig for _, sig in candidates]
 
 
 def scan_all_indices() -> list[dict[str, Any]]:
