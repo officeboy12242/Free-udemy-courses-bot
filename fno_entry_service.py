@@ -16,7 +16,7 @@ Strategies (all 60%+ win rate on Nifty/BankNifty backtests):
    Heavy PE writing = floor = CE scalp. Heavy CE writing = ceiling = PE.
 
 Auto-monitor runs every ~3 min during market hours.
-Only STRONG setups (strategy-specific thresholds) trigger Telegram alerts.
+Only high-conviction setups pass strict filters (ADX, VIX, volume, EMA alignment).
 Each setup is de-duped so you don't get spammed the same signal.
 
 Data: Yahoo Finance 15m candles  +  NSE option chain (jugaad-data)
@@ -51,9 +51,16 @@ log = logging.getLogger(__name__)
 DB_FILE = os.getenv("DB_FILE", "posted_courses.db")
 FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
+# Stricter filters for auto-alerts only (/entry still shows all setups)
+FNO_STRICT_FILTERS = os.getenv("FNO_STRICT_FILTERS", "1").strip().lower() in ("1", "true", "yes")
+FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "50"))
+FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "8"))
+FNO_MIN_ADX = float(os.getenv("FNO_MIN_ADX", "18"))
+ORB_MIN_BREAK_PCT = float(os.getenv("ORB_MIN_BREAK_PCT", "0.04"))
 
 # In-memory cache: yahoo_symbol -> (timestamp, tech dict)
 _intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_vix_cache: tuple[float, float] | None = None
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
@@ -394,6 +401,52 @@ def _ema(series: pd.Series, span: int) -> float | None:
     return float(val) if not math.isnan(val) else None
 
 
+def _adx(df: pd.DataFrame, period: int = 14) -> float | None:
+    """Average Directional Index — trend strength (higher = stronger trend)."""
+    if df is None or len(df) < period + 2:
+        return None
+    try:
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
+        plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+        minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+        atr = tr.ewm(span=period, adjust=False).mean()
+        plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr)
+        minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr)
+        denom = (plus_di + minus_di).replace(0, float("nan"))
+        dx = 100 * (plus_di - minus_di).abs() / denom
+        val = dx.ewm(span=period, adjust=False).mean().iloc[-1]
+        return float(val) if not math.isnan(val) else None
+    except Exception:
+        return None
+
+
+def _get_india_vix() -> float | None:
+    """India VIX — cached to avoid extra Yahoo calls per index."""
+    global _vix_cache
+    now = time.time()
+    if _vix_cache and now - _vix_cache[0] < FNO_YAHOO_CACHE_TTL:
+        return _vix_cache[1]
+    try:
+        df = _yf_history(yf.Ticker("^INDIAVIX"), period="5d", interval="15m")
+        if df.empty:
+            return None
+        val = float(df["Close"].iloc[-1])
+        _vix_cache = (now, val)
+        return val
+    except Exception as e:
+        log.debug("India VIX fetch failed: %s", e)
+        return None
+
+
 def _vwap(df: pd.DataFrame) -> float | None:
     try:
         typical = (df["High"] + df["Low"] + df["Close"]) / 3
@@ -446,6 +499,8 @@ def _minimal_tech(nse_spot: float) -> dict[str, Any]:
         "vwap_lower": None,
         "orb_high": None,
         "orb_low": None,
+        "adx": None,
+        "vix": None,
         "timeframe": "nse",
         "yahoo_skipped": True,
     }
@@ -515,12 +570,14 @@ def _fetch_intraday(
         mom = (last - ref) / ref * 100.0 if ref else 0.0
 
         orb_high = orb_low = None
+        adx_val = None
         if use_intraday:
             today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
             today_candles = df[df.index.strftime("%Y-%m-%d") == today_str]
             if len(today_candles) >= 1:
                 orb_high = float(today_candles["High"].iloc[0])
                 orb_low = float(today_candles["Low"].iloc[0])
+            adx_val = _adx(df)
 
         # Prefer NSE live spot; avoid extra Yahoo snapshot call (reduces rate limits)
         if nse_spot is not None:
@@ -543,6 +600,7 @@ def _fetch_intraday(
             "vwap_lower": round(vwap_lower, 2) if vwap_lower is not None else None,
             "orb_high": round(orb_high, 2) if orb_high is not None else None,
             "orb_low": round(orb_low, 2) if orb_low is not None else None,
+            "adx": round(adx_val, 1) if adx_val is not None else None,
             "timeframe": "15m" if use_intraday else "1d",
         })
         _intraday_cache[cache_key] = (now, dict(out))
@@ -843,8 +901,10 @@ def _check_orb(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, Any] | Non
         return None
 
     if spot > orb_high:
-        side = "CE"
         breakout_pct = (spot - orb_high) / orb_high * 100
+        if breakout_pct < ORB_MIN_BREAK_PCT:
+            return None
+        side = "CE"
         reasons.append(f"ORB breakout above {orb_high:.0f} (+{breakout_pct:.2f}%)")
         reasons.append(f"ORB range: {orb_low:.0f} - {orb_high:.0f} ({orb_range:.0f} pts)")
         if pcr > 1.0:
@@ -854,8 +914,10 @@ def _check_orb(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, Any] | Non
         elif rsi and rsi < 45:
             return None
     elif spot < orb_low:
-        side = "PE"
         breakout_pct = (orb_low - spot) / orb_low * 100
+        if breakout_pct < ORB_MIN_BREAK_PCT:
+            return None
+        side = "PE"
         reasons.append(f"ORB breakdown below {orb_low:.0f} (-{breakout_pct:.2f}%)")
         reasons.append(f"ORB range: {orb_low:.0f} - {orb_high:.0f} ({orb_range:.0f} pts)")
         if pcr < 1.0:
@@ -926,6 +988,120 @@ def _check_pcr_extreme(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, An
     }
 
 
+# ════════════════════ Quality filters (auto-alerts) ════════════════════
+
+def _is_prime_alert_window(now_ist: datetime | None = None) -> bool:
+    """Skip opening chop, lunch dead zone, and closing volatility."""
+    now = now_ist or datetime.now(ZoneInfo("Asia/Kolkata"))
+    mins = now.hour * 60 + now.minute
+    if 9 * 60 + 15 <= mins < 9 * 60 + 25:
+        return False
+    if 12 * 60 <= mins < 12 * 60 + 45:
+        return False
+    if 15 * 60 + 10 <= mins <= 15 * 60 + 30:
+        return False
+    return True
+
+
+def _leg_spread_pct(row: dict, side: str) -> float:
+    leg = row.get(side) or {}
+    bid = float(leg.get("buyPrice1") or 0)
+    ask = float(leg.get("sellPrice1") or 0)
+    ltp = float(leg.get("lastPrice") or 0)
+    mid = ltp if ltp > 0 else ((bid + ask) / 2 if bid > 0 and ask > 0 else 0)
+    if mid <= 0 or bid <= 0 or ask <= 0:
+        return 0.0
+    return (ask - bid) / mid * 100.0
+
+
+def _strategy_rank_base(strategy: str) -> int:
+    return {
+        STRATEGY_CONFLUENCE: 30,
+        STRATEGY_ORB: 25,
+        STRATEGY_PCR_REVERSAL: 20,
+    }.get(strategy, 10)
+
+
+def _passes_auto_alert_quality(
+    result: dict[str, Any],
+    tech: dict[str, Any],
+    leg: dict[str, Any],
+    row: dict[str, Any],
+    side: str,
+    prem_min: float,
+    prem_max: float,
+) -> tuple[bool, list[str], int]:
+    """Extra gates for auto-alerts — fewer trades, higher conviction."""
+    if not FNO_STRICT_FILTERS:
+        return True, [], 50
+
+    extras: list[str] = []
+    score = 0
+    strat = result.get("strategy", "")
+
+    if not _is_prime_alert_window():
+        return False, extras, 0
+
+    vol = int(leg.get("volume") or 0)
+    if vol < FNO_MIN_LEG_VOLUME:
+        return False, extras, 0
+    if vol >= FNO_MIN_LEG_VOLUME * 3:
+        score += 15
+        extras.append(f"High volume ({vol:,})")
+
+    spread = _leg_spread_pct(row, side)
+    if spread > FNO_MAX_SPREAD_PCT:
+        return False, extras, 0
+    if spread > 0 and spread <= FNO_MAX_SPREAD_PCT / 2:
+        score += 10
+        extras.append("Tight bid-ask spread")
+
+    ltp = float(leg.get("ltp") or 0)
+    if ltp < prem_min * 0.5 or ltp > prem_max * 1.4:
+        return False, extras, 0
+
+    adx = tech.get("adx")
+    if strat in (STRATEGY_CONFLUENCE, STRATEGY_ORB):
+        if adx is not None and adx < FNO_MIN_ADX:
+            return False, extras, 0
+        if adx is not None and adx >= 25:
+            score += 20
+            extras.append(f"ADX {adx:.0f} strong trend")
+        elif adx is not None:
+            score += 10
+            extras.append(f"ADX {adx:.0f} trending")
+
+    vix = tech.get("vix")
+    if vix is not None:
+        if strat == STRATEGY_PCR_REVERSAL and vix < 13:
+            return False, extras, 0
+        if strat == STRATEGY_ORB and vix > 24:
+            return False, extras, 0
+        if 14 <= vix <= 20:
+            score += 10
+            extras.append(f"VIX {vix:.1f} ideal zone")
+
+    ema9, ema21, spot = tech.get("ema9"), tech.get("ema21"), tech.get("spot")
+    if ema9 and ema21 and spot and strat in (STRATEGY_CONFLUENCE, STRATEGY_ORB):
+        if side == "CE" and not (ema9 > ema21 and spot > ema9):
+            return False, extras, 0
+        if side == "PE" and not (ema9 < ema21 and spot < ema9):
+            return False, extras, 0
+        score += 15
+        extras.append("EMA trend aligned with trade")
+
+    if strat == STRATEGY_CONFLUENCE:
+        layers = result.get("layers", "")
+        if layers != "4/4" and not (adx is not None and adx >= 22):
+            return False, extras, 0
+        if layers == "4/4":
+            score += 25
+            extras.append("4/4 confluence layers agree")
+
+    score += 20
+    return True, extras, score
+
+
 # ════════════════════ Scan all strategies ════════════════════
 
 def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str, Any]]:
@@ -942,11 +1118,13 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
     )
     if not tech.get("spot"):
         tech["spot"] = round(spot, 2)
+    tech["vix"] = _get_india_vix()
 
     rows = chain["rows"]
     oi = _oi_analysis(rows, spot, cfg["step"])
+    by_strike = {int(r["strikePrice"]): r for r in rows}
 
-    signals: list[dict[str, Any]] = []
+    candidates: list[tuple[int, dict[str, Any]]] = []
 
     for check_fn in [_check_confluence, _check_orb, _check_pcr_extreme]:
         result = check_fn(tech, oi)
@@ -962,9 +1140,25 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
             continue
 
         entry_prem = float(leg.get("ltp") or 0)
-        exits = _scalp_exits(entry_prem)
+        if entry_prem <= 0:
+            continue
 
-        signals.append({
+        row = by_strike.get(strike, {})
+        ok, quality_extras, qscore = _passes_auto_alert_quality(
+            result, tech, leg, row, side, cfg["prem_min"], cfg["prem_max"],
+        )
+        if not ok:
+            continue
+
+        reasons = list(result.get("reasons") or [])
+        for extra in quality_extras[:2]:
+            if extra not in reasons:
+                reasons.append(extra)
+
+        exits = _scalp_exits(entry_prem)
+        rank = qscore + _strategy_rank_base(result["strategy"])
+
+        candidates.append((rank, {
             "name": cfg["name"],
             "nse": cfg["nse"],
             "expiry": chain["expiry"],
@@ -972,15 +1166,22 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
             "tech": tech,
             "oi": oi,
             **result,
+            "reasons": reasons,
             "strike": strike,
             "premium": round(entry_prem, 2),
             "leg_oi": leg.get("oi", 0),
             "leg_chg_oi": leg.get("chg_oi", 0),
             "leg_volume": leg.get("volume", 0),
             "exits": exits,
-        })
+            "quality_score": rank,
+        }))
 
-    return signals
+    if not candidates:
+        return []
+
+    # One best setup per index per scan — avoids conflicting CE+PE spam
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [candidates[0][1]]
 
 
 def scan_all_indices() -> list[dict[str, Any]]:
@@ -1112,6 +1313,10 @@ def format_alert_html(signal: dict[str, Any]) -> str:
     )
 
     vwap_line = f"VWAP <code>{vwap}</code>  \u00b7  " if vwap else ""
+    adx = tech.get("adx")
+    adx_line = f"ADX <code>{adx}</code>  \u00b7  " if adx is not None else ""
+    vix = tech.get("vix")
+    vix_line = f"VIX <code>{vix:.1f}</code>  \u00b7  " if vix is not None else ""
 
     return (
         f"{strat_emoji} <b>TRADE ALERT</b> {strat_emoji}\n"
@@ -1121,7 +1326,7 @@ def format_alert_html(signal: dict[str, Any]) -> str:
         f"<b>Win Rate:</b> {signal.get('win_rate', '')}\n"
         f"\n"
         f"Spot <code>{signal['spot']}</code>  \u00b7  "
-        f"{vwap_line}"
+        f"{vwap_line}{adx_line}{vix_line}"
         f"PCR <code>{oi_data.get('pcr', '-')}</code>  \u00b7  "
         f"RSI <code>{tech.get('rsi', '-')}</code>\n"
         f"\n"
