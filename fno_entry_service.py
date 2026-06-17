@@ -20,7 +20,7 @@ Only STRONG setups (strategy-specific thresholds) trigger Telegram alerts.
 Each setup is de-duped so you don't get spammed the same signal.
 
 Data: Yahoo Finance 15m candles  +  NSE option chain (jugaad-data)
-       +  BSE Sensex option chain (Dhan API when configured).
+       +  BSE Sensex option chain (free BSE India API).
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from jugaad_data.nse import NSELive
 
-from dhan_service import dhan_configured, parse_dhan_option_chain, verify_dhan_credentials
+from bse_option_service import parse_bse_option_chain
 from market_service import get_all_subscribers, remove_subscriber
 
 load_dotenv()
@@ -66,7 +66,7 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 25, "prem_min": 80, "prem_max": 260, "nse_only_fallback": True},
     {"nse": "SENSEX", "yahoo": "^BSESN", "name": "Sensex",
      "step": 100, "prem_min": 180, "prem_max": 550,
-     "dhan_underlying_id": 51, "dhan_segment": "IDX_I"},
+     "bse_scrip_cd": 1},
 ]
 
 SL_MULT = 0.86
@@ -585,12 +585,9 @@ def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str
 
 
 def _parse_chain_for_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any] | None:
-    dhan_id = cfg.get("dhan_underlying_id")
-    if dhan_id is not None:
-        if not dhan_configured():
-            log.debug("Skipping %s — Dhan API not configured", cfg["name"])
-            return None
-        return parse_dhan_option_chain(int(dhan_id), cfg.get("dhan_segment", "IDX_I"))
+    bse_cd = cfg.get("bse_scrip_cd")
+    if bse_cd is not None:
+        return parse_bse_option_chain(int(bse_cd))
     return _parse_option_chain(cfg["nse"], nse)
 
 
@@ -1013,11 +1010,11 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
     if not chain:
         tech = _fetch_intraday(cfg["yahoo"], nse_only_fallback=bool(cfg.get("nse_only_fallback")))
         err = "Option chain unavailable"
-        if cfg.get("dhan_underlying_id"):
-            if not dhan_configured():
-                err = "Sensex needs Dhan API — set DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID"
-            else:
-                err = "Dhan Sensex option chain unavailable (check token / Data API plan)"
+        if cfg.get("bse_scrip_cd"):
+            err = (
+                "BSE Sensex option chain unavailable from this server "
+                "(BSE blocks some cloud IPs; NSE indices still work)"
+            )
         return {"name": cfg["name"], "nse": cfg["nse"], "error": err, "tech": tech}
 
     spot = float(chain["spot"])
@@ -1485,10 +1482,6 @@ async def run_fno_monitor(bot):
     ensure_fno_tables()
     interval = max(60, FNO_SCAN_INTERVAL)
     log.info("FnO monitor started: scanning every %ds during market hours", interval)
-    if dhan_configured():
-        verify_dhan_credentials()
-    else:
-        log.info("FnO: Sensex alerts disabled until DHAN_ACCESS_TOKEN + DHAN_CLIENT_ID are set")
 
     from telegram.error import TelegramError
 
