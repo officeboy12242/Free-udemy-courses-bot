@@ -2521,7 +2521,7 @@ async def main():
         tasks.append(
             asyncio.create_task(run_fno_eod_summary(bot))
         )
-        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR Extreme + EOD summary)")
+        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR + MACD MTF + EOD summary)")
     else:
         log.info("Market features off (MARKET_FEATURES_ENABLED).")
 
