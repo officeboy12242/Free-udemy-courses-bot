@@ -32,7 +32,7 @@ import math
 import os
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 DB_FILE = os.getenv("DB_FILE", "posted_courses.db")
 FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
-# Stricter filters for auto-alerts only (/entry still shows all setups)
+# Stricter filters for auto-alerts; /entry shows all setups + pass/fail vs same filters
 FNO_STRICT_FILTERS = os.getenv("FNO_STRICT_FILTERS", "1").strip().lower() in ("1", "true", "yes")
 FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "25"))
 FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "12"))
@@ -168,6 +168,17 @@ def ensure_fno_tables():
                 chat_id     INTEGER NOT NULL,
                 nse_symbol  TEXT NOT NULL,
                 PRIMARY KEY (chat_id, nse_symbol)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fno_scan_stats (
+                alert_date      TEXT PRIMARY KEY,
+                setups          INTEGER DEFAULT 0,
+                sent            INTEGER DEFAULT 0,
+                skip_quality    INTEGER DEFAULT 0,
+                skip_dedupe     INTEGER DEFAULT 0,
+                skip_premium    INTEGER DEFAULT 0,
+                scan_cycles     INTEGER DEFAULT 0
             )
         """)
         today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
@@ -301,6 +312,7 @@ def format_user_alert_prefs_html(chat_id: int) -> str:
     return (
         "<b>📬 Your F&amp;O alert indices</b>\n\n"
         f"{body}\n\n"
+        "<i>Applies to trade alerts and <code>/entry</code>.</i>\n\n"
         "<b>Commands:</b>\n"
         "<code>/alert nifty</code> — Nifty only\n"
         "<code>/alert banknifty</code> — Bank Nifty only\n"
@@ -329,6 +341,7 @@ def format_alert_usage_html() -> str:
         "<code>/alert all</code>\n"
         "<code>/clearalert</code> — back to all indices\n"
         "<code>/myalerts</code> — show current choice\n\n"
+        "<i>Also applies to <code>/entry</code> — only selected indices are shown.</i>\n\n"
         "<b>Names:</b> nifty · banknifty · finnifty · midcap · sensex"
     )
 
@@ -1035,40 +1048,40 @@ def _passes_auto_alert_quality(
     side: str,
     prem_min: float,
     prem_max: float,
-) -> tuple[bool, list[str], int]:
+) -> tuple[bool, list[str], int, str | None]:
     """Extra gates for auto-alerts — fewer trades, higher conviction."""
     if not FNO_STRICT_FILTERS:
-        return True, [], 50
+        return True, [], 50, None
 
     extras: list[str] = []
     score = 0
     strat = result.get("strategy", "")
 
     if not _is_prime_alert_window():
-        return False, extras, 0
+        return False, extras, 0, "time_window"
 
     vol = int(leg.get("volume") or 0)
     if vol < FNO_MIN_LEG_VOLUME:
-        return False, extras, 0
+        return False, extras, 0, "low_volume"
     if vol >= FNO_MIN_LEG_VOLUME * 3:
         score += 15
         extras.append(f"High volume ({vol:,})")
 
     spread = _leg_spread_pct(row, side)
     if spread > FNO_MAX_SPREAD_PCT:
-        return False, extras, 0
+        return False, extras, 0, "wide_spread"
     if spread > 0 and spread <= FNO_MAX_SPREAD_PCT / 2:
         score += 10
         extras.append("Tight bid-ask spread")
 
     ltp = float(leg.get("ltp") or 0)
     if ltp < prem_min * 0.5 or ltp > prem_max * 1.4:
-        return False, extras, 0
+        return False, extras, 0, "premium_band"
 
     adx = tech.get("adx")
     if strat in (STRATEGY_CONFLUENCE, STRATEGY_ORB):
         if adx is not None and adx < FNO_MIN_ADX:
-            return False, extras, 0
+            return False, extras, 0, "low_adx"
         if adx is not None and adx >= 25:
             score += 20
             extras.append(f"ADX {adx:.0f} strong trend")
@@ -1079,9 +1092,9 @@ def _passes_auto_alert_quality(
     vix = tech.get("vix")
     if vix is not None:
         if strat == STRATEGY_PCR_REVERSAL and vix < 13:
-            return False, extras, 0
+            return False, extras, 0, "vix_low"
         if strat == STRATEGY_ORB and vix > 24:
-            return False, extras, 0
+            return False, extras, 0, "vix_high"
         if 14 <= vix <= 20:
             score += 10
             extras.append(f"VIX {vix:.1f} ideal zone")
@@ -1093,7 +1106,7 @@ def _passes_auto_alert_quality(
             or (side == "PE" and ema9 < ema21 and spot < ema9)
         )
         if FNO_REQUIRE_EMA_ALIGN and not aligned:
-            return False, extras, 0
+            return False, extras, 0, "ema_misalign"
         if aligned:
             score += 15
             extras.append("EMA trend aligned with trade")
@@ -1106,7 +1119,7 @@ def _passes_auto_alert_quality(
             layer_n = 0
         if layer_n < FNO_CONFLUENCE_MIN_LAYERS:
             if not (adx is not None and adx >= FNO_MIN_ADX + 4):
-                return False, extras, 0
+                return False, extras, 0, "weak_confluence"
         if layer_n >= 4:
             score += 25
             extras.append("4/4 confluence layers agree")
@@ -1115,16 +1128,137 @@ def _passes_auto_alert_quality(
             extras.append("3/4 confluence layers agree")
 
     score += 20
-    return True, extras, score
+    return True, extras, score, None
+
+
+def _skip_reason_label(reason: str | None) -> str:
+    if not reason:
+        return ""
+    labels = {
+        "time_window": "Outside auto-alert window (9:20–15:15)",
+        "low_volume": f"Leg volume below {FNO_MIN_LEG_VOLUME}",
+        "wide_spread": f"Spread above {FNO_MAX_SPREAD_PCT}%",
+        "premium_band": "Premium outside scalp band",
+        "low_adx": f"ADX below {FNO_MIN_ADX}",
+        "vix_low": "VIX too low for PCR reversal",
+        "vix_high": "VIX too high for ORB",
+        "ema_misalign": "EMA trend not aligned",
+        "weak_confluence": f"Fewer than {FNO_CONFLUENCE_MIN_LAYERS}/4 confluence layers",
+        "already_alerted": "Same setup already alerted today",
+        "no_setup": "No strategy triggered",
+    }
+    return labels.get(reason, reason.replace("_", " ").title())
+
+
+def _empty_scan_stats() -> dict[str, int]:
+    return {
+        "setups": 0,
+        "sent": 0,
+        "skip_quality": 0,
+        "skip_dedupe": 0,
+        "skip_premium": 0,
+    }
+
+
+def _record_scan_stats(delta: dict[str, int]) -> None:
+    """Accumulate per-day filter stats (setups vs sent vs skipped)."""
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            """
+            INSERT INTO fno_scan_stats (
+                alert_date, setups, sent, skip_quality, skip_dedupe, skip_premium, scan_cycles
+            ) VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(alert_date) DO UPDATE SET
+                setups = setups + excluded.setups,
+                sent = sent + excluded.sent,
+                skip_quality = skip_quality + excluded.skip_quality,
+                skip_dedupe = skip_dedupe + excluded.skip_dedupe,
+                skip_premium = skip_premium + excluded.skip_premium,
+                scan_cycles = scan_cycles + 1
+            """,
+            (
+                today,
+                delta.get("setups", 0),
+                delta.get("sent", 0),
+                delta.get("skip_quality", 0),
+                delta.get("skip_dedupe", 0),
+                delta.get("skip_premium", 0),
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_scan_stats_for_date(alert_date: str) -> dict[str, int] | None:
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            """SELECT setups, sent, skip_quality, skip_dedupe, skip_premium, scan_cycles
+               FROM fno_scan_stats WHERE alert_date = ?""",
+            (alert_date,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "setups": row[0], "sent": row[1], "skip_quality": row[2],
+            "skip_dedupe": row[3], "skip_premium": row[4], "scan_cycles": row[5],
+        }
+    finally:
+        con.close()
+
+
+def get_scan_stats_range(start_date: str, end_date: str) -> dict[str, int]:
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            """
+            SELECT COALESCE(SUM(setups),0), COALESCE(SUM(sent),0),
+                   COALESCE(SUM(skip_quality),0), COALESCE(SUM(skip_dedupe),0),
+                   COALESCE(SUM(skip_premium),0), COALESCE(SUM(scan_cycles),0)
+            FROM fno_scan_stats
+            WHERE alert_date >= ? AND alert_date <= ?
+            """,
+            (start_date, end_date),
+        ).fetchone()
+        return {
+            "setups": row[0], "sent": row[1], "skip_quality": row[2],
+            "skip_dedupe": row[3], "skip_premium": row[4], "scan_cycles": row[5],
+        }
+    finally:
+        con.close()
+
+
+def format_scan_stats_html(stats: dict[str, int] | None, *, label: str = "Today") -> str:
+    if not stats or stats.get("scan_cycles", 0) == 0:
+        return ""
+    setups = int(stats.get("setups") or 0)
+    sent = int(stats.get("sent") or 0)
+    skip_q = int(stats.get("skip_quality") or 0)
+    skip_d = int(stats.get("skip_dedupe") or 0)
+    skip_p = int(stats.get("skip_premium") or 0)
+    cycles = int(stats.get("scan_cycles") or 0)
+    pass_pct = round(sent / setups * 100, 1) if setups else 0.0
+    return (
+        f"<b>\U0001f50d Filter stats ({html.escape(label)})</b>\n"
+        f"Scans: <b>{cycles}</b>  \u00b7  Setups found: <b>{setups}</b>\n"
+        f"Alerts sent: <b>{sent}</b>  \u00b7  Quality pass rate: <b>{pass_pct}%</b>\n"
+        f"Skipped — quality: <b>{skip_q}</b>  \u00b7  "
+        f"duplicate: <b>{skip_d}</b>  \u00b7  no premium: <b>{skip_p}</b>\n"
+        ""
+    )
 
 
 # ════════════════════ Scan all strategies ════════════════════
 
-def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str, Any]]:
-    """Run all 3 strategies on one index. Returns list of triggered signals."""
+def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Run all 3 strategies on one index. Returns (signals, scan stats)."""
+    stats = _empty_scan_stats()
     chain = _parse_chain_for_index(cfg, nse)
     if not chain:
-        return []
+        return [], stats
 
     spot = float(chain["spot"])
     tech = _fetch_intraday(
@@ -1147,23 +1281,27 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
         if result is None:
             continue
 
+        stats["setups"] += 1
         side = result["side"]
         strike, leg = _pick_scalp_strike(
             rows, spot, cfg["step"], side, cfg["prem_min"], cfg["prem_max"]
         )
 
         if _already_alerted(cfg["nse"], result["strategy"], side, strike):
+            stats["skip_dedupe"] += 1
             continue
 
         entry_prem = float(leg.get("ltp") or 0)
         if entry_prem <= 0:
+            stats["skip_premium"] += 1
             continue
 
         row = by_strike.get(strike, {})
-        ok, quality_extras, qscore = _passes_auto_alert_quality(
+        ok, quality_extras, qscore, _skip = _passes_auto_alert_quality(
             result, tech, leg, row, side, cfg["prem_min"], cfg["prem_max"],
         )
         if not ok:
+            stats["skip_quality"] += 1
             continue
 
         reasons = list(result.get("reasons") or [])
@@ -1193,26 +1331,33 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> list[dict[str
         }))
 
     if not candidates:
-        return []
+        return [], stats
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     if FNO_MAX_ALERTS_PER_INDEX > 0:
         candidates = candidates[:FNO_MAX_ALERTS_PER_INDEX]
-    return [sig for _, sig in candidates]
+    signals = [sig for _, sig in candidates]
+    stats["sent"] += len(signals)
+    return signals, stats
 
 
 def scan_all_indices() -> list[dict[str, Any]]:
     """Scan all indices with all strategies. Returns only triggered signals."""
     ensure_fno_tables()
     all_signals: list[dict[str, Any]] = []
+    cycle_stats = _empty_scan_stats()
     nse = NSELive()
     for i, cfg in enumerate(FNO_INDICES):
         try:
             if i > 0:
                 time.sleep(0.5)
-            all_signals.extend(scan_index(cfg, nse))
+            sigs, st = scan_index(cfg, nse)
+            all_signals.extend(sigs)
+            for k in cycle_stats:
+                cycle_stats[k] += st[k]
         except Exception as e:
             log.exception("Scan failed for %s: %s", cfg["name"], e)
+    _record_scan_stats(cycle_stats)
     return all_signals
 
 
@@ -1223,7 +1368,7 @@ async def scan_all_indices_async() -> list[dict[str, Any]]:
 # ════════════════════ On-demand /entry (all indices) ════════════════════
 
 def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any]:
-    """Full analysis for /entry command (shows all indices regardless of signal)."""
+    """Full analysis for /entry — same strategies & quality gates as auto-alerts."""
     chain = _parse_chain_for_index(cfg, nse)
     if not chain:
         tech = _fetch_intraday(cfg["yahoo"], nse_only_fallback=bool(cfg.get("nse_only_fallback")))
@@ -1243,26 +1388,83 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
     )
     if not tech.get("spot"):
         tech["spot"] = round(spot, 2)
+    tech["vix"] = _get_india_vix()
 
     rows = chain["rows"]
     oi = _oi_analysis(rows, spot, cfg["step"])
+    by_strike = {int(r["strikePrice"]): r for r in rows}
 
-    triggered: list[dict[str, Any]] = []
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    all_triggered: list[str] = []
+
     for check_fn in [_check_confluence, _check_orb, _check_pcr_extreme]:
         result = check_fn(tech, oi)
-        if result:
-            triggered.append(result)
+        if result is None:
+            continue
 
-    if triggered:
-        best = triggered[0]
-        side = best["side"]
-    else:
-        day_pct = float(tech.get("pct_change") or 0)
-        side = "CE" if day_pct >= 0 else "PE"
-        best = {"strategy": "No strong setup", "side": side, "strength": "WEAK",
-                "layers": "0/4", "reasons": ["No strategy triggered - low conviction"],
-                "win_rate": "N/A"}
+        all_triggered.append(result["strategy"])
+        side = result["side"]
+        strike, leg = _pick_scalp_strike(
+            rows, spot, cfg["step"], side, cfg["prem_min"], cfg["prem_max"],
+        )
+        entry_prem = float(leg.get("ltp") or 0)
+        row = by_strike.get(strike, {})
+        duped = _already_alerted(cfg["nse"], result["strategy"], side, strike)
 
+        ok = True
+        skip_reason: str | None = None
+        quality_extras: list[str] = []
+        qscore = 0
+
+        if entry_prem <= 0:
+            ok = False
+            skip_reason = "premium_band"
+        else:
+            ok, quality_extras, qscore, skip_reason = _passes_auto_alert_quality(
+                result, tech, leg, row, side, cfg["prem_min"], cfg["prem_max"],
+            )
+        if duped:
+            ok = False
+            skip_reason = "already_alerted"
+
+        reasons = list(result.get("reasons") or [])
+        for extra in quality_extras[:2]:
+            if extra not in reasons:
+                reasons.append(extra)
+
+        rank = qscore + _strategy_rank_base(result["strategy"])
+        if ok:
+            rank += 1000
+
+        exits = _scalp_exits(entry_prem)
+        candidates.append((rank, {
+            **result,
+            "reasons": reasons,
+            "side": side,
+            "strike": strike,
+            "premium": round(entry_prem, 2),
+            "leg_oi": leg.get("oi", 0),
+            "leg_chg_oi": leg.get("chg_oi", 0),
+            "leg_volume": leg.get("volume", 0),
+            "exits": exits,
+            "alert_ready": ok,
+            "skip_reason": skip_reason,
+            "skip_label": _skip_reason_label(skip_reason),
+            "quality_score": rank,
+        }))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best = candidates[0][1]
+        return {
+            "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
+            "spot": round(spot, 2), "tech": tech, "oi": oi,
+            **best,
+            "all_triggered": all_triggered,
+        }
+
+    day_pct = float(tech.get("pct_change") or 0)
+    side = "CE" if day_pct >= 0 else "PE"
     strike, leg = _pick_scalp_strike(rows, spot, cfg["step"], side, cfg["prem_min"], cfg["prem_max"])
     entry_prem = float(leg.get("ltp") or 0)
     exits = _scalp_exits(entry_prem)
@@ -1270,12 +1472,29 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
     return {
         "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
         "spot": round(spot, 2), "tech": tech, "oi": oi,
-        **best,
-        "all_triggered": [t["strategy"] for t in triggered],
+        "strategy": "No strong setup", "side": side, "strength": "WEAK",
+        "layers": "0/4",
+        "reasons": ["No strategy triggered — low conviction"],
+        "win_rate": "N/A",
+        "all_triggered": [],
         "strike": strike, "premium": round(entry_prem, 2),
         "leg_oi": leg.get("oi", 0), "leg_chg_oi": leg.get("chg_oi", 0),
         "leg_volume": leg.get("volume", 0), "exits": exits,
+        "alert_ready": False,
+        "skip_reason": "no_setup",
+        "skip_label": _skip_reason_label("no_setup"),
     }
+
+
+def filter_entry_payload_for_user(payload: dict[str, Any], chat_id: int) -> dict[str, Any] | None:
+    """Respect /alert index prefs for /entry (None prefs = all indices)."""
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        return payload
+    indices = [r for r in payload["indices"] if r.get("nse") in prefs]
+    if not indices:
+        return None
+    return {**payload, "indices": indices}
 
 
 def build_all_entries() -> dict[str, Any]:
@@ -1391,6 +1610,10 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
     ex = r["exits"]
     vwap = tech.get("vwap")
     vwap_str = f"<code>{vwap}</code>" if vwap else "N/A"
+    adx = tech.get("adx")
+    adx_str = f"<code>{adx}</code>" if adx is not None else "N/A"
+    vix = tech.get("vix")
+    vix_str = f"<code>{vix:.1f}</code>" if vix is not None else "N/A"
 
     triggered_str = ""
     all_t = r.get("all_triggered") or []
@@ -1398,6 +1621,13 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
         triggered_str = " + ".join(all_t)
     else:
         triggered_str = r.get("strategy", "None")
+
+    if r.get("alert_ready"):
+        alert_line = "\u2705 <b>Would auto-alert</b> (passes quality filters)\n"
+    elif r.get("skip_label"):
+        alert_line = f"\u23ed\ufe0f <b>Won't auto-alert:</b> {html.escape(r['skip_label'])}\n"
+    else:
+        alert_line = ""
 
     reasons_html = "\n".join(
         f"  \u2023 {html.escape(x)}" for x in (r.get("reasons") or [])[:4]
@@ -1409,8 +1639,10 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
         f"{side_emoji} <b>{name}</b>  <code>{nse}</code>\n"
         f"{strat_emoji} <b>{r.get('strength', 'WEAK')}</b>"
         f"  \u00b7  {html.escape(triggered_str)}\n"
+        f"{alert_line}"
         f"\n"
         f"Spot <code>{r['spot']}</code>  \u00b7  VWAP {vwap_str}  \u00b7  "
+        f"ADX {adx_str}  \u00b7  VIX {vix_str}\n"
         f"PCR <code>{oi_data['pcr']}</code>  \u00b7  RSI <code>{tech.get('rsi', '-')}</code>\n"
         f"OI walls:  Sup <code>{oi_data['support']}</code>  \u00b7  "
         f"Res <code>{oi_data['resistance']}</code>\n"
@@ -1454,7 +1686,8 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
     for r in payload["indices"]:
         parts.append(_format_one_index_html(r))
     parts.append(
-        "<i>\u26a0\ufe0f Scalping only \u00b7 Not advice \u00b7 STRONG setups auto-alerted</i>"
+        "<i>\u26a0\ufe0f Scalping only \u00b7 Not advice \u00b7 "
+        "\u2705 setups pass same filters as auto-alerts</i>"
     )
     return "\n".join(parts).strip()
 
@@ -1487,6 +1720,35 @@ def _strike_close_ltp(
         if q["ltp"] > 0:
             return float(q["ltp"])
     return None
+
+
+def _get_alerts_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    con = sqlite3.connect(DB_FILE)
+    try:
+        rows = con.execute(
+            """SELECT id, nse_symbol, index_name, strategy, side, strike,
+                      entry_premium, sl_premium, t1_premium, t2_premium,
+                      spot_at_entry, expiry, alerted_at,
+                      close_premium, outcome, pnl_pts, summarized, alert_date
+               FROM fno_alerts
+               WHERE alert_date >= ? AND alert_date <= ?
+               ORDER BY alert_date, alerted_at""",
+            (start_date, end_date),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "nse_symbol": r[1], "index_name": r[2] or r[1],
+                "strategy": r[3], "side": r[4], "strike": r[5],
+                "entry_premium": r[6], "sl_premium": r[7],
+                "t1_premium": r[8], "t2_premium": r[9],
+                "spot_at_entry": r[10], "expiry": r[11], "alerted_at": r[12],
+                "close_premium": r[13], "outcome": r[14], "pnl_pts": r[15],
+                "summarized": r[16], "alert_date": r[17],
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
 
 
 def _get_today_alerts(unsummarized_only: bool = True) -> list[dict[str, Any]]:
@@ -1583,7 +1845,54 @@ def build_eod_summary() -> dict[str, Any] | None:
             _update_alert_result(alert["id"], close_ltp, outcome, pnl)
 
     all_trades = _get_today_alerts(unsummarized_only=False)
-    return _summary_stats(all_trades)
+    summary = _summary_stats(all_trades)
+    summary["scan_stats"] = get_scan_stats_for_date(
+        datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    )
+    return summary
+
+
+def build_period_summary(days: int = 7) -> dict[str, Any] | None:
+    """Win/loss + filter stats for the last N calendar days (incl. today)."""
+    ensure_fno_tables()
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    end_date = now.strftime("%Y-%m-%d")
+    start_date = (now - timedelta(days=max(1, days) - 1)).strftime("%Y-%m-%d")
+    trades = _get_alerts_between(start_date, end_date)
+    if not trades:
+        scan = get_scan_stats_range(start_date, end_date)
+        if scan.get("scan_cycles", 0) == 0:
+            return None
+    summary = _summary_stats(trades)
+    summary["period_days"] = days
+    summary["start_date"] = start_date
+    summary["end_date"] = end_date
+    summary["scan_stats"] = get_scan_stats_range(start_date, end_date)
+    # Per-day compact breakdown
+    by_day: dict[str, list] = {}
+    for t in trades:
+        by_day.setdefault(t["alert_date"], []).append(t)
+    summary["daily"] = []
+    d = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    while d <= end:
+        ds = d.strftime("%Y-%m-%d")
+        day_trades = by_day.get(ds, [])
+        day_stat = _summary_stats(day_trades) if day_trades else None
+        summary["daily"].append({
+            "date": ds,
+            "total": len(day_trades),
+            "wins": day_stat["wins"] if day_stat else 0,
+            "losses": day_stat["losses"] if day_stat else 0,
+            "win_rate": day_stat["win_rate"] if day_stat else 0.0,
+            "net_pts": day_stat["net_pts"] if day_stat else 0.0,
+        })
+        d += timedelta(days=1)
+    return summary
+
+
+async def build_period_summary_async(days: int = 7) -> dict[str, Any] | None:
+    return await asyncio.to_thread(build_period_summary, days)
 
 
 async def build_eod_summary_async() -> dict[str, Any] | None:
@@ -1597,7 +1906,44 @@ def filter_eod_summary_for_user(summary: dict[str, Any], chat_id: int) -> dict[s
     trades = [t for t in summary["trades"] if t.get("nse_symbol") in prefs]
     if not trades:
         return None
-    return _summary_stats(trades)
+    out = _summary_stats(trades)
+    out["scan_stats"] = summary.get("scan_stats")
+    out["as_of_ist"] = summary.get("as_of_ist")
+    return out
+
+
+def filter_period_summary_for_user(summary: dict[str, Any], chat_id: int) -> dict[str, Any] | None:
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        return summary
+    trades = [t for t in summary["trades"] if t.get("nse_symbol") in prefs]
+    if not trades:
+        return None
+    out = _summary_stats(trades)
+    for key in ("period_days", "start_date", "end_date", "scan_stats", "daily"):
+        if key in summary:
+            out[key] = summary[key]
+    if summary.get("daily"):
+        by_day: dict[str, list] = {}
+        for t in trades:
+            by_day.setdefault(t["alert_date"], []).append(t)
+        out["daily"] = []
+        for day in summary["daily"]:
+            ds = day["date"]
+            dt = by_day.get(ds, [])
+            if not dt:
+                out["daily"].append({**day, "total": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pts": 0.0})
+            else:
+                st = _summary_stats(dt)
+                out["daily"].append({
+                    "date": ds,
+                    "total": st["total"],
+                    "wins": st["wins"],
+                    "losses": st["losses"],
+                    "win_rate": st["win_rate"],
+                    "net_pts": st["net_pts"],
+                })
+    return out
 
 
 def _outcome_emoji(outcome: str) -> str:
@@ -1613,10 +1959,15 @@ def _outcome_emoji(outcome: str) -> str:
 
 
 def format_eod_summary_html(summary: dict[str, Any]) -> str:
+    scan_block = format_scan_stats_html(summary.get("scan_stats"), label="Today")
     lines = [
         "<b>\U0001f4ca DAILY F&amp;O TRADE SUMMARY</b>",
         f"<i>{html.escape(summary['as_of_ist'])}</i>",
         "",
+    ]
+    if scan_block:
+        lines.append(scan_block)
+    lines.extend([
         f"<b>Total alerts:</b> {summary['total']}",
         f"<b>Wins:</b> {summary['wins']}  \u00b7  <b>Losses:</b> {summary['losses']}",
         f"<b>Win rate:</b> {summary['win_rate']}%",
@@ -1625,7 +1976,7 @@ def format_eod_summary_html(summary: dict[str, Any]) -> str:
         "<i>P&amp;L based on premium at 3:30 PM close vs entry. "
         "Intraday T1/SL may have hit earlier.</i>",
         "",
-    ]
+    ])
 
     for t in summary["trades"]:
         em = _outcome_emoji(t["outcome"])
@@ -1643,6 +1994,59 @@ def format_eod_summary_html(summary: dict[str, Any]) -> str:
             + "\n"
         )
 
+    lines.append("")
+    lines.append("<i>\u26a0\ufe0f Paper-track only \u00b7 Not financial advice</i>")
+    return "\n".join(lines).strip()
+
+
+def format_period_summary_html(summary: dict[str, Any]) -> str:
+    """Weekly / multi-day summary with filter stats and per-day breakdown."""
+    days = summary.get("period_days", 7)
+    start = summary.get("start_date", "")
+    end = summary.get("end_date", "")
+    scan_block = format_scan_stats_html(
+        summary.get("scan_stats"),
+        label=f"{start} to {end}",
+    )
+    lines = [
+        f"<b>\U0001f4ca {days}-DAY F&amp;O SUMMARY</b>",
+        f"<i>{html.escape(start)} \u2192 {html.escape(end)}</i>",
+        "",
+    ]
+    if scan_block:
+        lines.append(scan_block)
+    lines.extend([
+        f"<b>Total alerts:</b> {summary['total']}",
+        f"<b>Wins:</b> {summary['wins']}  \u00b7  <b>Losses:</b> {summary['losses']}",
+        f"<b>Win rate:</b> {summary['win_rate']}%",
+        f"<b>Net premium P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b>",
+        "",
+        "<b>Daily breakdown:</b>",
+    ])
+    for day in summary.get("daily") or []:
+        if day["total"] == 0:
+            lines.append(f"  {day['date']}: —")
+        else:
+            lines.append(
+                f"  {day['date']}: {day['total']} alerts  \u00b7  "
+                f"WR {day['win_rate']}%  \u00b7  {day['net_pts']:+.1f} pts"
+            )
+    lines.extend([
+        "",
+        "<b>Recent trades:</b>",
+        "",
+    ])
+    for t in (summary.get("trades") or [])[-15:]:
+        em = _outcome_emoji(t.get("outcome") or "")
+        entry = float(t.get("entry_premium") or 0)
+        pnl = float(t.get("pnl_pts") or 0)
+        outcome = t.get("outcome") or "PENDING"
+        lines.append(
+            f"{em} {html.escape(t.get('alert_date', ''))} "
+            f"<b>{html.escape(t.get('index_name') or '')}</b> "
+            f"<code>{t.get('strike')} {t.get('side')}</code> "
+            f"{pnl:+.1f} pts \u00b7 {html.escape(outcome)}"
+        )
     lines.append("")
     lines.append("<i>\u26a0\ufe0f Paper-track only \u00b7 Not financial advice</i>")
     return "\n".join(lines).strip()

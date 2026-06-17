@@ -38,13 +38,17 @@ from market_service import (
 from market_backtest import run_backtest
 from fno_entry_service import (
     build_all_entries_async,
+    filter_entry_payload_for_user,
     format_entry_telegram_html,
     run_fno_monitor,
     run_fno_eod_summary,
     ensure_fno_tables,
     build_eod_summary_async,
+    build_period_summary_async,
     format_eod_summary_html,
+    format_period_summary_html,
     filter_eod_summary_for_user,
+    filter_period_summary_for_user,
     parse_index_tokens,
     set_user_alert_indices,
     clear_user_alert_indices,
@@ -284,8 +288,10 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 
 <b>📈 Market Commands:</b>
 /market — live market snapshot
-/entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
+/entry — F&amp;O scalp sheet (respects /alert indices, shows filter pass/fail)
 /summary — today's trade win/loss summary
+/summary week — last 7 days + filter stats
+/summaryweek — same as /summary week
 /alert — choose which index alerts (nifty, banknifty, …)
 /clearalert — reset to all indices
 /myalerts — show your alert filter
@@ -480,8 +486,10 @@ Reuses the same live message (no spam):
 
 <b>📈 MARKET</b>
 /market — live market snapshot
-/entry — F&amp;O scalp sheet (Confluence+ORB+PCR)
+/entry — F&amp;O scalp sheet (respects /alert indices, shows filter pass/fail)
 /summary — today's trade win/loss summary
+/summary week — last 7 days + filter stats
+/summaryweek — same as /summary week
 /alert — choose which index alerts (nifty, banknifty, …)
 /clearalert — reset to all indices
 /myalerts — show your alert filter
@@ -516,25 +524,37 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scalp entry/exit premiums for all index F&O. Owner only."""
+    """Scalp entry/exit premiums for index F&O. Owner only; respects /alert index prefs."""
     if not update.effective_message or not update.effective_user:
         return
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only feature. Use /enroll for Udemy courses.")
         return
-    await update.effective_message.reply_text("⏳ Scanning all indices (Confluence + ORB + PCR)...")
+    await update.effective_message.reply_text("⏳ Scanning indices (same filters as auto-alerts)...")
     payload = await build_all_entries_async()
+    payload = filter_entry_payload_for_user(payload, update.effective_chat.id)
+    if not payload:
+        await update.effective_message.reply_text(
+            "No indices match your /alert settings. Use /myalerts or /clearalert."
+        )
+        return
     text = format_entry_telegram_html(payload)
     await reply_html_chunked(update.effective_message, text)
 
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Today's F&O alert win/loss summary. Owner only."""
+    """Today's or weekly F&O alert win/loss summary. Owner only."""
     if not update.effective_message or not update.effective_user:
         return
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only feature.")
         return
+
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("week", "7d", "weekly", "7"):
+        await cmd_summaryweek(update, context)
+        return
+
     await update.effective_message.reply_text("⏳ Building today's trade summary...")
     summary = await build_eod_summary_async()
     if not summary:
@@ -547,6 +567,33 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     await reply_html_chunked(update.effective_message, format_eod_summary_html(user_summary))
+
+
+async def cmd_summaryweek(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Last 7 days F&O summary with filter stats. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
+        return
+    days = 7
+    if context.args:
+        try:
+            days = max(1, min(30, int(context.args[0])))
+        except ValueError:
+            pass
+    await update.effective_message.reply_text(f"⏳ Building last {days} days summary...")
+    summary = await build_period_summary_async(days)
+    if not summary:
+        await update.effective_message.reply_text("No F&O alert data for this period yet.")
+        return
+    user_summary = filter_period_summary_for_user(summary, update.effective_chat.id)
+    if not user_summary:
+        await update.effective_message.reply_text(
+            "No alerts in this period for your selected indices. Use /myalerts to check."
+        )
+        return
+    await reply_html_chunked(update.effective_message, format_period_summary_html(user_summary))
 
 
 async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1769,6 +1816,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("summaryweek", cmd_summaryweek))
     app.add_handler(CommandHandler("alert", cmd_alert))
     app.add_handler(CommandHandler("clearalert", cmd_clearalert))
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
