@@ -698,17 +698,17 @@ def _pick_scalp_strike(
 
 def _pick_aggressive_strike(
     rows: list[dict], spot: float, step: int,
-    side: str, safe_strike: int, prem_min: float,
+    side: str, safe_strike: int, safe_premium: float,
 ) -> tuple[int, dict[str, Any]] | None:
-    """Pick a cheaper OTM strike 1-3 steps beyond safe_strike for higher % leverage."""
+    """Pick a cheaper OTM strike 1-4 steps beyond safe_strike for higher % leverage."""
     by_strike = {int(r["strikePrice"]): r for r in rows}
-    min_ltp = max(8.0, prem_min * 0.12)
-    max_ltp = prem_min * 0.85
+    min_ltp = max(5.0, safe_premium * 0.10)
+    max_ltp = safe_premium * 0.75
 
     if side == "CE":
-        try_strikes = [safe_strike + i * step for i in range(1, 5)]
+        try_strikes = [safe_strike + i * step for i in range(1, 6)]
     else:
-        try_strikes = [safe_strike - i * step for i in range(1, 5)]
+        try_strikes = [safe_strike - i * step for i in range(1, 6)]
 
     best: tuple[int, dict[str, Any]] | None = None
     best_score = -999.0
@@ -722,9 +722,9 @@ def _pick_aggressive_strike(
             continue
         vol = int(q.get("volume") or 0)
         oi = int(q.get("oi") or 0)
-        if vol < 5 or oi < 50:
+        if vol < 2 or oi < 20:
             continue
-        score = vol * 3 + oi - abs(ltp - prem_min * 0.4) * 2
+        score = vol * 3 + oi - abs(ltp - safe_premium * 0.35) * 2
         if score > best_score:
             best_score = score
             best = (strike, q)
@@ -1345,7 +1345,7 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> tuple[list[di
         rank = qscore + _strategy_rank_base(result["strategy"])
 
         agg = _pick_aggressive_strike(
-            rows, spot, cfg["step"], side, strike, cfg["prem_min"],
+            rows, spot, cfg["step"], side, strike, entry_prem,
         )
         agg_data: dict[str, Any] | None = None
         if agg:
@@ -1488,7 +1488,7 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
         exits = _scalp_exits(entry_prem, cfg.get("lot", 0))
 
         agg = _pick_aggressive_strike(
-            rows, spot, cfg["step"], side, strike, cfg["prem_min"],
+            rows, spot, cfg["step"], side, strike, entry_prem,
         )
         agg_data: dict[str, Any] | None = None
         if agg:
