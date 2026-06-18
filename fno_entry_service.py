@@ -90,15 +90,15 @@ _vix_cache: tuple[float, float] | None = None
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
-     "step": 50, "prem_min": 55, "prem_max": 160},
+     "step": 50, "prem_min": 55, "prem_max": 160, "lot": 25},
     {"nse": "BANKNIFTY", "yahoo": "^NSEBANK", "name": "Bank Nifty",
-     "step": 100, "prem_min": 220, "prem_max": 520},
+     "step": 100, "prem_min": 220, "prem_max": 520, "lot": 15},
     {"nse": "FINNIFTY", "yahoo": "NIFTY_FIN_SERVICE.NS", "name": "Fin Nifty",
-     "step": 50, "prem_min": 120, "prem_max": 380},
+     "step": 50, "prem_min": 120, "prem_max": 380, "lot": 25},
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
-     "step": 25, "prem_min": 80, "prem_max": 260, "nse_only_fallback": True},
+     "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
     {"nse": "SENSEX", "yahoo": "^BSESN", "name": "Sensex",
-     "step": 100, "prem_min": 180, "prem_max": 550,
+     "step": 100, "prem_min": 180, "prem_max": 550, "lot": 10,
      "bse_scrip_cd": 1},
 ]
 
@@ -696,7 +696,43 @@ def _pick_scalp_strike(
     return candidates[0][0], candidates[0][1]
 
 
-def _scalp_exits(entry_premium: float) -> dict[str, float]:
+def _pick_aggressive_strike(
+    rows: list[dict], spot: float, step: int,
+    side: str, safe_strike: int, prem_min: float,
+) -> tuple[int, dict[str, Any]] | None:
+    """Pick a cheaper OTM strike 1-3 steps beyond safe_strike for higher % leverage."""
+    by_strike = {int(r["strikePrice"]): r for r in rows}
+    min_ltp = max(8.0, prem_min * 0.12)
+    max_ltp = prem_min * 0.85
+
+    if side == "CE":
+        try_strikes = [safe_strike + i * step for i in range(1, 5)]
+    else:
+        try_strikes = [safe_strike - i * step for i in range(1, 5)]
+
+    best: tuple[int, dict[str, Any]] | None = None
+    best_score = -999.0
+    for strike in try_strikes:
+        row = by_strike.get(strike)
+        if not row:
+            continue
+        q = _leg_quote(row, side)
+        ltp = q["ltp"]
+        if ltp < min_ltp or ltp > max_ltp or ltp <= 0:
+            continue
+        vol = int(q.get("volume") or 0)
+        oi = int(q.get("oi") or 0)
+        if vol < 5 or oi < 50:
+            continue
+        score = vol * 3 + oi - abs(ltp - prem_min * 0.4) * 2
+        if score > best_score:
+            best_score = score
+            best = (strike, q)
+
+    return best
+
+
+def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     prem = max(entry_premium, 5.0)
     s5_mult = 1.0 + FNO_SCALP_T5_PCT / 100.0
     s10_mult = 1.0 + FNO_SCALP_T10_PCT / 100.0
@@ -705,7 +741,8 @@ def _scalp_exits(entry_premium: float) -> dict[str, float]:
     s10 = round(prem * s10_mult, 2)
     t1 = round(prem * T1_MULT, 2)
     t2 = round(prem * T2_MULT, 2)
-    return {
+    lot = lot_size if lot_size > 0 else 1
+    d: dict[str, Any] = {
         "entry": round(prem, 2),
         "sl": sl, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
         "sl_pts": round(prem - sl, 2),
@@ -716,34 +753,53 @@ def _scalp_exits(entry_premium: float) -> dict[str, float]:
         "s5_pct": FNO_SCALP_T5_PCT,
         "s10_pct": FNO_SCALP_T10_PCT,
         "rr": round((t1 - prem) / (prem - sl), 1) if prem > sl else 0.0,
+        "lot": lot_size,
     }
+    if lot_size > 0:
+        d["sl_rs"] = round((prem - sl) * lot, 0)
+        d["s5_rs"] = round((s5 - prem) * lot, 0)
+        d["s10_rs"] = round((s10 - prem) * lot, 0)
+        d["t1_rs"] = round((t1 - prem) * lot, 0)
+        d["t2_rs"] = round((t2 - prem) * lot, 0)
+        d["capital"] = round(prem * lot, 0)
+    return d
 
 
 def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
     """Quick 5–10% scalp levels + T1/T2/SL block for alerts and /entry."""
     p5 = ex.get("s5_pct", FNO_SCALP_T5_PCT)
     p10 = ex.get("s10_pct", FNO_SCALP_T10_PCT)
+    has_lot = bool(ex.get("lot"))
+    s5_rs = f"  \u20b9{int(ex['s5_rs']):,}/lot" if has_lot else ""
+    s10_rs = f"  \u20b9{int(ex['s10_rs']):,}/lot" if has_lot else ""
+    t1_rs = f"  \u20b9{int(ex['t1_rs']):,}/lot" if has_lot else ""
+    t2_rs = f"  \u20b9{int(ex['t2_rs']):,}/lot" if has_lot else ""
+    sl_rs = f"  \u20b9{int(ex['sl_rs']):,}/lot" if has_lot else ""
     quick5 = (
         f"\u2502  \u26a1 <b>+{p5:.0f}%</b>  {_ru(ex['s5'])}"
-        f"  <i>+{ex['s5_pts']:.2f} pts"
+        f"  <i>+{ex['s5_pts']:.2f} pts{s5_rs}"
         + (" (book ~30%)</i>\n" if book_hints else "</i>\n")
     )
     quick10 = (
         f"\u2502  \u26a1 <b>+{p10:.0f}%</b>  {_ru(ex['s10'])}"
-        f"  <i>+{ex['s10_pts']:.2f} pts"
+        f"  <i>+{ex['s10_pts']:.2f} pts{s10_rs}"
         + (" (book ~20% more)</i>\n" if book_hints else "</i>\n")
     )
     t1_hint = " (book 50% of rest)" if book_hints else ""
     t2_hint = " (trail remainder)" if book_hints else ""
+    cap_line = ""
+    if has_lot:
+        cap_line = f"\u2502  \U0001f4b0 Capital: <b>\u20b9{int(ex['capital']):,}</b> per lot ({ex['lot']})\n"
     return (
         f"{quick5}{quick10}"
         f"\u2502\n"
         f"\u2502  \U0001f3af <b>T1  {_ru(ex['t1'])}</b>"
-        f"  <i>+{ex['t1_pts']:.2f} pts{t1_hint}</i>\n"
+        f"  <i>+{ex['t1_pts']:.2f} pts{t1_rs}{t1_hint}</i>\n"
         f"\u2502  \U0001f3af <b>T2  {_ru(ex['t2'])}</b>"
-        f"  <i>+{ex['t2_pts']:.2f} pts{t2_hint}</i>\n"
+        f"  <i>+{ex['t2_pts']:.2f} pts{t2_rs}{t2_hint}</i>\n"
         f"\u2502  \U0001f53b <b>SL  {_ru(ex['sl'])}</b>"
-        f"  <i>\u2212{ex['sl_pts']:.2f} pts (hard exit)</i>\n"
+        f"  <i>\u2212{ex['sl_pts']:.2f} pts{sl_rs} (hard exit)</i>\n"
+        f"{cap_line}"
         f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>  <i>(to T1 vs SL)</i>\n"
     )
 
@@ -1285,8 +1341,24 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> tuple[list[di
             if extra not in reasons:
                 reasons.append(extra)
 
-        exits = _scalp_exits(entry_prem)
+        exits = _scalp_exits(entry_prem, cfg.get("lot", 0))
         rank = qscore + _strategy_rank_base(result["strategy"])
+
+        agg = _pick_aggressive_strike(
+            rows, spot, cfg["step"], side, strike, cfg["prem_min"],
+        )
+        agg_data: dict[str, Any] | None = None
+        if agg:
+            agg_strike, agg_leg = agg
+            agg_prem = float(agg_leg.get("ltp") or 0)
+            if agg_prem > 0:
+                agg_data = {
+                    "strike": agg_strike,
+                    "premium": round(agg_prem, 2),
+                    "oi": agg_leg.get("oi", 0),
+                    "volume": agg_leg.get("volume", 0),
+                    "exits": _scalp_exits(agg_prem, cfg.get("lot", 0)),
+                }
 
         candidates.append((rank, {
             "name": cfg["name"],
@@ -1303,6 +1375,7 @@ def scan_index(cfg: dict[str, Any], nse: NSELive | None = None) -> tuple[list[di
             "leg_chg_oi": leg.get("chg_oi", 0),
             "leg_volume": leg.get("volume", 0),
             "exits": exits,
+            "aggressive": agg_data,
             "quality_score": rank,
         }))
 
@@ -1412,7 +1485,24 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
         if ok:
             rank += 1000
 
-        exits = _scalp_exits(entry_prem)
+        exits = _scalp_exits(entry_prem, cfg.get("lot", 0))
+
+        agg = _pick_aggressive_strike(
+            rows, spot, cfg["step"], side, strike, cfg["prem_min"],
+        )
+        agg_data: dict[str, Any] | None = None
+        if agg:
+            agg_strike, agg_leg = agg
+            agg_prem = float(agg_leg.get("ltp") or 0)
+            if agg_prem > 0:
+                agg_data = {
+                    "strike": agg_strike,
+                    "premium": round(agg_prem, 2),
+                    "oi": agg_leg.get("oi", 0),
+                    "volume": agg_leg.get("volume", 0),
+                    "exits": _scalp_exits(agg_prem, cfg.get("lot", 0)),
+                }
+
         candidates.append((rank, {
             **result,
             "reasons": reasons,
@@ -1423,6 +1513,7 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
             "leg_chg_oi": leg.get("chg_oi", 0),
             "leg_volume": leg.get("volume", 0),
             "exits": exits,
+            "aggressive": agg_data,
             "alert_ready": ok,
             "skip_reason": skip_reason,
             "skip_label": _skip_reason_label(skip_reason),
@@ -1443,7 +1534,7 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
     side = "CE" if day_pct >= 0 else "PE"
     strike, leg = _pick_scalp_strike(rows, spot, cfg["step"], side, cfg["prem_min"], cfg["prem_max"])
     entry_prem = float(leg.get("ltp") or 0)
-    exits = _scalp_exits(entry_prem)
+    exits = _scalp_exits(entry_prem, cfg.get("lot", 0))
 
     return {
         "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
@@ -1456,6 +1547,7 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
         "strike": strike, "premium": round(entry_prem, 2),
         "leg_oi": leg.get("oi", 0), "leg_chg_oi": leg.get("chg_oi", 0),
         "leg_volume": leg.get("volume", 0), "exits": exits,
+        "aggressive": None,
         "alert_ready": False,
         "skip_reason": "no_setup",
         "skip_label": _skip_reason_label("no_setup"),
@@ -1510,6 +1602,41 @@ def _strategy_emoji(strategy: str) -> str:
     return "\u26a1"
 
 
+def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
+    """Render the aggressive OTM option block if available."""
+    agg = signal.get("aggressive")
+    if not agg:
+        return ""
+    aex = agg["exits"]
+    has_lot = bool(aex.get("lot"))
+    s5_rs = f"  \u20b9{int(aex['s5_rs']):,}" if has_lot else ""
+    t1_rs = f"  \u20b9{int(aex['t1_rs']):,}" if has_lot else ""
+    cap_line = ""
+    if has_lot:
+        cap_line = (
+            f"\u2502  \U0001f4b0 Capital: <b>\u20b9{int(aex['capital']):,}</b>/lot"
+            f"  vs  \u20b9{int(signal['exits']['capital']):,}/lot (safe)\n"
+        )
+    return (
+        f"\n\U0001f4a5 <b>AGGRESSIVE (deeper OTM, higher leverage)</b>\n"
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+        f"\u2502  \U0001f4cc <b>ENTRY</b>  <code>{agg['strike']} {side}</code>"
+        f"  @  <b>{_ru(aex['entry'])}</b>\n"
+        f"\u2502  OI <code>{agg['oi']:,}</code>"
+        f" \u00b7 Vol <code>{agg['volume']:,}</code>\n"
+        f"{cap_line}"
+        f"\u2502\n"
+        f"\u2502  \u26a1 <b>+5%</b>  {_ru(aex['s5'])}  <i>+{aex['s5_pts']:.2f}{s5_rs}</i>\n"
+        f"\u2502  \u26a1 <b>+10%</b>  {_ru(aex['s10'])}  <i>+{aex['s10_pts']:.2f}</i>\n"
+        f"\u2502  \U0001f3af <b>T1</b>  {_ru(aex['t1'])}  <i>+{aex['t1_pts']:.2f}{t1_rs}</i>"
+        f"  \u00b7  \U0001f53b <b>SL</b> {_ru(aex['sl'])}\n"
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
+        f"<i>\u26a0\ufe0f Cheaper premium = bigger % swings both ways. Higher risk.</i>\n"
+    )
+
+
 def format_alert_html(signal: dict[str, Any]) -> str:
     """Format a single auto-alert message for Telegram."""
     name = html.escape(signal["name"])
@@ -1559,6 +1686,7 @@ def format_alert_html(signal: dict[str, Any]) -> str:
         f"\n"
         f"<b>Why this setup:</b>\n"
         f"{reasons_html}\n"
+        f"{_format_aggressive_html(signal, side)}"
         f"\n"
         f"<i>\u26a0\ufe0f Scalping only \u00b7 Hard SL \u00b7 No averaging \u00b7 Not advice</i>"
     )
@@ -1633,6 +1761,7 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
         f"{reasons_html}\n"
+        f"{_format_aggressive_html(r, side)}"
     )
 
 
