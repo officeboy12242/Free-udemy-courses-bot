@@ -97,9 +97,6 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 50, "prem_min": 120, "prem_max": 380, "lot": 25},
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
      "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
-    {"nse": "SENSEX", "yahoo": "^BSESN", "name": "Sensex",
-     "step": 100, "prem_min": 180, "prem_max": 550, "lot": 10,
-     "bse_scrip_cd": 1},
 ]
 
 SL_MULT = 0.86
