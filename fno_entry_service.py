@@ -83,6 +83,7 @@ FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true
 FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "0"))
 FNO_MACD_MTF_ENABLED = os.getenv("FNO_MACD_MTF_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 FNO_MACD_REQUIRE_5M = os.getenv("FNO_MACD_REQUIRE_5M", "1").strip().lower() in ("1", "true", "yes")
+FNO_PAPER_CAPITAL = float(os.getenv("FNO_PAPER_CAPITAL", "50000"))
 
 # In-memory cache: yahoo_symbol -> (timestamp, tech dict)
 _intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -102,6 +103,20 @@ FNO_INDICES: list[dict[str, Any]] = [
 SL_MULT = 0.86
 T1_MULT = 1.20
 T2_MULT = 1.35
+
+_LOT_BY_NSE: dict[str, int] = {cfg["nse"]: cfg.get("lot", 1) for cfg in FNO_INDICES}
+
+
+def _lot_size(nse_symbol: str) -> int:
+    return _LOT_BY_NSE.get(nse_symbol, 25)
+
+
+def _lots_for_capital(capital: float, premium: float, lot_size: int) -> int:
+    """Max lots affordable with given capital."""
+    cost_per_lot = premium * lot_size
+    if cost_per_lot <= 0:
+        return 0
+    return max(1, int(capital // cost_per_lot))
 FNO_SCALP_T5_PCT = float(os.getenv("FNO_SCALP_T5_PCT", "5"))
 FNO_SCALP_T10_PCT = float(os.getenv("FNO_SCALP_T10_PCT", "10"))
 
@@ -1927,6 +1942,25 @@ def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         sum(float(r.get("pnl_pts") or 0) for r in results if r.get("outcome") != "NO DATA"),
         2,
     )
+
+    net_rupees = 0.0
+    capital = FNO_PAPER_CAPITAL
+    trade_details: list[dict[str, Any]] = []
+    for r in results:
+        pnl = float(r.get("pnl_pts") or 0)
+        outcome = r.get("outcome") or ""
+        if outcome == "NO DATA":
+            trade_details.append({**r, "lots": 0, "pnl_rs": 0.0, "capital_used": 0.0})
+            continue
+        sym = r.get("nse_symbol") or ""
+        lot = _lot_size(sym)
+        entry = float(r.get("entry_premium") or 0)
+        lots = _lots_for_capital(capital, entry, lot) if entry > 0 else 0
+        pnl_rs = round(pnl * lot * lots, 2)
+        cap_used = round(entry * lot * lots, 2)
+        net_rupees += pnl_rs
+        trade_details.append({**r, "lots": lots, "pnl_rs": pnl_rs, "capital_used": cap_used})
+
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     return {
         "date": now.strftime("%Y-%m-%d"),
@@ -1936,7 +1970,10 @@ def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "losses": losses,
         "win_rate": win_rate,
         "net_pts": net_pts,
-        "trades": results,
+        "net_rupees": round(net_rupees, 2),
+        "capital": FNO_PAPER_CAPITAL,
+        "final_balance": round(FNO_PAPER_CAPITAL + net_rupees, 2),
+        "trades": trade_details,
     }
 
 
@@ -2010,6 +2047,7 @@ def build_period_summary(days: int = 7) -> dict[str, Any] | None:
             "losses": day_stat["losses"] if day_stat else 0,
             "win_rate": day_stat["win_rate"] if day_stat else 0.0,
             "net_pts": day_stat["net_pts"] if day_stat else 0.0,
+            "net_rupees": day_stat["net_rupees"] if day_stat else 0.0,
         })
         d += timedelta(days=1)
     return summary
@@ -2086,21 +2124,32 @@ def _outcome_emoji(outcome: str) -> str:
 
 def format_eod_summary_html(summary: dict[str, Any]) -> str:
     scan_block = format_scan_stats_html(summary.get("scan_stats"), label="Today")
+    capital = summary.get("capital", FNO_PAPER_CAPITAL)
+    net_rs = summary.get("net_rupees", 0.0)
+    final = summary.get("final_balance", capital + net_rs)
+    pnl_sign = "+" if net_rs >= 0 else ""
+    pnl_emoji = "\U0001f4b0" if net_rs >= 0 else "\U0001f4c9"
+
     lines = [
-        "<b>\U0001f4ca DAILY F&amp;O TRADE SUMMARY</b>",
+        "<b>\U0001f4ca DAILY F&amp;O PAPER TRADE SUMMARY</b>",
         f"<i>{html.escape(summary['as_of_ist'])}</i>",
         "",
     ]
     if scan_block:
         lines.append(scan_block)
+
     lines.extend([
+        f"\u250c\u2500\u2500\u2500\u2500\u2500 \U0001f4b5 PORTFOLIO \u2500\u2500\u2500\u2500\u2500\u2510",
+        f"\u2502  Starting Capital:  <b>\u20b9{capital:,.0f}</b>",
+        f"\u2502  Day P&amp;L:          <b>{pnl_sign}\u20b9{abs(net_rs):,.0f}</b> {pnl_emoji}",
+        f"\u2502  Final Balance:     <b>\u20b9{final:,.0f}</b>",
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518",
+        "",
         f"<b>Total alerts:</b> {summary['total']}",
         f"<b>Wins:</b> {summary['wins']}  \u00b7  <b>Losses:</b> {summary['losses']}",
         f"<b>Win rate:</b> {summary['win_rate']}%",
-        f"<b>Net premium P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b> (at close)",
-        "",
-        "<i>P&amp;L based on premium at 3:30 PM close vs entry. "
-        "Intraday T1/SL may have hit earlier.</i>",
+        f"<b>Net P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b>  \u00b7  <b>{pnl_sign}\u20b9{abs(net_rs):,.0f}</b>",
         "",
     ])
 
@@ -2109,24 +2158,28 @@ def format_eod_summary_html(summary: dict[str, Any]) -> str:
         entry = float(t["entry_premium"] or 0)
         close = float(t["close_premium"] or 0)
         pnl = float(t["pnl_pts"] or 0)
+        lots = int(t.get("lots") or 0)
+        pnl_rs = float(t.get("pnl_rs") or 0)
         time_part = (t.get("alerted_at") or "")[11:16]
+        rs_str = f"  \u20b9{pnl_rs:+,.0f}" if lots > 0 else ""
+        lot_str = f" ({lots}L)" if lots > 0 else ""
         lines.append(
             f"{em} <b>{html.escape(t['index_name'])}</b> "
-            f"<code>{t['strike']} {t['side']}</code>\n"
+            f"<code>{t['strike']} {t['side']}</code>{lot_str}\n"
             f"   {html.escape(t['strategy'][:28])}\n"
             f"   Entry <b>{_ru(entry)}</b> \u2192 Close <b>{_ru(close) if close else 'N/A'}</b> "
-            f"({pnl:+.2f} pts) \u00b7 <b>{html.escape(t['outcome'])}</b>"
+            f"({pnl:+.2f} pts{rs_str}) \u00b7 <b>{html.escape(t['outcome'])}</b>"
             + (f" \u00b7 {time_part}" if time_part else "")
             + "\n"
         )
 
     lines.append("")
-    lines.append("<i>\u26a0\ufe0f Paper-track only \u00b7 Not financial advice</i>")
+    lines.append(f"<i>\u26a0\ufe0f Paper trade with \u20b9{capital:,.0f} capital \u00b7 Not financial advice</i>")
     return "\n".join(lines).strip()
 
 
 def format_period_summary_html(summary: dict[str, Any]) -> str:
-    """Weekly / multi-day summary with filter stats and per-day breakdown."""
+    """Weekly / multi-day summary with portfolio growth and per-day breakdown."""
     days = summary.get("period_days", 7)
     start = summary.get("start_date", "")
     end = summary.get("end_date", "")
@@ -2134,28 +2187,49 @@ def format_period_summary_html(summary: dict[str, Any]) -> str:
         summary.get("scan_stats"),
         label=f"{start} to {end}",
     )
+    capital = summary.get("capital", FNO_PAPER_CAPITAL)
+    net_rs = summary.get("net_rupees", 0.0)
+    final = summary.get("final_balance", capital + net_rs)
+    pnl_sign = "+" if net_rs >= 0 else ""
+    ret_pct = round(net_rs / capital * 100, 1) if capital > 0 else 0.0
+
     lines = [
-        f"<b>\U0001f4ca {days}-DAY F&amp;O SUMMARY</b>",
+        f"<b>\U0001f4ca {days}-DAY F&amp;O PAPER TRADE SUMMARY</b>",
         f"<i>{html.escape(start)} \u2192 {html.escape(end)}</i>",
         "",
     ]
     if scan_block:
         lines.append(scan_block)
+
     lines.extend([
+        f"\u250c\u2500\u2500\u2500\u2500\u2500 \U0001f4b5 PORTFOLIO \u2500\u2500\u2500\u2500\u2500\u2510",
+        f"\u2502  Starting Capital:  <b>\u20b9{capital:,.0f}</b>",
+        f"\u2502  {days}-Day P&amp;L:      <b>{pnl_sign}\u20b9{abs(net_rs):,.0f}</b>"
+        f"  ({pnl_sign}{abs(ret_pct):.1f}%)",
+        f"\u2502  Current Balance:   <b>\u20b9{final:,.0f}</b>",
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518",
+        "",
         f"<b>Total alerts:</b> {summary['total']}",
         f"<b>Wins:</b> {summary['wins']}  \u00b7  <b>Losses:</b> {summary['losses']}",
         f"<b>Win rate:</b> {summary['win_rate']}%",
-        f"<b>Net premium P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b>",
+        f"<b>Net P&amp;L:</b> <b>{summary['net_pts']:+.2f} pts</b>  \u00b7  <b>{pnl_sign}\u20b9{abs(net_rs):,.0f}</b>",
         "",
         "<b>Daily breakdown:</b>",
     ])
+    running = capital
     for day in summary.get("daily") or []:
+        day_rs = float(day.get("net_rupees") or 0)
+        running += day_rs
         if day["total"] == 0:
-            lines.append(f"  {day['date']}: —")
+            lines.append(f"  {day['date']}: \u2014  (bal \u20b9{running:,.0f})")
         else:
+            d_sign = "+" if day_rs >= 0 else ""
             lines.append(
-                f"  {day['date']}: {day['total']} alerts  \u00b7  "
+                f"  {day['date']}: {day['total']} trades  \u00b7  "
                 f"WR {day['win_rate']}%  \u00b7  {day['net_pts']:+.1f} pts"
+                f"  \u00b7  {d_sign}\u20b9{abs(day_rs):,.0f}"
+                f"  \u2192  \u20b9{running:,.0f}"
             )
     lines.extend([
         "",
@@ -2166,15 +2240,18 @@ def format_period_summary_html(summary: dict[str, Any]) -> str:
         em = _outcome_emoji(t.get("outcome") or "")
         entry = float(t.get("entry_premium") or 0)
         pnl = float(t.get("pnl_pts") or 0)
+        pnl_rs = float(t.get("pnl_rs") or 0)
+        lots = int(t.get("lots") or 0)
         outcome = t.get("outcome") or "PENDING"
+        rs_str = f"  \u20b9{pnl_rs:+,.0f}" if lots > 0 else ""
         lines.append(
             f"{em} {html.escape(t.get('alert_date', ''))} "
             f"<b>{html.escape(t.get('index_name') or '')}</b> "
             f"<code>{t.get('strike')} {t.get('side')}</code> "
-            f"{pnl:+.1f} pts \u00b7 {html.escape(outcome)}"
+            f"{pnl:+.1f} pts{rs_str} \u00b7 {html.escape(outcome)}"
         )
     lines.append("")
-    lines.append("<i>\u26a0\ufe0f Paper-track only \u00b7 Not financial advice</i>")
+    lines.append(f"<i>\u26a0\ufe0f Paper trade with \u20b9{capital:,.0f} capital \u00b7 Not financial advice</i>")
     return "\n".join(lines).strip()
 
 
