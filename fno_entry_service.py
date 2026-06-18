@@ -90,6 +90,8 @@ FNO_INDICES: list[dict[str, Any]] = [
 SL_MULT = 0.86
 T1_MULT = 1.20
 T2_MULT = 1.35
+FNO_SCALP_T5_PCT = float(os.getenv("FNO_SCALP_T5_PCT", "5"))
+FNO_SCALP_T10_PCT = float(os.getenv("FNO_SCALP_T10_PCT", "10"))
 
 STRATEGY_CONFLUENCE = "EMA+RSI+OI+VWAP Confluence"
 STRATEGY_ORB = "ORB (Opening Range Breakout)"
@@ -859,17 +861,54 @@ def _pick_scalp_strike(
 
 def _scalp_exits(entry_premium: float) -> dict[str, float]:
     prem = max(entry_premium, 5.0)
+    s5_mult = 1.0 + FNO_SCALP_T5_PCT / 100.0
+    s10_mult = 1.0 + FNO_SCALP_T10_PCT / 100.0
     sl = round(prem * SL_MULT, 2)
+    s5 = round(prem * s5_mult, 2)
+    s10 = round(prem * s10_mult, 2)
     t1 = round(prem * T1_MULT, 2)
     t2 = round(prem * T2_MULT, 2)
     return {
         "entry": round(prem, 2),
-        "sl": sl, "t1": t1, "t2": t2,
+        "sl": sl, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
         "sl_pts": round(prem - sl, 2),
+        "s5_pts": round(s5 - prem, 2),
+        "s10_pts": round(s10 - prem, 2),
         "t1_pts": round(t1 - prem, 2),
         "t2_pts": round(t2 - prem, 2),
+        "s5_pct": FNO_SCALP_T5_PCT,
+        "s10_pct": FNO_SCALP_T10_PCT,
         "rr": round((t1 - prem) / (prem - sl), 1) if prem > sl else 0.0,
     }
+
+
+def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
+    """Quick 5–10% scalp levels + T1/T2/SL block for alerts and /entry."""
+    p5 = ex.get("s5_pct", FNO_SCALP_T5_PCT)
+    p10 = ex.get("s10_pct", FNO_SCALP_T10_PCT)
+    quick5 = (
+        f"\u2502  \u26a1 <b>+{p5:.0f}%</b>  {_ru(ex['s5'])}"
+        f"  <i>+{ex['s5_pts']:.2f} pts"
+        + (" (book ~30%)</i>\n" if book_hints else "</i>\n")
+    )
+    quick10 = (
+        f"\u2502  \u26a1 <b>+{p10:.0f}%</b>  {_ru(ex['s10'])}"
+        f"  <i>+{ex['s10_pts']:.2f} pts"
+        + (" (book ~20% more)</i>\n" if book_hints else "</i>\n")
+    )
+    t1_hint = " (book 50% of rest)" if book_hints else ""
+    t2_hint = " (trail remainder)" if book_hints else ""
+    return (
+        f"{quick5}{quick10}"
+        f"\u2502\n"
+        f"\u2502  \U0001f3af <b>T1  {_ru(ex['t1'])}</b>"
+        f"  <i>+{ex['t1_pts']:.2f} pts{t1_hint}</i>\n"
+        f"\u2502  \U0001f3af <b>T2  {_ru(ex['t2'])}</b>"
+        f"  <i>+{ex['t2_pts']:.2f} pts{t2_hint}</i>\n"
+        f"\u2502  \U0001f53b <b>SL  {_ru(ex['sl'])}</b>"
+        f"  <i>\u2212{ex['sl_pts']:.2f} pts (hard exit)</i>\n"
+        f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>  <i>(to T1 vs SL)</i>\n"
+    )
 
 
 # ════════════════════ STRATEGY 1: Confluence ════════════════════
@@ -1748,13 +1787,7 @@ def format_alert_html(signal: dict[str, Any]) -> str:
         f" \u00b7 Vol <code>{signal['leg_volume']:,}</code>\n"
         f"\u2502  \U0001f4c5 Expiry <code>{html.escape(signal['expiry'])}</code>\n"
         f"\u2502\n"
-        f"\u2502  \U0001f3af <b>T1  {_ru(ex['t1'])}</b>"
-        f"  <i>+{ex['t1_pts']:.2f} pts (book 50%)</i>\n"
-        f"\u2502  \U0001f3af <b>T2  {_ru(ex['t2'])}</b>"
-        f"  <i>+{ex['t2_pts']:.2f} pts (trail rest)</i>\n"
-        f"\u2502  \U0001f53b <b>SL  {_ru(ex['sl'])}</b>"
-        f"  <i>\u2212{ex['sl_pts']:.2f} pts (hard exit)</i>\n"
-        f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>\n"
+        f"{_exit_targets_html(ex)}"
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
@@ -1829,10 +1862,7 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
         f" \u00b7 Vol <code>{r['leg_volume']:,}</code>\n"
         f"\u2502  \U0001f4c5 Expiry  <code>{html.escape(r['expiry'])}</code>\n"
         f"\u2502\n"
-        f"\u2502  \U0001f3af <b>T1  {_ru(ex['t1'])}</b>  <i>+{ex['t1_pts']:.2f} pts</i>\n"
-        f"\u2502  \U0001f3af <b>T2  {_ru(ex['t2'])}</b>  <i>+{ex['t2_pts']:.2f} pts</i>\n"
-        f"\u2502  \U0001f53b <b>SL  {_ru(ex['sl'])}</b>  <i>\u2212{ex['sl_pts']:.2f} pts</i>\n"
-        f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>\n"
+        f"{_exit_targets_html(ex, book_hints=False)}"
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
@@ -1853,7 +1883,7 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
         "<b>Strategies:</b> Confluence + ORB + PCR + MACD MTF",
         f"<i>Updated {html.escape(payload['as_of_ist'])}</i>",
         "",
-        "Book 50% at T1 \u00b7 trail rest to T2 \u00b7 hard SL \u00b7 no averaging",
+        "Quick book +5% / +10% \u00b7 then 50% at T1 (+20%) \u00b7 trail rest to T2 (+35%) \u00b7 hard SL",
         "",
     ]
     for r in payload["indices"]:
@@ -1868,12 +1898,18 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
 # ════════════════════ EOD trade summary ════════════════════
 
 def _classify_outcome(entry: float, sl: float, t1: float, t2: float, close_ltp: float) -> tuple[str, float]:
-    """Return (outcome_label, pnl_pts) based on close premium vs entry/SL/T1/T2."""
+    """Return (outcome_label, pnl_pts) based on close premium vs entry/SL/targets."""
     pnl = round(close_ltp - entry, 2)
+    s5 = round(entry * (1.0 + FNO_SCALP_T5_PCT / 100.0), 2)
+    s10 = round(entry * (1.0 + FNO_SCALP_T10_PCT / 100.0), 2)
     if close_ltp >= t2:
         return "T2 WIN", pnl
     if close_ltp >= t1:
         return "T1 WIN", pnl
+    if close_ltp >= s10:
+        return "SCALP 10%", pnl
+    if close_ltp >= s5:
+        return "SCALP 5%", pnl
     if close_ltp <= sl:
         return "SL LOSS", pnl
     if pnl > 0:
@@ -1955,7 +1991,9 @@ def _get_today_alerts(unsummarized_only: bool = True) -> list[dict[str, Any]]:
 
 
 def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
-    wins = sum(1 for r in results if r.get("outcome") in ("T1 WIN", "T2 WIN", "PARTIAL WIN"))
+    wins = sum(1 for r in results if r.get("outcome") in (
+        "T1 WIN", "T2 WIN", "PARTIAL WIN", "SCALP 5%", "SCALP 10%",
+    ))
     losses = sum(1 for r in results if r.get("outcome") in ("SL LOSS", "PARTIAL LOSS"))
     decided = wins + losses
     win_rate = round(wins / decided * 100, 1) if decided else 0.0
@@ -2123,6 +2161,8 @@ def _outcome_emoji(outcome: str) -> str:
     return {
         "T2 WIN": "\U0001f7e2",
         "T1 WIN": "\U0001f7e2",
+        "SCALP 10%": "\U0001f7e1",
+        "SCALP 5%": "\U0001f7e1",
         "PARTIAL WIN": "\U0001f7e1",
         "FLAT": "\u26aa",
         "PARTIAL LOSS": "\U0001f7e0",
