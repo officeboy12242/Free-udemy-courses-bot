@@ -700,31 +700,34 @@ def _pick_aggressive_strike(
     rows: list[dict], spot: float, step: int,
     side: str, safe_strike: int, safe_premium: float,
 ) -> tuple[int, dict[str, Any]] | None:
-    """Pick a cheaper OTM strike 1-4 steps beyond safe_strike for higher % leverage."""
+    """Pick a near-ATM / slight-ITM strike with higher delta for more pts per index move."""
+    atm = _round_strike(spot, step)
     by_strike = {int(r["strikePrice"]): r for r in rows}
-    min_ltp = max(5.0, safe_premium * 0.10)
-    max_ltp = safe_premium * 0.75
+    min_ltp = safe_premium * 1.25
 
     if side == "CE":
-        try_strikes = [safe_strike + i * step for i in range(1, 6)]
+        try_strikes = [atm + i * step for i in (0, -1, -2, 1, -3)]
     else:
-        try_strikes = [safe_strike - i * step for i in range(1, 6)]
+        try_strikes = [atm + i * step for i in (0, 1, 2, -1, 3)]
 
     best: tuple[int, dict[str, Any]] | None = None
     best_score = -999.0
     for strike in try_strikes:
+        if strike == safe_strike:
+            continue
         row = by_strike.get(strike)
         if not row:
             continue
         q = _leg_quote(row, side)
         ltp = q["ltp"]
-        if ltp < min_ltp or ltp > max_ltp or ltp <= 0:
+        if ltp < min_ltp or ltp <= 0:
             continue
         vol = int(q.get("volume") or 0)
         oi = int(q.get("oi") or 0)
         if vol < 2 or oi < 20:
             continue
-        score = vol * 3 + oi - abs(ltp - safe_premium * 0.35) * 2
+        closeness = -abs(strike - atm)
+        score = closeness * 10 + vol * 2 + oi
         if score > best_score:
             best_score = score
             best = (strike, q)
@@ -1603,7 +1606,7 @@ def _strategy_emoji(strategy: str) -> str:
 
 
 def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
-    """Render the aggressive OTM option block if available."""
+    """Render the aggressive near-ATM option block if available."""
     agg = signal.get("aggressive")
     if not agg:
         return ""
@@ -1618,7 +1621,7 @@ def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
             f"  vs  \u20b9{int(signal['exits']['capital']):,}/lot (safe)\n"
         )
     return (
-        f"\n\U0001f4a5 <b>AGGRESSIVE (deeper OTM, higher leverage)</b>\n"
+        f"\n\U0001f4a5 <b>AGGRESSIVE (near ATM, higher delta)</b>\n"
         f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
         f"\u2502  \U0001f4cc <b>ENTRY</b>  <code>{agg['strike']} {side}</code>"
@@ -1633,7 +1636,7 @@ def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
         f"  \u00b7  \U0001f53b <b>SL</b> {_ru(aex['sl'])}\n"
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
-        f"<i>\u26a0\ufe0f Cheaper premium = bigger % swings both ways. Higher risk.</i>\n"
+        f"<i>\u26a0\ufe0f Higher premium \u00b7 moves more pts per index point \u00b7 needs more capital</i>\n"
     )
 
 
