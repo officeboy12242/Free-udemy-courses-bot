@@ -34,7 +34,6 @@ import html
 import logging
 import math
 import os
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -46,13 +45,29 @@ from dotenv import load_dotenv
 from jugaad_data.nse import NSELive
 
 from bse_option_service import parse_bse_option_chain
+from fno_storage import (
+    already_alerted as _already_alerted,
+    clear_user_alert_indices,
+    eod_summary_sent_today as _eod_summary_sent_today,
+    ensure_fno_storage,
+    get_alerts_between as _get_alerts_between,
+    get_scan_stats_for_date,
+    get_scan_stats_range,
+    get_today_alerts as _get_today_alerts,
+    get_user_alert_indices,
+    mark_eod_summary_sent as _mark_eod_summary_sent,
+    record_alert as _record_alert,
+    record_scan_stats as _record_scan_stats,
+    set_user_alert_indices,
+    storage_backend_label,
+    update_alert_result as _update_alert_result,
+)
 from market_service import get_all_subscribers, remove_subscriber
 
 load_dotenv()
 
 log = logging.getLogger(__name__)
 
-DB_FILE = os.getenv("DB_FILE", "posted_courses.db")
 FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
 # Stricter filters for auto-alerts; /entry shows all setups + pass/fail vs same filters
@@ -122,105 +137,11 @@ NSE_TO_NAME: dict[str, str] = {c["nse"]: c["name"] for c in FNO_INDICES}
 ALL_NSE_SYMBOLS: frozenset[str] = frozenset(c["nse"] for c in FNO_INDICES)
 
 
-# ════════════════════ DB for alert de-dupe ════════════════════
+# ════════════════════ DB for alert de-dupe (MongoDB or SQLite via fno_storage) ════════════════════
 
 def ensure_fno_tables():
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS fno_alerts (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                alert_date      TEXT NOT NULL,
-                nse_symbol      TEXT NOT NULL,
-                index_name      TEXT,
-                strategy        TEXT NOT NULL,
-                side            TEXT NOT NULL,
-                strike          INTEGER,
-                entry_premium   REAL,
-                sl_premium      REAL,
-                t1_premium      REAL,
-                t2_premium      REAL,
-                spot_at_entry   REAL,
-                expiry          TEXT,
-                alerted_at      TEXT,
-                close_premium   REAL,
-                outcome         TEXT,
-                pnl_pts         REAL,
-                summarized      INTEGER DEFAULT 0
-            )
-        """)
-        for col, typ in (
-            ("index_name", "TEXT"),
-            ("entry_premium", "REAL"),
-            ("sl_premium", "REAL"),
-            ("t1_premium", "REAL"),
-            ("t2_premium", "REAL"),
-            ("spot_at_entry", "REAL"),
-            ("expiry", "TEXT"),
-            ("close_premium", "REAL"),
-            ("outcome", "TEXT"),
-            ("pnl_pts", "REAL"),
-            ("summarized", "INTEGER DEFAULT 0"),
-        ):
-            try:
-                con.execute(f"ALTER TABLE fno_alerts ADD COLUMN {col} {typ}")
-            except Exception:
-                pass
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS fno_eod_sent (
-                alert_date  TEXT PRIMARY KEY,
-                sent_at     TEXT NOT NULL
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS fno_alert_prefs (
-                chat_id     INTEGER NOT NULL,
-                nse_symbol  TEXT NOT NULL,
-                PRIMARY KEY (chat_id, nse_symbol)
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS fno_scan_stats (
-                alert_date      TEXT PRIMARY KEY,
-                setups          INTEGER DEFAULT 0,
-                sent            INTEGER DEFAULT 0,
-                skip_quality    INTEGER DEFAULT 0,
-                skip_dedupe     INTEGER DEFAULT 0,
-                skip_premium    INTEGER DEFAULT 0,
-                scan_cycles     INTEGER DEFAULT 0
-            )
-        """)
-        today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-        con.execute("DELETE FROM fno_alerts WHERE alert_date != ? AND summarized = 1", (today,))
-        con.commit()
-    finally:
-        con.close()
-
-
-def _eod_summary_sent_today() -> bool:
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    con = sqlite3.connect(DB_FILE)
-    try:
-        row = con.execute(
-            "SELECT 1 FROM fno_eod_sent WHERE alert_date = ?", (today,)
-        ).fetchone()
-        return row is not None
-    finally:
-        con.close()
-
-
-def _mark_eod_summary_sent():
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute(
-            "INSERT OR REPLACE INTO fno_eod_sent (alert_date, sent_at) VALUES (?, ?)",
-            (today, now_ist),
-        )
-        con.commit()
-    finally:
-        con.close()
+    ensure_fno_storage()
+    log.debug("F&O storage backend: %s", storage_backend_label())
 
 
 # ════════════════════ Per-user index alert prefs ════════════════════
@@ -254,44 +175,6 @@ def parse_index_tokens(args: list[str]) -> tuple[list[str] | None, str | None]:
             seen.add(s)
             out.append(s)
     return out, None
-
-
-def set_user_alert_indices(chat_id: int, nse_symbols: list[str]) -> None:
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute("DELETE FROM fno_alert_prefs WHERE chat_id = ?", (chat_id,))
-        for sym in nse_symbols:
-            con.execute(
-                "INSERT INTO fno_alert_prefs (chat_id, nse_symbol) VALUES (?, ?)",
-                (chat_id, sym),
-            )
-        con.commit()
-    finally:
-        con.close()
-
-
-def clear_user_alert_indices(chat_id: int) -> None:
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute("DELETE FROM fno_alert_prefs WHERE chat_id = ?", (chat_id,))
-        con.commit()
-    finally:
-        con.close()
-
-
-def get_user_alert_indices(chat_id: int) -> set[str] | None:
-    """None = all indices (no custom filter)."""
-    con = sqlite3.connect(DB_FILE)
-    try:
-        rows = con.execute(
-            "SELECT nse_symbol FROM fno_alert_prefs WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchall()
-        if not rows:
-            return None
-        return {r[0] for r in rows}
-    finally:
-        con.close()
 
 
 def user_wants_index(chat_id: int, nse_symbol: str) -> bool:
@@ -353,52 +236,6 @@ def format_alert_usage_html() -> str:
         "<i>Also applies to <code>/entry</code> — only selected indices are shown.</i>\n\n"
         "<b>Names:</b> nifty · banknifty · finnifty · midcap · sensex"
     )
-
-
-def _already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> bool:
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    con = sqlite3.connect(DB_FILE)
-    try:
-        row = con.execute(
-            "SELECT 1 FROM fno_alerts WHERE alert_date=? AND nse_symbol=? AND strategy=? AND side=? AND strike=?",
-            (today, nse_symbol, strategy, side, strike),
-        ).fetchone()
-        return row is not None
-    finally:
-        con.close()
-
-
-def _record_alert(signal: dict[str, Any]):
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
-    ex = signal.get("exits") or {}
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute(
-            """INSERT INTO fno_alerts (
-                alert_date, nse_symbol, index_name, strategy, side, strike,
-                entry_premium, sl_premium, t1_premium, t2_premium,
-                spot_at_entry, expiry, alerted_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                today,
-                signal["nse"],
-                signal.get("name"),
-                signal["strategy"],
-                signal["side"],
-                signal["strike"],
-                signal.get("premium"),
-                ex.get("sl"),
-                ex.get("t1"),
-                ex.get("t2"),
-                signal.get("spot"),
-                signal.get("expiry"),
-                now_ist,
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
 
 
 # ════════════════════ Technical helpers ════════════════════
@@ -1370,77 +1207,6 @@ def _empty_scan_stats() -> dict[str, int]:
     }
 
 
-def _record_scan_stats(delta: dict[str, int]) -> None:
-    """Accumulate per-day filter stats (setups vs sent vs skipped)."""
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute(
-            """
-            INSERT INTO fno_scan_stats (
-                alert_date, setups, sent, skip_quality, skip_dedupe, skip_premium, scan_cycles
-            ) VALUES (?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(alert_date) DO UPDATE SET
-                setups = setups + excluded.setups,
-                sent = sent + excluded.sent,
-                skip_quality = skip_quality + excluded.skip_quality,
-                skip_dedupe = skip_dedupe + excluded.skip_dedupe,
-                skip_premium = skip_premium + excluded.skip_premium,
-                scan_cycles = scan_cycles + 1
-            """,
-            (
-                today,
-                delta.get("setups", 0),
-                delta.get("sent", 0),
-                delta.get("skip_quality", 0),
-                delta.get("skip_dedupe", 0),
-                delta.get("skip_premium", 0),
-            ),
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def get_scan_stats_for_date(alert_date: str) -> dict[str, int] | None:
-    con = sqlite3.connect(DB_FILE)
-    try:
-        row = con.execute(
-            """SELECT setups, sent, skip_quality, skip_dedupe, skip_premium, scan_cycles
-               FROM fno_scan_stats WHERE alert_date = ?""",
-            (alert_date,),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "setups": row[0], "sent": row[1], "skip_quality": row[2],
-            "skip_dedupe": row[3], "skip_premium": row[4], "scan_cycles": row[5],
-        }
-    finally:
-        con.close()
-
-
-def get_scan_stats_range(start_date: str, end_date: str) -> dict[str, int]:
-    con = sqlite3.connect(DB_FILE)
-    try:
-        row = con.execute(
-            """
-            SELECT COALESCE(SUM(setups),0), COALESCE(SUM(sent),0),
-                   COALESCE(SUM(skip_quality),0), COALESCE(SUM(skip_dedupe),0),
-                   COALESCE(SUM(skip_premium),0), COALESCE(SUM(scan_cycles),0)
-            FROM fno_scan_stats
-            WHERE alert_date >= ? AND alert_date <= ?
-            """,
-            (start_date, end_date),
-        ).fetchone()
-        return {
-            "setups": row[0], "sent": row[1], "skip_quality": row[2],
-            "skip_dedupe": row[3], "skip_premium": row[4], "scan_cycles": row[5],
-        }
-    finally:
-        con.close()
-
-
 def format_scan_stats_html(stats: dict[str, int] | None, *, label: str = "Today") -> str:
     if not stats or stats.get("scan_cycles", 0) == 0:
         return ""
@@ -1931,65 +1697,6 @@ def _strike_close_ltp(
     return None
 
 
-def _get_alerts_between(start_date: str, end_date: str) -> list[dict[str, Any]]:
-    con = sqlite3.connect(DB_FILE)
-    try:
-        rows = con.execute(
-            """SELECT id, nse_symbol, index_name, strategy, side, strike,
-                      entry_premium, sl_premium, t1_premium, t2_premium,
-                      spot_at_entry, expiry, alerted_at,
-                      close_premium, outcome, pnl_pts, summarized, alert_date
-               FROM fno_alerts
-               WHERE alert_date >= ? AND alert_date <= ?
-               ORDER BY alert_date, alerted_at""",
-            (start_date, end_date),
-        ).fetchall()
-        return [
-            {
-                "id": r[0], "nse_symbol": r[1], "index_name": r[2] or r[1],
-                "strategy": r[3], "side": r[4], "strike": r[5],
-                "entry_premium": r[6], "sl_premium": r[7],
-                "t1_premium": r[8], "t2_premium": r[9],
-                "spot_at_entry": r[10], "expiry": r[11], "alerted_at": r[12],
-                "close_premium": r[13], "outcome": r[14], "pnl_pts": r[15],
-                "summarized": r[16], "alert_date": r[17],
-            }
-            for r in rows
-        ]
-    finally:
-        con.close()
-
-
-def _get_today_alerts(unsummarized_only: bool = True) -> list[dict[str, Any]]:
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
-    con = sqlite3.connect(DB_FILE)
-    try:
-        q = """SELECT id, nse_symbol, index_name, strategy, side, strike,
-                      entry_premium, sl_premium, t1_premium, t2_premium,
-                      spot_at_entry, expiry, alerted_at,
-                      close_premium, outcome, pnl_pts, summarized
-               FROM fno_alerts WHERE alert_date = ?"""
-        params: tuple[Any, ...] = (today,)
-        if unsummarized_only:
-            q += " AND summarized = 0"
-        q += " ORDER BY alerted_at ASC"
-        rows = con.execute(q, params).fetchall()
-        return [
-            {
-                "id": r[0], "nse_symbol": r[1], "index_name": r[2] or r[1],
-                "strategy": r[3], "side": r[4], "strike": r[5],
-                "entry_premium": r[6], "sl_premium": r[7],
-                "t1_premium": r[8], "t2_premium": r[9],
-                "spot_at_entry": r[10], "expiry": r[11], "alerted_at": r[12],
-                "close_premium": r[13], "outcome": r[14], "pnl_pts": r[15],
-                "summarized": r[16],
-            }
-            for r in rows
-        ]
-    finally:
-        con.close()
-
-
 def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     wins = sum(1 for r in results if r.get("outcome") in (
         "T1 WIN", "T2 WIN", "PARTIAL WIN", "SCALP 5%", "SCALP 10%",
@@ -2012,19 +1719,6 @@ def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "net_pts": net_pts,
         "trades": results,
     }
-
-
-def _update_alert_result(alert_id: int, close_ltp: float, outcome: str, pnl: float):
-    con = sqlite3.connect(DB_FILE)
-    try:
-        con.execute(
-            """UPDATE fno_alerts SET close_premium=?, outcome=?, pnl_pts=?, summarized=1
-               WHERE id=?""",
-            (close_ltp, outcome, pnl, alert_id),
-        )
-        con.commit()
-    finally:
-        con.close()
 
 
 def build_eod_summary() -> dict[str, Any] | None:

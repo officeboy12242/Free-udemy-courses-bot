@@ -2515,13 +2515,15 @@ async def main():
             )
         )
         ensure_fno_tables()
+        from fno_storage import storage_backend_label
+        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR + MACD MTF + EOD summary)")
+        log.info("📊 F&O trade history storage: %s", storage_backend_label())
         tasks.append(
             asyncio.create_task(run_fno_monitor(bot))
         )
         tasks.append(
             asyncio.create_task(run_fno_eod_summary(bot))
         )
-        log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR + MACD MTF + EOD summary)")
     else:
         log.info("Market features off (MARKET_FEATURES_ENABLED).")
 
