@@ -319,28 +319,42 @@ def get_user_alert_indices(chat_id: int) -> set[str] | None:
 
 
 def already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> bool:
-    """Block if this index+side was alerted today (any strategy, any outcome).
+    """Block re-entry for index+side if last trade was a loss or is still open.
 
-    High-quality mode: once an index+side combo fires, no more entries for
-    the rest of the day.  Prevents re-entry spam after quick exits.
+    Allow re-entry only if every previous trade for this index+side today
+    was a winner (S5/S10/T1/T2).  Prevents SL-spam while letting winning
+    setups re-trigger.
     """
     today = _ist_today()
     if use_mongodb():
-        return _get_mongo_db().fno_alerts.find_one({
+        db = _get_mongo_db()
+        prev = list(db.fno_alerts.find({
             "alert_date": today,
             "nse_symbol": nse_symbol,
             "side": side,
             "pick_type": "safe",
             "exit_status": {"$nin": ["LEGACY"]},
-        }) is not None
+        }))
+        if not prev:
+            return False
+        for a in prev:
+            status = a.get("exit_status") or "OPEN"
+            if status in ("OPEN", "SL", "INVALIDATED"):
+                return True
+        return False
     con = sqlite3.connect(DB_FILE)
     try:
-        return con.execute(
-            """SELECT 1 FROM fno_alerts
-               WHERE alert_date=? AND nse_symbol=? AND side=?
-               AND outcome IS NOT NULL AND outcome != 'NO DATA'""",
+        rows = con.execute(
+            """SELECT outcome FROM fno_alerts
+               WHERE alert_date=? AND nse_symbol=? AND side=?""",
             (today, nse_symbol, side),
-        ).fetchone() is not None
+        ).fetchall()
+        if not rows:
+            return False
+        for (outcome,) in rows:
+            if not outcome or outcome in ("SL LOSS", "INVALIDATED", ""):
+                return True
+        return False
     finally:
         con.close()
 

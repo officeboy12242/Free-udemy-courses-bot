@@ -77,18 +77,18 @@ FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
 FNO_EXIT_CHECK_INTERVAL = int(os.getenv("FNO_EXIT_CHECK_INTERVAL", "30"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
 FNO_STRICT_FILTERS = os.getenv("FNO_STRICT_FILTERS", "1").strip().lower() in ("1", "true", "yes")
-FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "100"))
-FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "8"))
-FNO_MIN_ADX = float(os.getenv("FNO_MIN_ADX", "18"))
-ORB_MIN_BREAK_PCT = float(os.getenv("ORB_MIN_BREAK_PCT", "0.10"))
+FNO_MIN_LEG_VOLUME = int(os.getenv("FNO_MIN_LEG_VOLUME", "50"))
+FNO_MAX_SPREAD_PCT = float(os.getenv("FNO_MAX_SPREAD_PCT", "10"))
+FNO_MIN_ADX = float(os.getenv("FNO_MIN_ADX", "16"))
+ORB_MIN_BREAK_PCT = float(os.getenv("ORB_MIN_BREAK_PCT", "0.08"))
 FNO_REQUIRE_EMA_ALIGN = os.getenv("FNO_REQUIRE_EMA_ALIGN", "1").strip().lower() in ("1", "true", "yes")
-FNO_CONFLUENCE_MIN_LAYERS = int(os.getenv("FNO_CONFLUENCE_MIN_LAYERS", "4"))
-FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "1").strip().lower() in ("1", "true", "yes")
+FNO_CONFLUENCE_MIN_LAYERS = int(os.getenv("FNO_CONFLUENCE_MIN_LAYERS", "3"))
+FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true", "yes")
 FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "1"))
-FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "8"))
-FNO_MIN_QUALITY_SCORE = int(os.getenv("FNO_MIN_QUALITY_SCORE", "40"))
-FNO_LAST_ENTRY_HOUR = int(os.getenv("FNO_LAST_ENTRY_HOUR", "14"))
-FNO_LAST_ENTRY_MINUTE = int(os.getenv("FNO_LAST_ENTRY_MINUTE", "30"))
+FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "12"))
+FNO_MIN_QUALITY_SCORE = int(os.getenv("FNO_MIN_QUALITY_SCORE", "30"))
+FNO_LAST_ENTRY_HOUR = int(os.getenv("FNO_LAST_ENTRY_HOUR", "15"))
+FNO_LAST_ENTRY_MINUTE = int(os.getenv("FNO_LAST_ENTRY_MINUTE", "0"))
 FNO_MACD_MTF_ENABLED = os.getenv("FNO_MACD_MTF_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 FNO_MACD_REQUIRE_5M = os.getenv("FNO_MACD_REQUIRE_5M", "0").strip().lower() in ("1", "true", "yes")
 FNO_MACD_CROSS_LOOKBACK = max(1, int(os.getenv("FNO_MACD_CROSS_LOOKBACK", "3")))
@@ -1426,6 +1426,9 @@ def _passes_auto_alert_quality(
         if layer_n >= 4:
             score += 25
             extras.append("4/4 confluence layers agree")
+        elif layer_n >= 3:
+            score += 12
+            extras.append("3/4 confluence layers agree")
 
     if strat == STRATEGY_ORB:
         orb_break = result.get("orb_break_pct") or 0
