@@ -1777,7 +1777,7 @@ def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
     )
 
 
-def format_alert_html(signal: dict[str, Any]) -> str:
+def format_alert_html(signal: dict[str, Any], refs: list[dict[str, Any]] | None = None) -> str:
     """Format a single auto-alert message for Telegram."""
     name = html.escape(signal["name"])
     nse = html.escape(signal["nse"])
@@ -1830,6 +1830,7 @@ def format_alert_html(signal: dict[str, Any]) -> str:
         f"<b>Why this setup:</b>\n"
         f"{reasons_html}\n"
         f"{_format_aggressive_html(signal, side)}"
+        f"{_format_entry_refs_html(refs)}"
         f"\n"
         f"<i>\u26a0\ufe0f Scalping only \u00b7 Hard SL \u00b7 No averaging \u00b7 Not advice</i>"
     )
@@ -2391,13 +2392,84 @@ def _pick_type_badge(alert: dict[str, Any]) -> str:
     return ""
 
 
+def _trade_ref(alert_id: int | None) -> str:
+    return f"#T-{alert_id}" if alert_id else "#T-?"
+
+
+def _format_ist_alert_time(alerted_at: str | None) -> str:
+    if not alerted_at:
+        return "\u2014"
+    try:
+        dt = datetime.strptime(str(alerted_at)[:19], "%Y-%m-%dT%H:%M:%S")
+        return dt.strftime("%d-%b %H:%M") + " IST"
+    except ValueError:
+        return str(alerted_at)[:16]
+
+
+def _pick_label(alert: dict[str, Any]) -> str:
+    return "Aggressive" if (alert.get("pick_type") or "safe") == "aggressive" else "Safe"
+
+
+def _format_entry_refs_html(refs: list[dict[str, Any]] | None) -> str:
+    """Footer on entry alerts — refs to search when exit alert arrives."""
+    if not refs:
+        return ""
+    lines = ["\n\U0001f517 <b>Trade refs</b> <i>(search in chat to match exit alerts)</i>"]
+    for r in refs:
+        pick = "Aggressive" if r.get("pick_type") == "aggressive" else "Safe"
+        lines.append(
+            f"  \u2023 <b>{pick}</b>: <code>{_trade_ref(r.get('id'))}</code>  "
+            f"<code>{r.get('strike')} {r.get('side')}</code> @ <b>{_ru(float(r.get('premium') or 0))}</b>"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _format_exit_trace_html(alert: dict[str, Any], level: str | None = None) -> str:
+    """Link exit / invalidation back to the original entry alert."""
+    ref = _trade_ref(alert.get("id"))
+    nse = html.escape(alert.get("nse_symbol") or "")
+    name = html.escape(alert.get("index_name") or nse)
+    side = alert.get("side") or ""
+    strike = alert.get("strike") or ""
+    strategy = html.escape(alert.get("strategy") or "")
+    pick = _pick_label(alert)
+    entry_time = _format_ist_alert_time(alert.get("alerted_at"))
+    expiry = html.escape(str(alert.get("expiry") or "\u2014"))
+    entry = float(alert.get("entry_premium") or 0)
+    spot = alert.get("spot_at_entry")
+
+    level_keys = {
+        "SL": "sl_premium", "S5": "s5_premium", "S10": "s10_premium",
+        "T1": "t1_premium", "T2": "t2_premium",
+    }
+    level_line = ""
+    if level and level in level_keys:
+        tgt = alert.get(level_keys[level])
+        if tgt is not None:
+            level_line = f"Trigger level: <b>{level}</b> @ <b>{_ru(float(tgt))}</b>\n"
+
+    spot_line = f"Spot at entry: <code>{spot}</code>\n" if spot is not None else ""
+
+    return (
+        f"\n\U0001f517 <b>LINKED TO ENTRY ALERT</b>\n"
+        f"Ref: <code>{ref}</code>  \u00b7  Pick: <b>{pick}</b>\n"
+        f"<b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
+        f"Strategy: {strategy}\n"
+        f"Entry alert: <code>{entry_time}</code> @ <b>{_ru(entry)}</b>\n"
+        f"Expiry: <code>{expiry}</code>\n"
+        f"{spot_line}"
+        f"{level_line}"
+        f"<i>Search <code>{ref}</code> in this chat to find the original setup alert</i>\n"
+    )
+
+
 def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, pnl: float) -> str:
     """Format an exit notification for Telegram."""
     name = html.escape(alert.get("index_name") or alert.get("nse_symbol") or "")
     nse = html.escape(alert.get("nse_symbol") or "")
     side = alert.get("side") or ""
     entry = float(alert.get("entry_premium") or 0)
-    strategy = html.escape((alert.get("strategy") or "")[:30])
+    strategy = html.escape(alert.get("strategy") or "")
     strike = alert.get("strike") or ""
     lot = _lot_size(alert.get("nse_symbol") or "")
     lots = _lots_for_capital(FNO_PAPER_CAPITAL, entry, lot) if entry > 0 else 0
@@ -2439,9 +2511,7 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
     return (
         f"{emoji} <b>{title}</b> {emoji}\n"
         f"{_pick_type_badge(alert)}"
-        f"\n"
-        f"{tag_color} <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
-        f"\U0001f4cc {strategy}\n"
+        f"{_format_exit_trace_html(alert, level)}"
         f"\n"
         f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
@@ -2612,7 +2682,7 @@ def format_invalidation_alert_html(
     nse = html.escape(alert.get("nse_symbol") or "")
     side = alert.get("side") or ""
     entry = float(alert.get("entry_premium") or 0)
-    strategy = html.escape((alert.get("strategy") or "")[:30])
+    strategy = html.escape(alert.get("strategy") or "")
     strike = alert.get("strike") or ""
     pnl = round(live_prem - entry, 2)
     pnl_sign = "+" if pnl >= 0 else ""
@@ -2626,9 +2696,7 @@ def format_invalidation_alert_html(
     return (
         f"\u26a0\ufe0f <b>SETUP NOT WORKING</b> \u26a0\ufe0f\n"
         f"{_pick_type_badge(alert)}"
-        f"\n"
-        f"\U0001f7e0 <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
-        f"\U0001f4cc {strategy}\n"
+        f"{_format_exit_trace_html(alert)}"
         f"\n"
         f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
@@ -2798,15 +2866,16 @@ async def run_fno_monitor(bot):
             signals = await scan_all_indices_async()
             if signals:
                 for sig in signals:
-                    text = format_alert_html(sig)
-                    n_recorded = _record_alerts_for_signal(sig)
+                    refs = _record_alerts_for_signal(sig)
+                    text = format_alert_html(sig, refs=refs)
                     await _send_to_subscribers(bot, sig["nse"], text)
                     agg = sig.get("aggressive")
+                    ref_str = ", ".join(_trade_ref(r["id"]) for r in refs)
                     log.info(
-                        "FnO ALERT sent: %s %s %s %s @ %s (%d tracked%s)",
+                        "FnO ALERT sent: %s %s %s %s @ %s refs=%s%s",
                         sig["strategy"], sig["name"], sig["side"],
-                        sig["strike"], sig["premium"], n_recorded,
-                        f", agg {agg['strike']} @ {agg['premium']}" if agg else "",
+                        sig["strike"], sig["premium"], ref_str,
+                        f" agg {agg['strike']} @ {agg['premium']}" if agg else "",
                     )
             else:
                 log.debug("FnO scan: no new signals this cycle")

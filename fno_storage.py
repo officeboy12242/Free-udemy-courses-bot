@@ -333,8 +333,8 @@ def record_alert(
     *,
     pick_type: str = "safe",
     agg_pick: dict[str, Any] | None = None,
-) -> None:
-    """Persist one trade alert (safe or aggressive near-ATM pick)."""
+) -> int:
+    """Persist one trade alert (safe or aggressive near-ATM pick). Returns alert id."""
     today = _ist_today()
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
     scalp_t5 = float(os.getenv("FNO_SCALP_T5_PCT", "5"))
@@ -392,10 +392,10 @@ def record_alert(
                 "bb_lower": tech.get("bb_lower"),
             },
         })
-        return
+        return aid
     con = sqlite3.connect(DB_FILE)
     try:
-        con.execute(
+        cur = con.execute(
             """INSERT INTO fno_alerts (
                 alert_date, nse_symbol, index_name, strategy, side, strike,
                 entry_premium, sl_premium, t1_premium, t2_premium,
@@ -409,33 +409,48 @@ def record_alert(
             ),
         )
         con.commit()
+        return int(cur.lastrowid)
     finally:
         con.close()
 
 
-def record_alerts_for_signal(signal: dict[str, Any]) -> int:
-    """Record safe alert and optional aggressive pick for exit monitoring."""
-    record_alert(signal, pick_type="safe")
-    recorded = 1
+def record_alerts_for_signal(signal: dict[str, Any]) -> list[dict[str, Any]]:
+    """Record safe + optional aggressive picks. Returns refs for trace IDs in Telegram."""
+    refs: list[dict[str, Any]] = []
+    safe_id = record_alert(signal, pick_type="safe")
+    refs.append({
+        "id": safe_id,
+        "pick_type": "safe",
+        "strike": signal["strike"],
+        "side": signal["side"],
+        "premium": signal.get("premium"),
+    })
 
     agg = signal.get("aggressive")
     if not agg:
-        return recorded
+        return refs
 
     strike = int(agg.get("strike") or 0)
     premium = float(agg.get("premium") or 0)
     if strike <= 0 or premium <= 0:
-        return recorded
+        return refs
 
     if already_alerted(signal["nse"], signal["strategy"], signal["side"], strike):
         log.info(
             "Aggressive pick already open: %s %s %s %s",
             signal["nse"], signal["strategy"], signal["side"], strike,
         )
-        return recorded
+        return refs
 
-    record_alert(signal, pick_type="aggressive", agg_pick=agg)
-    return recorded + 1
+    agg_id = record_alert(signal, pick_type="aggressive", agg_pick=agg)
+    refs.append({
+        "id": agg_id,
+        "pick_type": "aggressive",
+        "strike": strike,
+        "side": signal["side"],
+        "premium": round(premium, 2),
+    })
+    return refs
 
 
 def record_scan_stats(delta: dict[str, int]) -> None:
