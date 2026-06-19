@@ -68,6 +68,12 @@ from fno_storage import (
     update_exit_status as _update_exit_status,
 )
 from market_service import get_all_subscribers, remove_subscriber
+from market_calendar import (
+    is_eod_summary_window,
+    is_market_hours,
+    log_market_gate,
+    market_gate_sleep_seconds,
+)
 
 load_dotenv()
 
@@ -2415,11 +2421,13 @@ async def run_fno_eod_summary(bot):
     while True:
         try:
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            is_weekday = now_ist.weekday() < 5
-            eod_start = now_ist.replace(hour=15, minute=32, second=0, microsecond=0)
-            eod_end = now_ist.replace(hour=16, minute=15, second=0, microsecond=0)
 
-            if is_weekday and eod_start <= now_ist <= eod_end and not _eod_summary_sent_today():
+            if not is_eod_summary_window(now_ist):
+                log_market_gate(log, "FnO EOD summary", now_ist)
+                await asyncio.sleep(market_gate_sleep_seconds(now_ist, 180))
+                continue
+
+            if not _eod_summary_sent_today():
                 summary = await build_eod_summary_async()
                 if summary and summary["total"] > 0:
                     subscribers = get_all_subscribers()
@@ -3158,12 +3166,10 @@ async def run_fno_exit_monitor(bot):
     while True:
         try:
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-            market_close = now_ist.replace(hour=15, minute=35, second=0, microsecond=0)
-            is_weekday = now_ist.weekday() < 5
 
-            if not (is_weekday and market_open <= now_ist <= market_close):
-                await asyncio.sleep(interval)
+            if not is_market_hours(now_ist, for_exit=True):
+                log_market_gate(log, "FnO exit monitor", now_ist)
+                await asyncio.sleep(market_gate_sleep_seconds(now_ist, interval))
                 continue
 
             exit_signals = await check_active_exits_async()
@@ -3195,13 +3201,10 @@ async def run_fno_monitor(bot):
     while True:
         try:
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-            market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-            is_weekday = now_ist.weekday() < 5
 
-            if not (is_weekday and market_open <= now_ist <= market_close):
-                log.debug("FnO monitor: market closed, sleeping %ds", interval)
-                await asyncio.sleep(interval)
+            if not is_market_hours(now_ist):
+                log_market_gate(log, "FnO entry scanner", now_ist)
+                await asyncio.sleep(market_gate_sleep_seconds(now_ist, interval))
                 continue
 
             signals = await scan_all_indices_async()

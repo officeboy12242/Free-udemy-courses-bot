@@ -18,6 +18,8 @@ import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
+from market_calendar import is_market_hours, log_market_gate, market_gate_sleep_seconds
+
 load_dotenv()
 
 log = logging.getLogger(__name__)
@@ -484,22 +486,12 @@ async def run_market_monitor(bot, alert_chat_id: str | None = None):
 
     while True:
         try:
-            # ── Market-hours gate (NSE/BSE: Mon–Fri 09:15–15:30 IST) ──────────
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-            market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
-            market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-            is_weekday   = now_ist.weekday() < 5          # Mon=0 … Fri=4
-            in_hours     = is_weekday and market_open <= now_ist <= market_close
 
-            if not in_hours:
-                next_wake = interval
-                log.debug(
-                    "Market closed (%s IST, weekday=%s) — skipping alert check.",
-                    now_ist.strftime("%H:%M"), is_weekday,
-                )
-                await asyncio.sleep(next_wake)
+            if not is_market_hours(now_ist):
+                log_market_gate(log, "Market dip monitor", now_ist)
+                await asyncio.sleep(market_gate_sleep_seconds(now_ist, interval))
                 continue
-            # ─────────────────────────────────────────────────────────────────
 
             snaps = await fetch_all_snapshots_async()
             day = _today_ist()
