@@ -57,7 +57,7 @@ from fno_storage import (
     get_today_alerts as _get_today_alerts,
     get_user_alert_indices,
     mark_eod_summary_sent as _mark_eod_summary_sent,
-    record_alert as _record_alert,
+    record_alerts_for_signal as _record_alerts_for_signal,
     record_scan_stats as _record_scan_stats,
     set_user_alert_indices,
     storage_backend_label,
@@ -1961,7 +1961,8 @@ def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         lots = _lots_for_capital(capital, entry, lot) if entry > 0 else 0
         pnl_rs = round(pnl * lot * lots, 2)
         cap_used = round(entry * lot * lots, 2)
-        net_rupees += pnl_rs
+        if (r.get("pick_type") or "safe") == "safe":
+            net_rupees += pnl_rs
         trade_details.append({**r, "lots": lots, "pnl_rs": pnl_rs, "capital_used": cap_used})
 
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
@@ -2167,8 +2168,9 @@ def format_eod_summary_html(summary: dict[str, Any]) -> str:
         time_part = (t.get("alerted_at") or "")[11:16]
         rs_str = f"  \u20b9{pnl_rs:+,.0f}" if lots > 0 else ""
         lot_str = f" ({lots}L)" if lots > 0 else ""
+        pick_tag = " \U0001f4a5" if (t.get("pick_type") or "safe") == "aggressive" else ""
         lines.append(
-            f"{em} <b>{html.escape(t['index_name'])}</b> "
+            f"{em} <b>{html.escape(t['index_name'])}</b>{pick_tag} "
             f"<code>{t['strike']} {t['side']}</code>{lot_str}\n"
             f"   {html.escape(t['strategy'][:28])}\n"
             f"   Entry <b>{_ru(entry)}</b> \u2192 Close <b>{_ru(close) if close else 'N/A'}</b> "
@@ -2178,7 +2180,8 @@ def format_eod_summary_html(summary: dict[str, Any]) -> str:
         )
 
     lines.append("")
-    lines.append(f"<i>\u26a0\ufe0f Paper trade with \u20b9{capital:,.0f} capital \u00b7 Not financial advice</i>")
+    lines.append("<i>\U0001f4a5 = aggressive near-ATM leg (exit tracked separately)</i>")
+    lines.append(f"<i>\u26a0\ufe0f Paper trade with \u20b9{capital:,.0f} capital \u00b7 Portfolio uses safe picks \u00b7 Not advice</i>")
     return "\n".join(lines).strip()
 
 
@@ -2248,9 +2251,10 @@ def format_period_summary_html(summary: dict[str, Any]) -> str:
         lots = int(t.get("lots") or 0)
         outcome = t.get("outcome") or "PENDING"
         rs_str = f"  \u20b9{pnl_rs:+,.0f}" if lots > 0 else ""
+        pick_tag = " \U0001f4a5" if (t.get("pick_type") or "safe") == "aggressive" else ""
         lines.append(
             f"{em} {html.escape(t.get('alert_date', ''))} "
-            f"<b>{html.escape(t.get('index_name') or '')}</b> "
+            f"<b>{html.escape(t.get('index_name') or '')}</b>{pick_tag} "
             f"<code>{t.get('strike')} {t.get('side')}</code> "
             f"{pnl:+.1f} pts{rs_str} \u00b7 {html.escape(outcome)}"
         )
@@ -2346,6 +2350,12 @@ def _check_exit_level(alert: dict[str, Any], live_prem: float) -> tuple[str, str
     return None
 
 
+def _pick_type_badge(alert: dict[str, Any]) -> str:
+    if (alert.get("pick_type") or "safe") == "aggressive":
+        return "\n\U0001f4a5 <b>AGGRESSIVE PICK</b> \U0001f4a5\n"
+    return ""
+
+
 def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, pnl: float) -> str:
     """Format an exit notification for Telegram."""
     name = html.escape(alert.get("index_name") or alert.get("nse_symbol") or "")
@@ -2393,6 +2403,7 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
 
     return (
         f"{emoji} <b>{title}</b> {emoji}\n"
+        f"{_pick_type_badge(alert)}"
         f"\n"
         f"{tag_color} <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
         f"\U0001f4cc {strategy}\n"
@@ -2579,6 +2590,7 @@ def format_invalidation_alert_html(
 
     return (
         f"\u26a0\ufe0f <b>SETUP NOT WORKING</b> \u26a0\ufe0f\n"
+        f"{_pick_type_badge(alert)}"
         f"\n"
         f"\U0001f7e0 <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
         f"\U0001f4cc {strategy}\n"
@@ -2752,12 +2764,14 @@ async def run_fno_monitor(bot):
             if signals:
                 for sig in signals:
                     text = format_alert_html(sig)
-                    _record_alert(sig)
+                    n_recorded = _record_alerts_for_signal(sig)
                     await _send_to_subscribers(bot, sig["nse"], text)
+                    agg = sig.get("aggressive")
                     log.info(
-                        "FnO ALERT sent: %s %s %s %s @ %s",
+                        "FnO ALERT sent: %s %s %s %s @ %s (%d tracked%s)",
                         sig["strategy"], sig["name"], sig["side"],
-                        sig["strike"], sig["premium"],
+                        sig["strike"], sig["premium"], n_recorded,
+                        f", agg {agg['strike']} @ {agg['premium']}" if agg else "",
                     )
             else:
                 log.debug("FnO scan: no new signals this cycle")

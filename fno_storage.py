@@ -128,6 +128,7 @@ def _doc_to_alert(doc: dict[str, Any]) -> dict[str, Any]:
         "summarized": int(doc.get("summarized") or 0),
         "alert_date": doc.get("alert_date"),
         "entry_conditions": doc.get("entry_conditions") or {},
+        "pick_type": doc.get("pick_type") or "safe",
     }
 
 
@@ -327,12 +328,30 @@ def already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> b
         con.close()
 
 
-def record_alert(signal: dict[str, Any]) -> None:
+def record_alert(
+    signal: dict[str, Any],
+    *,
+    pick_type: str = "safe",
+    agg_pick: dict[str, Any] | None = None,
+) -> None:
+    """Persist one trade alert (safe or aggressive near-ATM pick)."""
     today = _ist_today()
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
-    ex = signal.get("exits") or {}
-    s5 = round(float(signal.get("premium") or 0) * (1 + float(os.getenv("FNO_SCALP_T5_PCT", "5")) / 100), 2)
-    s10 = round(float(signal.get("premium") or 0) * (1 + float(os.getenv("FNO_SCALP_T10_PCT", "10")) / 100), 2)
+    scalp_t5 = float(os.getenv("FNO_SCALP_T5_PCT", "5"))
+    scalp_t10 = float(os.getenv("FNO_SCALP_T10_PCT", "10"))
+
+    if pick_type == "aggressive" and agg_pick:
+        strike = int(agg_pick["strike"])
+        premium = float(agg_pick.get("premium") or 0)
+        ex = agg_pick.get("exits") or {}
+    else:
+        strike = int(signal["strike"])
+        premium = float(signal.get("premium") or 0)
+        ex = signal.get("exits") or {}
+
+    s5 = round(float(ex.get("s5") or premium * (1 + scalp_t5 / 100)), 2)
+    s10 = round(float(ex.get("s10") or premium * (1 + scalp_t10 / 100)), 2)
+
     if use_mongodb():
         db = _get_mongo_db()
         aid = _next_alert_id(db)
@@ -345,8 +364,8 @@ def record_alert(signal: dict[str, Any]) -> None:
             "index_name": signal.get("name"),
             "strategy": signal["strategy"],
             "side": signal["side"],
-            "strike": signal["strike"],
-            "entry_premium": signal.get("premium"),
+            "strike": strike,
+            "entry_premium": round(premium, 2),
             "sl_premium": ex.get("sl"),
             "s5_premium": s5,
             "s10_premium": s10,
@@ -359,6 +378,7 @@ def record_alert(signal: dict[str, Any]) -> None:
             "outcome": None,
             "pnl_pts": None,
             "exit_status": "OPEN",
+            "pick_type": pick_type,
             "summarized": 0,
             "entry_conditions": {
                 "rsi": tech.get("rsi"),
@@ -383,7 +403,7 @@ def record_alert(signal: dict[str, Any]) -> None:
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 today, signal["nse"], signal.get("name"), signal["strategy"],
-                signal["side"], signal["strike"], signal.get("premium"),
+                signal["side"], strike, round(premium, 2),
                 ex.get("sl"), ex.get("t1"), ex.get("t2"),
                 signal.get("spot"), signal.get("expiry"), now_ist,
             ),
@@ -391,6 +411,31 @@ def record_alert(signal: dict[str, Any]) -> None:
         con.commit()
     finally:
         con.close()
+
+
+def record_alerts_for_signal(signal: dict[str, Any]) -> int:
+    """Record safe alert and optional aggressive pick for exit monitoring."""
+    record_alert(signal, pick_type="safe")
+    recorded = 1
+
+    agg = signal.get("aggressive")
+    if not agg:
+        return recorded
+
+    strike = int(agg.get("strike") or 0)
+    premium = float(agg.get("premium") or 0)
+    if strike <= 0 or premium <= 0:
+        return recorded
+
+    if already_alerted(signal["nse"], signal["strategy"], signal["side"], strike):
+        log.info(
+            "Aggressive pick already open: %s %s %s %s",
+            signal["nse"], signal["strategy"], signal["side"], strike,
+        )
+        return recorded
+
+    record_alert(signal, pick_type="aggressive", agg_pick=agg)
+    return recorded + 1
 
 
 def record_scan_stats(delta: dict[str, int]) -> None:
