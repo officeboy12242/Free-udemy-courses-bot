@@ -114,6 +114,8 @@ def _doc_to_alert(doc: dict[str, Any]) -> dict[str, Any]:
         "strike": doc.get("strike"),
         "entry_premium": doc.get("entry_premium"),
         "sl_premium": doc.get("sl_premium"),
+        "s5_premium": doc.get("s5_premium"),
+        "s10_premium": doc.get("s10_premium"),
         "t1_premium": doc.get("t1_premium"),
         "t2_premium": doc.get("t2_premium"),
         "spot_at_entry": doc.get("spot_at_entry"),
@@ -122,8 +124,10 @@ def _doc_to_alert(doc: dict[str, Any]) -> dict[str, Any]:
         "close_premium": doc.get("close_premium"),
         "outcome": doc.get("outcome"),
         "pnl_pts": doc.get("pnl_pts"),
+        "exit_status": doc.get("exit_status", "OPEN"),
         "summarized": int(doc.get("summarized") or 0),
         "alert_date": doc.get("alert_date"),
+        "entry_conditions": doc.get("entry_conditions") or {},
     }
 
 
@@ -329,6 +333,8 @@ def record_alert(signal: dict[str, Any]) -> None:
     if use_mongodb():
         db = _get_mongo_db()
         aid = _next_alert_id(db)
+        tech = signal.get("tech") or {}
+        oi_data = signal.get("oi") or {}
         db.fno_alerts.insert_one({
             "id": aid,
             "alert_date": today,
@@ -351,6 +357,17 @@ def record_alert(signal: dict[str, Any]) -> None:
             "pnl_pts": None,
             "exit_status": "OPEN",
             "summarized": 0,
+            "entry_conditions": {
+                "rsi": tech.get("rsi"),
+                "vwap": tech.get("vwap"),
+                "ema9": tech.get("ema9"),
+                "ema21": tech.get("ema21"),
+                "adx": tech.get("adx"),
+                "pcr": oi_data.get("pcr"),
+                "bb_upper": tech.get("bb_upper"),
+                "bb_middle": tech.get("bb_middle"),
+                "bb_lower": tech.get("bb_lower"),
+            },
         })
         return
     con = sqlite3.connect(DB_FILE)

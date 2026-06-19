@@ -1937,7 +1937,7 @@ def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     wins = sum(1 for r in results if r.get("outcome") in (
         "T1 WIN", "T2 WIN", "PARTIAL WIN", "SCALP 5%", "SCALP 10%",
     ))
-    losses = sum(1 for r in results if r.get("outcome") in ("SL LOSS", "PARTIAL LOSS"))
+    losses = sum(1 for r in results if r.get("outcome") in ("SL LOSS", "PARTIAL LOSS", "SETUP BROKE"))
     decided = wins + losses
     win_rate = round(wins / decided * 100, 1) if decided else 0.0
     net_pts = round(
@@ -2120,6 +2120,7 @@ def _outcome_emoji(outcome: str) -> str:
         "FLAT": "\u26aa",
         "PARTIAL LOSS": "\U0001f7e0",
         "SL LOSS": "\U0001f534",
+        "SETUP BROKE": "\u26a0\ufe0f",
         "NO DATA": "\u2753",
     }.get(outcome, "\u2753")
 
@@ -2460,6 +2461,191 @@ async def check_active_exits_async() -> list[dict[str, Any]]:
     return await asyncio.to_thread(check_active_exits)
 
 
+# ════════════════════ Setup invalidation checker ════════════════════
+
+_YAHOO_BY_NSE: dict[str, str] = {cfg["nse"]: cfg["yahoo"] for cfg in FNO_INDICES}
+_NSE_ONLY_FALLBACK: dict[str, bool] = {cfg["nse"]: bool(cfg.get("nse_only_fallback")) for cfg in FNO_INDICES}
+
+
+def _check_setup_invalidation(
+    alert: dict[str, Any], tech: dict[str, Any], oi: dict[str, Any],
+) -> list[str] | None:
+    """Return list of invalidation reasons if the original setup thesis broke, else None."""
+    ec = alert.get("entry_conditions") or {}
+    if not ec:
+        return None
+
+    side = alert.get("side") or ""
+    strategy = alert.get("strategy") or ""
+    reasons: list[str] = []
+
+    spot = tech.get("spot")
+    vwap = tech.get("vwap")
+    ema9 = tech.get("ema9")
+    ema21 = tech.get("ema21")
+    rsi = tech.get("rsi")
+    adx = tech.get("adx")
+    pcr = float(oi.get("pcr") or 1) if oi else float(ec.get("pcr") or 1)
+    entry_pcr = float(ec.get("pcr") or 1)
+
+    if spot and vwap and ec.get("vwap"):
+        if side == "CE" and float(ec.get("vwap")) < float(ec.get("rsi", 999)):
+            if spot < vwap:
+                reasons.append(f"Price dropped below VWAP {vwap:.0f}")
+        elif side == "PE":
+            if spot > vwap:
+                reasons.append(f"Price rose above VWAP {vwap:.0f}")
+
+    if ema9 and ema21 and ec.get("ema9") and ec.get("ema21"):
+        if side == "CE":
+            was_aligned = float(ec["ema9"]) > float(ec["ema21"])
+            now_crossed = ema9 < ema21
+            if was_aligned and now_crossed:
+                reasons.append(f"EMA bearish cross: EMA9({ema9:.0f}) < EMA21({ema21:.0f})")
+        elif side == "PE":
+            was_aligned = float(ec["ema9"]) < float(ec["ema21"])
+            now_crossed = ema9 > ema21
+            if was_aligned and now_crossed:
+                reasons.append(f"EMA bullish cross: EMA9({ema9:.0f}) > EMA21({ema21:.0f})")
+
+    if rsi is not None and ec.get("rsi") is not None:
+        entry_rsi = float(ec["rsi"])
+        if side == "CE" and entry_rsi > 50 and rsi < 40:
+            reasons.append(f"RSI collapsed: {entry_rsi:.0f} \u2192 {rsi:.0f}")
+        elif side == "PE" and entry_rsi < 50 and rsi > 60:
+            reasons.append(f"RSI flipped bullish: {entry_rsi:.0f} \u2192 {rsi:.0f}")
+
+    if side == "CE" and entry_pcr > 1.0 and pcr < 0.8:
+        reasons.append(f"PCR flipped bearish: {entry_pcr:.2f} \u2192 {pcr:.2f}")
+    elif side == "PE" and entry_pcr < 1.0 and pcr > 1.2:
+        reasons.append(f"PCR flipped bullish: {entry_pcr:.2f} \u2192 {pcr:.2f}")
+
+    if "Sideways" in strategy or "Mean Reversion" in strategy:
+        if adx is not None and adx > 25:
+            reasons.append(f"ADX surged to {adx:.0f} \u2014 market trending now (was sideways)")
+
+    if "Confluence" in strategy or "MACD" in strategy or "ORB" in strategy:
+        if adx is not None and ec.get("adx") is not None:
+            if float(ec["adx"]) >= 15 and adx < 12:
+                reasons.append(f"ADX collapsed: {float(ec['adx']):.0f} \u2192 {adx:.0f} (trend dying)")
+
+    if len(reasons) >= 2:
+        return reasons
+    return None
+
+
+def format_invalidation_alert_html(
+    alert: dict[str, Any], reasons: list[str], live_prem: float,
+) -> str:
+    """Format a setup invalidation warning."""
+    name = html.escape(alert.get("index_name") or alert.get("nse_symbol") or "")
+    nse = html.escape(alert.get("nse_symbol") or "")
+    side = alert.get("side") or ""
+    entry = float(alert.get("entry_premium") or 0)
+    strategy = html.escape((alert.get("strategy") or "")[:30])
+    strike = alert.get("strike") or ""
+    pnl = round(live_prem - entry, 2)
+    pnl_sign = "+" if pnl >= 0 else ""
+    lot = _lot_size(alert.get("nse_symbol") or "")
+    lots = _lots_for_capital(FNO_PAPER_CAPITAL, entry, lot) if entry > 0 else 0
+    pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
+    rs_str = f"  (\u20b9{pnl_rs:+,.0f})" if lots > 0 else ""
+
+    reasons_html = "\n".join(f"  \u274c {html.escape(r)}" for r in reasons[:4])
+
+    return (
+        f"\u26a0\ufe0f <b>SETUP NOT WORKING</b> \u26a0\ufe0f\n"
+        f"\n"
+        f"\U0001f7e0 <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
+        f"\U0001f4cc {strategy}\n"
+        f"\n"
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+        f"\u2502  Entry:   <b>{_ru(entry)}</b>\n"
+        f"\u2502  Now:     <b>{_ru(live_prem)}</b>\n"
+        f"\u2502  P&amp;L:    <b>{pnl_sign}{pnl:.2f} pts</b>{rs_str}\n"
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
+        f"\n"
+        f"<b>What changed:</b>\n"
+        f"{reasons_html}\n"
+        f"\n"
+        f"\U0001f4a1 <b>Original setup conditions broke. Consider early exit before SL hits.</b>\n"
+        f"\n"
+        f"<i>\u26a0\ufe0f Paper trade \u00b7 Not financial advice</i>"
+    )
+
+
+def check_setup_invalidations() -> list[dict[str, Any]]:
+    """Check if any open alert's original setup thesis has broken."""
+    active = _get_active_alerts()
+    if not active:
+        return []
+
+    nse_client = NSELive()
+    signals: list[dict[str, Any]] = []
+    tech_cache: dict[str, dict] = {}
+    oi_cache: dict[str, dict] = {}
+
+    for alert in active:
+        sym = alert["nse_symbol"]
+
+        if sym not in tech_cache:
+            yahoo = _YAHOO_BY_NSE.get(sym)
+            if not yahoo:
+                continue
+            tech_cache[sym] = _fetch_intraday(
+                yahoo, nse_only_fallback=_NSE_ONLY_FALLBACK.get(sym, False),
+            )
+
+        if sym not in oi_cache:
+            chain = _parse_option_chain(sym, nse_client)
+            if chain:
+                cfg = next((c for c in FNO_INDICES if c["nse"] == sym), None)
+                step = cfg["step"] if cfg else 50
+                oi_cache[sym] = _oi_analysis(chain["rows"], float(chain["spot"]), step)
+            else:
+                oi_cache[sym] = {}
+
+        tech = tech_cache[sym]
+        oi = oi_cache[sym]
+
+        reasons = _check_setup_invalidation(alert, tech, oi)
+        if not reasons:
+            continue
+
+        chain = _parse_option_chain(sym, nse_client)
+        live_prem = 0.0
+        if chain:
+            lp = _strike_close_ltp(chain["rows"], int(alert["strike"]), alert["side"])
+            if lp and lp > 0:
+                live_prem = lp
+
+        _update_exit_status(alert["id"], "INVALIDATED", live_prem)
+        entry = float(alert.get("entry_premium") or 0)
+        pnl = round(live_prem - entry, 2) if live_prem > 0 else 0.0
+        _update_alert_result(alert["id"], live_prem, "SETUP BROKE", pnl)
+
+        signals.append({
+            "alert": alert,
+            "level": "INVALIDATED",
+            "reasons": reasons,
+            "live_premium": live_prem,
+            "html": format_invalidation_alert_html(alert, reasons, live_prem),
+        })
+        log.info(
+            "SETUP INVALIDATED: %s %s %s — %s",
+            alert["index_name"], alert["strike"], alert["side"],
+            "; ".join(reasons),
+        )
+
+    return signals
+
+
+async def check_setup_invalidations_async() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(check_setup_invalidations)
+
+
 # ════════════════════ Auto-monitor loop ════════════════════
 
 async def run_fno_monitor(bot):
@@ -2524,6 +2710,22 @@ async def run_fno_monitor(bot):
                         await asyncio.sleep(0.1)
                     except TelegramError as e:
                         log.error("Exit alert failed for chat=%s: %s", cid, e)
+                        if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
+                            remove_subscriber(cid)
+
+            inv_signals = await check_setup_invalidations_async()
+            for inv in inv_signals:
+                alert = inv["alert"]
+                inv_html = inv["html"]
+                subscribers = get_subscribers_for_index(alert["nse_symbol"])
+                if not subscribers:
+                    continue
+                for cid in subscribers:
+                    try:
+                        await bot.send_message(chat_id=cid, text=inv_html, parse_mode="HTML")
+                        await asyncio.sleep(0.1)
+                    except TelegramError as e:
+                        log.error("Invalidation alert failed for chat=%s: %s", cid, e)
                         if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
                             remove_subscriber(cid)
 
