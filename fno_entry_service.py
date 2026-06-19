@@ -51,6 +51,8 @@ from fno_storage import (
     eod_summary_sent_today as _eod_summary_sent_today,
     ensure_fno_storage,
     get_active_alerts as _get_active_alerts,
+    get_alert_by_id as _get_alert_by_id,
+    get_alert_telegram_msg as _get_alert_telegram_msg,
     get_alerts_between as _get_alerts_between,
     get_scan_stats_for_date,
     get_scan_stats_range,
@@ -59,6 +61,7 @@ from fno_storage import (
     mark_eod_summary_sent as _mark_eod_summary_sent,
     record_alerts_for_signal as _record_alerts_for_signal,
     record_scan_stats as _record_scan_stats,
+    save_alert_telegram_msg as _save_alert_telegram_msg,
     set_user_alert_indices,
     storage_backend_label,
     update_alert_result as _update_alert_result,
@@ -2414,7 +2417,7 @@ def _format_entry_refs_html(refs: list[dict[str, Any]] | None) -> str:
     """Footer on entry alerts — refs to search when exit alert arrives."""
     if not refs:
         return ""
-    lines = ["\n\U0001f517 <b>Trade refs</b> <i>(search in chat to match exit alerts)</i>"]
+    lines = ["\n\U0001f517 <b>Trade refs</b> <i>(exit alerts reply to this message)</i>"]
     for r in refs:
         pick = "Aggressive" if r.get("pick_type") == "aggressive" else "Safe"
         lines.append(
@@ -2459,8 +2462,193 @@ def _format_exit_trace_html(alert: dict[str, Any], level: str | None = None) -> 
         f"Expiry: <code>{expiry}</code>\n"
         f"{spot_line}"
         f"{level_line}"
-        f"<i>Search <code>{ref}</code> in this chat to find the original setup alert</i>\n"
+        f"<i>Replies to your entry alert  \u00b7  <code>/trade {alert.get('id')}</code></i>\n"
     )
+
+
+def _filter_trades_for_user(alerts: list[dict[str, Any]], chat_id: int) -> list[dict[str, Any]]:
+    prefs = get_user_alert_indices(chat_id)
+    if prefs is None:
+        return alerts
+    return [a for a in alerts if a.get("nse_symbol") in prefs]
+
+
+def _parse_trade_ref_arg(arg: str) -> int | None:
+    s = arg.strip().upper().lstrip("#")
+    if s.startswith("T-"):
+        s = s[2:]
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _trade_status_emoji(alert: dict[str, Any]) -> str:
+    status = alert.get("exit_status") or "OPEN"
+    if status == "OPEN":
+        return "\U0001f7e2"
+    if status in ("S5", "S10", "T1", "T2"):
+        return "\u26a1"
+    if status == "SL":
+        return "\U0001f534"
+    if status == "INVALIDATED":
+        return "\U0001f7e0"
+    return "\u26aa"
+
+
+def _fetch_live_premiums(alerts: list[dict[str, Any]]) -> dict[int, float]:
+    """Map alert id -> live premium for open legs."""
+    open_alerts = [a for a in alerts if (a.get("exit_status") or "OPEN") == "OPEN"]
+    if not open_alerts:
+        return {}
+    symbols = list({a["nse_symbol"] for a in open_alerts})
+    from concurrent.futures import ThreadPoolExecutor
+    chain_cache: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as pool:
+        for sym, chain in pool.map(_fetch_chain_for_sym, symbols):
+            chain_cache[sym] = chain
+    out: dict[int, float] = {}
+    for alert in open_alerts:
+        rows = chain_cache.get(alert["nse_symbol"], {}).get("rows") or []
+        live = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
+        if live and live > 0:
+            out[int(alert["id"])] = live
+    return out
+
+
+def format_trade_detail_html(alert: dict[str, Any], live_prem: float | None = None) -> str:
+    """Single trade status for /trade <id>."""
+    ref = _trade_ref(alert.get("id"))
+    name = html.escape(alert.get("index_name") or alert.get("nse_symbol") or "")
+    nse = html.escape(alert.get("nse_symbol") or "")
+    side = alert.get("side") or ""
+    strike = alert.get("strike") or ""
+    strategy = html.escape(alert.get("strategy") or "")
+    pick = _pick_label(alert)
+    entry = float(alert.get("entry_premium") or 0)
+    status = alert.get("exit_status") or "OPEN"
+    outcome = alert.get("outcome") or ("Open" if status == "OPEN" else status)
+    entry_time = _format_ist_alert_time(alert.get("alerted_at"))
+
+    lines = [
+        f"<b>\U0001f4ca TRADE {ref}</b>",
+        f"{_trade_status_emoji(alert)} <b>{name}</b> <code>{nse}</code>",
+        f"<code>{strike} {side}</code>  \u00b7  <b>{pick}</b>",
+        f"Strategy: {strategy}",
+        f"Entry: <b>{_ru(entry)}</b> at <code>{entry_time}</code>",
+    ]
+
+    if status == "OPEN" and live_prem is not None:
+        pnl = round(live_prem - entry, 2)
+        pnl_pct = round((live_prem - entry) / entry * 100, 1) if entry > 0 else 0
+        sign = "+" if pnl >= 0 else ""
+        lines.append(f"Live: <b>{_ru(live_prem)}</b>  ({sign}{pnl:.2f} pts / {sign}{pnl_pct}%)")
+        lines.append("")
+        lines.append("<b>Targets:</b>")
+        for tag, key in (("SL", "sl_premium"), ("+5%", "s5_premium"), ("+10%", "s10_premium"),
+                         ("T1", "t1_premium"), ("T2", "t2_premium")):
+            val = alert.get(key)
+            if val is not None:
+                hit = ""
+                if tag == "SL" and live_prem <= float(val):
+                    hit = " \u26a0\ufe0f"
+                elif tag != "SL" and live_prem >= float(val):
+                    hit = " \u2705"
+                lines.append(f"  {tag}: {_ru(float(val))}{hit}")
+    elif alert.get("close_premium") is not None:
+        close = float(alert["close_premium"])
+        pnl = float(alert.get("pnl_pts") or round(close - entry, 2))
+        sign = "+" if pnl >= 0 else ""
+        lines.append(f"Closed: <b>{_ru(close)}</b>  ({sign}{pnl:.2f} pts)")
+        lines.append(f"Outcome: <b>{html.escape(str(outcome))}</b>")
+
+    lines.append("")
+    lines.append("<i>Exit alerts reply under the original entry message</i>")
+    return "\n".join(lines)
+
+
+def format_trade_list_html(
+    alerts: list[dict[str, Any]], live_map: dict[int, float] | None = None,
+) -> str:
+    """Today's trades overview for /trade."""
+    if not alerts:
+        return "No trades found for your indices today."
+    live_map = live_map or {}
+    open_n = sum(1 for a in alerts if (a.get("exit_status") or "OPEN") == "OPEN")
+    lines = [
+        f"<b>\U0001f4ca TODAY'S TRADES</b>",
+        f"<i>{len(alerts)} total  \u00b7  {open_n} open</i>",
+        "",
+    ]
+    for a in alerts:
+        ref = _trade_ref(a.get("id"))
+        em = _trade_status_emoji(a)
+        name = html.escape(a.get("index_name") or a.get("nse_symbol") or "")
+        pick = " \U0001f4a5" if (a.get("pick_type") or "safe") == "aggressive" else ""
+        entry = float(a.get("entry_premium") or 0)
+        status = a.get("exit_status") or "OPEN"
+        aid = int(a["id"])
+        if status == "OPEN" and aid in live_map:
+            live = live_map[aid]
+            pnl = round(live - entry, 2)
+            sign = "+" if pnl >= 0 else ""
+            tail = f"live {_ru(live)} ({sign}{pnl:.2f} pts)"
+        elif a.get("outcome"):
+            pnl = float(a.get("pnl_pts") or 0)
+            sign = "+" if pnl >= 0 else ""
+            tail = f"{html.escape(str(a['outcome']))} ({sign}{pnl:.2f} pts)"
+        else:
+            tail = status
+        lines.append(
+            f"{em} <code>{ref}</code>{pick} <b>{name}</b> "
+            f"<code>{a.get('strike')} {a.get('side')}</code> @ {_ru(entry)}"
+        )
+        lines.append(f"   {html.escape((a.get('strategy') or '')[:32])}  \u00b7  {tail}")
+    lines.extend([
+        "",
+        "<i>/trade 42  \u00b7  /trade open  \u00b7  exit alerts reply to entry</i>",
+    ])
+    return "\n".join(lines)
+
+
+def build_trade_status(chat_id: int, arg: str | None = None) -> str:
+    """Build /trade response (sync — may fetch live premiums)."""
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    all_today = _get_today_alerts(unsummarized_only=False)
+    all_today = [
+        a for a in all_today
+        if (a.get("exit_status") or "") not in ("LEGACY",) and a.get("outcome") != "NO DATA"
+    ]
+    trades = _filter_trades_for_user(all_today, chat_id)
+    if not trades:
+        return "No trades today for your selected indices. Use /myalerts to check filters."
+
+    if arg:
+        arg_l = arg.strip().lower()
+        if arg_l == "open":
+            trades = [t for t in trades if (t.get("exit_status") or "OPEN") == "OPEN"]
+            live_map = _fetch_live_premiums(trades)
+            return format_trade_list_html(trades, live_map)
+        aid = _parse_trade_ref_arg(arg)
+        if aid is None:
+            return "Usage: /trade  \u00b7  /trade 42  \u00b7  /trade open"
+        alert = _get_alert_by_id(aid)
+        if not alert or alert.get("alert_date") != today:
+            return f"Trade {_trade_ref(aid)} not found today."
+        if not _filter_trades_for_user([alert], chat_id):
+            return "That trade is outside your /alert index filter."
+        live = None
+        if (alert.get("exit_status") or "OPEN") == "OPEN":
+            live_map = _fetch_live_premiums([alert])
+            live = live_map.get(aid)
+        return format_trade_detail_html(alert, live)
+
+    live_map = _fetch_live_premiums(trades)
+    return format_trade_list_html(trades, live_map)
+
+
+async def build_trade_status_async(chat_id: int, arg: str | None = None) -> str:
+    return await asyncio.to_thread(build_trade_status, chat_id, arg)
 
 
 def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, pnl: float) -> str:
@@ -2803,6 +2991,56 @@ async def _send_to_subscribers(bot, nse_symbol: str, html_text: str) -> None:
                 remove_subscriber(cid)
 
 
+async def _send_entry_alerts(
+    bot, nse_symbol: str, html_text: str, refs: list[dict[str, Any]],
+) -> None:
+    """Send entry alert and store message ids so exits can reply in-thread."""
+    from telegram.error import TelegramError
+    subscribers = get_subscribers_for_index(nse_symbol)
+    if not subscribers:
+        return
+    for cid in subscribers:
+        try:
+            msg = await bot.send_message(chat_id=cid, text=html_text, parse_mode="HTML")
+            for r in refs:
+                _save_alert_telegram_msg(int(r["id"]), cid, msg.message_id)
+            await asyncio.sleep(0.1)
+        except TelegramError as e:
+            log.error("Entry alert failed for chat=%s: %s", cid, e)
+            if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
+                remove_subscriber(cid)
+
+
+async def _send_trade_update(bot, alert: dict[str, Any], html_text: str) -> None:
+    """Send exit/invalidation as reply to the original entry message when possible."""
+    from telegram.error import TelegramError
+    subscribers = get_subscribers_for_index(alert["nse_symbol"])
+    if not subscribers:
+        return
+    alert_id = int(alert["id"])
+    for cid in subscribers:
+        reply_to = _get_alert_telegram_msg(alert_id, cid)
+        try:
+            kwargs: dict[str, Any] = {"chat_id": cid, "text": html_text, "parse_mode": "HTML"}
+            if reply_to:
+                kwargs["reply_to_message_id"] = reply_to
+            await bot.send_message(**kwargs)
+            await asyncio.sleep(0.1)
+        except TelegramError as e:
+            err = str(e).lower()
+            if reply_to and ("message to be replied" in err or "message not found" in err):
+                try:
+                    await bot.send_message(chat_id=cid, text=html_text, parse_mode="HTML")
+                    await asyncio.sleep(0.1)
+                    continue
+                except TelegramError as e2:
+                    e = e2
+                    err = str(e2).lower()
+            log.error("Trade update failed chat=%s alert=%s: %s", cid, alert_id, e)
+            if "Forbidden" in str(e) or "blocked" in err or "not found" in err:
+                remove_subscriber(cid)
+
+
 async def run_fno_exit_monitor(bot):
     """Fast loop: check exit levels every ~10s for active alerts (SL/targets/scalps).
 
@@ -2828,14 +3066,14 @@ async def run_fno_exit_monitor(bot):
             exit_signals = await check_active_exits_async()
             for ex_sig in exit_signals:
                 alert = ex_sig["alert"]
-                await _send_to_subscribers(bot, alert["nse_symbol"], ex_sig["html"])
+                await _send_trade_update(bot, alert, ex_sig["html"])
 
             cycle += 1
             if cycle % 6 == 0:
                 inv_signals = await check_setup_invalidations_async()
                 for inv in inv_signals:
                     alert = inv["alert"]
-                    await _send_to_subscribers(bot, alert["nse_symbol"], inv["html"])
+                    await _send_trade_update(bot, alert, inv["html"])
 
         except Exception as e:
             log.exception("FnO exit monitor error: %s", e)
@@ -2868,7 +3106,7 @@ async def run_fno_monitor(bot):
                 for sig in signals:
                     refs = _record_alerts_for_signal(sig)
                     text = format_alert_html(sig, refs=refs)
-                    await _send_to_subscribers(bot, sig["nse"], text)
+                    await _send_entry_alerts(bot, sig["nse"], text, refs)
                     agg = sig.get("aggressive")
                     ref_str = ", ".join(_trade_ref(r["id"]) for r in refs)
                     log.info(

@@ -56,6 +56,7 @@ from fno_entry_service import (
     format_user_alert_prefs_html,
     format_alert_prefs_set_html,
     format_alert_usage_html,
+    build_trade_status_async,
     ALL_NSE_SYMBOLS,
 )
 from news_service import (
@@ -296,6 +297,9 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 /alert — choose which index alerts (nifty, banknifty, …)
 /clearalert — reset to all indices
 /myalerts — show your alert filter
+/trade — today's trades (live P&amp;L on open legs)
+/trade 42 — detail for trade #T-42
+/trade open — open trades only
 /testdip — sample dip alert
 /testalert — test alert delivery
 
@@ -494,6 +498,9 @@ Reuses the same live message (no spam):
 /alert — choose which index alerts (nifty, banknifty, …)
 /clearalert — reset to all indices
 /myalerts — show your alert filter
+/trade — today's trades (live P&amp;L on open legs)
+/trade 42 — detail for trade #T-42
+/trade open — open trades only
 /testdip — sample dip alert
 /testalert — test alert delivery
 """
@@ -631,6 +638,17 @@ async def cmd_clearalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.effective_message.reply_html(
         "<b>✅ F&amp;O alerts cleared</b>\n\nYou will receive alerts for <b>all indices</b> again."
     )
+
+
+async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show today's F&O trades with live status. Respects /alert index prefs."""
+    if not update.effective_message or not update.effective_chat:
+        return
+    ensure_fno_tables()
+    arg = " ".join(context.args) if context.args else None
+    await update.effective_message.reply_text("⏳ Fetching trade status...")
+    text = await build_trade_status_async(update.effective_chat.id, arg)
+    await reply_html_chunked(update.effective_message, text)
 
 
 async def cmd_myalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1819,6 +1837,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("summaryweek", cmd_summaryweek))
     app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("trade", cmd_trade))
     app.add_handler(CommandHandler("clearalert", cmd_clearalert))
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("movies", cmd_movies))

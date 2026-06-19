@@ -144,10 +144,15 @@ def ensure_fno_storage() -> None:
         db.fno_eod_sent.create_index([("alert_date", 1)], unique=True)
         db.fno_alert_prefs.create_index([("chat_id", 1)])
         db.fno_alert_prefs.create_index([("chat_id", 1), ("nse_symbol", 1)], unique=True)
+        db.fno_alert_tg.create_index([("alert_id", 1), ("chat_id", 1)], unique=True)
+        db.fno_alert_tg.create_index([("alert_date", 1)])
         cutoff = _retention_cutoff()
         r = db.fno_alerts.delete_many({"summarized": 1, "alert_date": {"$lt": cutoff}})
         if r.deleted_count:
             log.info("F&O MongoDB: pruned %d old summarized alerts (before %s)", r.deleted_count, cutoff)
+        r2 = db.fno_alert_tg.delete_many({"alert_date": {"$lt": cutoff}})
+        if r2.deleted_count:
+            log.info("F&O MongoDB: pruned %d old telegram message refs", r2.deleted_count)
         return
 
     con = sqlite3.connect(DB_FILE)
@@ -195,6 +200,15 @@ def ensure_fno_storage() -> None:
                 chat_id     INTEGER NOT NULL,
                 nse_symbol  TEXT NOT NULL,
                 PRIMARY KEY (chat_id, nse_symbol)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS fno_alert_tg (
+                alert_id    INTEGER NOT NULL,
+                chat_id     INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                alert_date  TEXT NOT NULL,
+                PRIMARY KEY (alert_id, chat_id)
             )
         """)
         con.execute("""
@@ -722,5 +736,80 @@ def update_exit_status(alert_id: int, exit_status: str, live_premium: float) -> 
             (live_premium, exit_status, alert_id),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def save_alert_telegram_msg(alert_id: int, chat_id: int, message_id: int) -> None:
+    """Store entry alert Telegram message id for reply threading on exit."""
+    today = _ist_today()
+    if use_mongodb():
+        _get_mongo_db().fno_alert_tg.update_one(
+            {"alert_id": alert_id, "chat_id": chat_id},
+            {"$set": {
+                "alert_id": alert_id,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "alert_date": today,
+            }},
+            upsert=True,
+        )
+        return
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            """INSERT INTO fno_alert_tg (alert_id, chat_id, message_id, alert_date)
+               VALUES (?,?,?,?)
+               ON CONFLICT(alert_id, chat_id) DO UPDATE SET message_id=excluded.message_id""",
+            (alert_id, chat_id, message_id, today),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_alert_telegram_msg(alert_id: int, chat_id: int) -> int | None:
+    if use_mongodb():
+        doc = _get_mongo_db().fno_alert_tg.find_one({"alert_id": alert_id, "chat_id": chat_id})
+        return int(doc["message_id"]) if doc else None
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            "SELECT message_id FROM fno_alert_tg WHERE alert_id=? AND chat_id=?",
+            (alert_id, chat_id),
+        ).fetchone()
+        return int(row[0]) if row else None
+    finally:
+        con.close()
+
+
+def get_alert_by_id(alert_id: int) -> dict[str, Any] | None:
+    if use_mongodb():
+        doc = _get_mongo_db().fno_alerts.find_one({"id": alert_id})
+        return _doc_to_alert(doc) if doc else None
+    con = sqlite3.connect(DB_FILE)
+    try:
+        row = con.execute(
+            """SELECT id, nse_symbol, index_name, strategy, side, strike,
+                      entry_premium, sl_premium, t1_premium, t2_premium,
+                      spot_at_entry, expiry, alerted_at,
+                      close_premium, outcome, pnl_pts, summarized, alert_date
+               FROM fno_alerts WHERE id=?""",
+            (alert_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return _doc_to_alert({
+            "id": row[0], "nse_symbol": row[1], "index_name": row[2],
+            "strategy": row[3], "side": row[4], "strike": row[5],
+            "entry_premium": row[6], "sl_premium": row[7],
+            "t1_premium": row[8], "t2_premium": row[9],
+            "spot_at_entry": row[10], "expiry": row[11], "alerted_at": row[12],
+            "close_premium": row[13], "outcome": row[14], "pnl_pts": row[15],
+            "summarized": row[16], "alert_date": row[17],
+            "exit_status": "OPEN",
+            "pick_type": "safe",
+            "entry_conditions": {},
+        })
     finally:
         con.close()
