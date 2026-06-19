@@ -2411,22 +2411,31 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
     )
 
 
+def _fetch_chain_for_sym(sym: str) -> tuple[str, dict[str, Any]]:
+    """Fetch option chain for a single symbol (used in parallel threads)."""
+    return sym, _parse_option_chain(sym, NSELive()) or {}
+
+
 def check_active_exits() -> list[dict[str, Any]]:
     """Check live premiums of open alerts and return exit signals."""
     active = _get_active_alerts()
     if not active:
         return []
 
-    log.info("Exit monitor: checking %d active alerts", len(active))
-    nse = NSELive()
+    symbols = list({a["nse_symbol"] for a in active})
+    log.info("Exit monitor: checking %d alerts across %s", len(active), symbols)
+
+    from concurrent.futures import ThreadPoolExecutor
     chain_cache: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 4)) as pool:
+        for sym, chain in pool.map(_fetch_chain_for_sym, symbols):
+            chain_cache[sym] = chain
+
     exit_signals: list[dict[str, Any]] = []
 
     for alert in active:
         sym = alert["nse_symbol"]
-        if sym not in chain_cache:
-            chain_cache[sym] = _parse_option_chain(sym, nse) or {}
-        rows = chain_cache[sym].get("rows") or []
+        rows = chain_cache.get(sym, {}).get("rows") or []
         if not rows:
             log.warning("Exit monitor: no chain data for %s", sym)
             continue
@@ -2680,9 +2689,15 @@ async def _send_to_subscribers(bot, nse_symbol: str, html_text: str) -> None:
 
 
 async def run_fno_exit_monitor(bot):
-    """Fast loop: check exit levels every 30s for active alerts (SL/targets/scalps)."""
-    interval = max(15, FNO_EXIT_CHECK_INTERVAL)
+    """Fast loop: check exit levels every ~10s for active alerts (SL/targets/scalps).
+
+    Fetches option chains in parallel threads so all symbols are checked
+    within a few seconds regardless of how many active alerts exist.
+    Invalidation checks run every 6th cycle (~60s) to save API calls.
+    """
+    interval = max(5, FNO_EXIT_CHECK_INTERVAL)
     log.info("FnO EXIT monitor started: checking every %ds during market hours", interval)
+    cycle = 0
 
     while True:
         try:
@@ -2700,10 +2715,12 @@ async def run_fno_exit_monitor(bot):
                 alert = ex_sig["alert"]
                 await _send_to_subscribers(bot, alert["nse_symbol"], ex_sig["html"])
 
-            inv_signals = await check_setup_invalidations_async()
-            for inv in inv_signals:
-                alert = inv["alert"]
-                await _send_to_subscribers(bot, alert["nse_symbol"], inv["html"])
+            cycle += 1
+            if cycle % 6 == 0:
+                inv_signals = await check_setup_invalidations_async()
+                for inv in inv_signals:
+                    alert = inv["alert"]
+                    await _send_to_subscribers(bot, alert["nse_symbol"], inv["html"])
 
         except Exception as e:
             log.exception("FnO exit monitor error: %s", e)
