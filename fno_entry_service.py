@@ -85,12 +85,14 @@ FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true
 # 0 = no cap (all strategies that pass quality); 3 = up to 3 per index per scan
 FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "0"))
 FNO_MACD_MTF_ENABLED = os.getenv("FNO_MACD_MTF_ENABLED", "1").strip().lower() in ("1", "true", "yes")
-FNO_MACD_REQUIRE_5M = os.getenv("FNO_MACD_REQUIRE_5M", "1").strip().lower() in ("1", "true", "yes")
+FNO_MACD_REQUIRE_5M = os.getenv("FNO_MACD_REQUIRE_5M", "0").strip().lower() in ("1", "true", "yes")
+FNO_MACD_CROSS_LOOKBACK = max(1, int(os.getenv("FNO_MACD_CROSS_LOOKBACK", "3")))
 FNO_PAPER_CAPITAL = float(os.getenv("FNO_PAPER_CAPITAL", "50000"))
 
 # In-memory cache: yahoo_symbol -> (timestamp, tech dict)
 _intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _vix_cache: tuple[float, float] | None = None
+_macd_1h_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
@@ -291,8 +293,8 @@ def _macd_lines(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 
     return macd, sig, hist
 
 
-def _macd_bar_state(close: pd.Series) -> dict[str, Any] | None:
-    """Bull/bear alignment and crossover on the last closed bar."""
+def _macd_bar_state(close: pd.Series, *, cross_lookback: int = 1) -> dict[str, Any] | None:
+    """Bull/bear alignment and crossover (current bar or recent bars for entry)."""
     if close is None or len(close) < 35:
         return None
     macd, sig, _hist = _macd_lines(close)
@@ -300,16 +302,47 @@ def _macd_bar_state(close: pd.Series) -> dict[str, Any] | None:
     pm, ps = float(macd.iloc[-2]), float(sig.iloc[-2])
     if any(math.isnan(x) for x in (m, s, pm, ps)):
         return None
+
+    cross_up = pm <= ps and m > s
+    cross_down = pm >= ps and m < s
+    if cross_lookback > 1:
+        start = max(1, len(macd) - cross_lookback)
+        for i in range(start, len(macd)):
+            mi, si = float(macd.iloc[i]), float(sig.iloc[i])
+            pmi, psi = float(macd.iloc[i - 1]), float(sig.iloc[i - 1])
+            if pmi <= psi and mi > si:
+                cross_up = True
+            if pmi >= psi and mi < si:
+                cross_down = True
+
     return {
         "bull": m > s,
         "bear": m < s,
         "above_zero": m > 0,
         "below_zero": m < 0,
-        "cross_up": pm <= ps and m > s,
-        "cross_down": pm >= ps and m < s,
+        "cross_up": cross_up,
+        "cross_down": cross_down,
         "macd": round(m, 4),
         "signal": round(s, 4),
     }
+
+
+def _fetch_1h_closes(yahoo_symbol: str) -> pd.Series | None:
+    """Direct 1H history — resampled 5d 15m only yields ~34 bars (too short for MACD)."""
+    global _macd_1h_cache
+    now = time.time()
+    cached = _macd_1h_cache.get(yahoo_symbol)
+    if cached and now - cached[0] < FNO_YAHOO_CACHE_TTL:
+        close = cached[1]
+        return close if close is not None and len(close) >= 35 else None
+    try:
+        df = _yf_history(yf.Ticker(yahoo_symbol), period="60d", interval="1h")
+        close = df["Close"].dropna() if not df.empty else pd.Series(dtype=float)
+        _macd_1h_cache[yahoo_symbol] = (now, close)
+        return close if len(close) >= 35 else None
+    except Exception as e:
+        log.debug("1H MACD fetch failed for %s: %s", yahoo_symbol, e)
+        return None
 
 
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -330,22 +363,24 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 
 def _build_mtf_macd(yahoo_symbol: str, df_15m: pd.DataFrame) -> dict[str, Any]:
-    """1H (from 15m) + 15m + optional 5m MACD alignment."""
+    """1H (direct Yahoo) + 15m + optional 5m MACD alignment."""
     out: dict[str, Any] = {"ready": False}
     close_15 = df_15m["Close"].dropna()
-    m15 = _macd_bar_state(close_15)
+    m15 = _macd_bar_state(close_15, cross_lookback=FNO_MACD_CROSS_LOOKBACK)
     if not m15:
         return out
 
-    df_1h = _resample_ohlcv(df_15m, "1h")
-    m1h = _macd_bar_state(df_1h["Close"].dropna()) if len(df_1h) >= 35 else None
+    close_1h = _fetch_1h_closes(yahoo_symbol)
+    m1h = _macd_bar_state(close_1h) if close_1h is not None else None
 
     m5: dict[str, Any] | None = None
     if FNO_MACD_REQUIRE_5M:
         try:
             df_5 = _yf_history(yf.Ticker(yahoo_symbol), period="5d", interval="5m")
             if not df_5.empty and len(df_5) >= 35:
-                m5 = _macd_bar_state(df_5["Close"].dropna())
+                m5 = _macd_bar_state(
+                    df_5["Close"].dropna(), cross_lookback=FNO_MACD_CROSS_LOOKBACK,
+                )
         except Exception as e:
             log.debug("5m MACD fetch failed for %s: %s", yahoo_symbol, e)
 
