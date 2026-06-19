@@ -304,6 +304,7 @@ def get_user_alert_indices(chat_id: int) -> set[str] | None:
 
 
 def already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> bool:
+    """Only block if there's an OPEN (active) alert for this exact combo today."""
     today = _ist_today()
     if use_mongodb():
         return _get_mongo_db().fno_alerts.find_one({
@@ -312,12 +313,14 @@ def already_alerted(nse_symbol: str, strategy: str, side: str, strike: int) -> b
             "strategy": strategy,
             "side": side,
             "strike": strike,
+            "exit_status": "OPEN",
         }) is not None
     con = sqlite3.connect(DB_FILE)
     try:
         return con.execute(
             """SELECT 1 FROM fno_alerts
-               WHERE alert_date=? AND nse_symbol=? AND strategy=? AND side=? AND strike=?""",
+               WHERE alert_date=? AND nse_symbol=? AND strategy=? AND side=? AND strike=?
+               AND (outcome IS NULL OR outcome = '')""",
             (today, nse_symbol, strategy, side, strike),
         ).fetchone() is not None
     finally:
