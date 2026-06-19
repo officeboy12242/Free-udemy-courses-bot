@@ -50,6 +50,7 @@ from fno_storage import (
     clear_user_alert_indices,
     eod_summary_sent_today as _eod_summary_sent_today,
     ensure_fno_storage,
+    get_active_alerts as _get_active_alerts,
     get_alerts_between as _get_alerts_between,
     get_scan_stats_for_date,
     get_scan_stats_range,
@@ -61,6 +62,7 @@ from fno_storage import (
     set_user_alert_indices,
     storage_backend_label,
     update_alert_result as _update_alert_result,
+    update_exit_status as _update_exit_status,
 )
 from market_service import get_all_subscribers, remove_subscriber
 
@@ -2304,6 +2306,160 @@ async def run_fno_eod_summary(bot):
         await asyncio.sleep(180)
 
 
+# ════════════════════ Live exit monitoring ════════════════════
+
+EXIT_LEVELS = [
+    ("SL", "sl_premium", "SL LOSS"),
+    ("S5", "s5_premium", "SCALP 5%"),
+    ("S10", "s10_premium", "SCALP 10%"),
+    ("T1", "t1_premium", "T1 WIN"),
+    ("T2", "t2_premium", "T2 WIN"),
+]
+
+
+def _check_exit_level(alert: dict[str, Any], live_prem: float) -> tuple[str, str, float] | None:
+    """Return (level_tag, outcome, pnl_pts) if an exit level is hit, else None."""
+    entry = float(alert.get("entry_premium") or 0)
+    if entry <= 0 or live_prem <= 0:
+        return None
+
+    sl = float(alert.get("sl_premium") or entry * SL_MULT)
+    t2 = float(alert.get("t2_premium") or entry * T2_MULT)
+    t1 = float(alert.get("t1_premium") or entry * T1_MULT)
+    s5 = float(alert.get("s5_premium") or entry * 1.05)
+    s10 = float(alert.get("s10_premium") or entry * 1.10)
+
+    pnl = round(live_prem - entry, 2)
+
+    if live_prem <= sl:
+        return "SL", "SL LOSS", pnl
+    if live_prem >= t2:
+        return "T2", "T2 WIN", pnl
+    if live_prem >= t1:
+        return "T1", "T1 WIN", pnl
+    if live_prem >= s10:
+        return "S10", "SCALP 10%", pnl
+    if live_prem >= s5:
+        return "S5", "SCALP 5%", pnl
+    return None
+
+
+def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, pnl: float) -> str:
+    """Format an exit notification for Telegram."""
+    name = html.escape(alert.get("index_name") or alert.get("nse_symbol") or "")
+    nse = html.escape(alert.get("nse_symbol") or "")
+    side = alert.get("side") or ""
+    entry = float(alert.get("entry_premium") or 0)
+    strategy = html.escape((alert.get("strategy") or "")[:30])
+    strike = alert.get("strike") or ""
+    lot = _lot_size(alert.get("nse_symbol") or "")
+    lots = _lots_for_capital(FNO_PAPER_CAPITAL, entry, lot) if entry > 0 else 0
+    pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
+    pnl_sign = "+" if pnl >= 0 else ""
+    rs_str = f"  (\u20b9{pnl_rs:+,.0f})" if lots > 0 else ""
+
+    if level == "SL":
+        emoji = "\U0001f6a8"
+        title = "EXIT \u2014 STOP LOSS HIT"
+        action = "Close position immediately. Hard SL triggered."
+        tag_color = "\U0001f534"
+    elif level == "T2":
+        emoji = "\U0001f3c6"
+        title = "EXIT \u2014 TARGET 2 HIT"
+        action = "Full target achieved! Close remaining position."
+        tag_color = "\U0001f7e2"
+    elif level == "T1":
+        emoji = "\U0001f3af"
+        title = "BOOK PROFIT \u2014 TARGET 1 HIT"
+        action = "Book 50% profit. Trail SL to entry for rest."
+        tag_color = "\U0001f7e2"
+    elif level == "S10":
+        emoji = "\u26a1"
+        title = "QUICK SCALP \u2014 +10% HIT"
+        action = "Book 20% more. Move SL to entry (cost-free trade)."
+        tag_color = "\U0001f7e1"
+    elif level == "S5":
+        emoji = "\u26a1"
+        title = "QUICK SCALP \u2014 +5% HIT"
+        action = "Book 30% position. Keep rest for bigger targets."
+        tag_color = "\U0001f7e1"
+    else:
+        emoji = "\u2753"
+        title = f"EXIT \u2014 {level}"
+        action = "Review position."
+        tag_color = "\u26aa"
+
+    return (
+        f"{emoji} <b>{title}</b> {emoji}\n"
+        f"\n"
+        f"{tag_color} <b>{name}</b> <code>{nse}</code>  \u2014  <code>{strike} {side}</code>\n"
+        f"\U0001f4cc {strategy}\n"
+        f"\n"
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+        f"\u2502  Entry:   <b>{_ru(entry)}</b>\n"
+        f"\u2502  Now:     <b>{_ru(live_prem)}</b>\n"
+        f"\u2502  P&amp;L:    <b>{pnl_sign}{pnl:.2f} pts</b>{rs_str}\n"
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
+        f"\n"
+        f"\U0001f4a1 <b>{action}</b>\n"
+        f"\n"
+        f"<i>\u26a0\ufe0f Paper trade \u00b7 Not financial advice</i>"
+    )
+
+
+def check_active_exits() -> list[dict[str, Any]]:
+    """Check live premiums of open alerts and return exit signals."""
+    active = _get_active_alerts()
+    if not active:
+        return []
+
+    nse = NSELive()
+    chain_cache: dict[str, dict] = {}
+    exit_signals: list[dict[str, Any]] = []
+
+    for alert in active:
+        sym = alert["nse_symbol"]
+        if sym not in chain_cache:
+            chain_cache[sym] = _parse_option_chain(sym, nse) or {}
+        rows = chain_cache[sym].get("rows") or []
+        if not rows:
+            continue
+
+        live = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
+        if live is None or live <= 0:
+            continue
+
+        hit = _check_exit_level(alert, live)
+        if hit is None:
+            continue
+
+        level, outcome, pnl = hit
+        _update_exit_status(alert["id"], level, live)
+        _update_alert_result(alert["id"], live, outcome, pnl)
+
+        exit_signals.append({
+            "alert": alert,
+            "level": level,
+            "outcome": outcome,
+            "live_premium": live,
+            "pnl": pnl,
+            "html": format_exit_alert_html(alert, level, live, pnl),
+        })
+        log.info(
+            "EXIT %s: %s %s %s @ %s → %s (%.2f pts)",
+            level, alert["index_name"], alert["strike"], alert["side"],
+            alert["entry_premium"], live, pnl,
+        )
+
+    return exit_signals
+
+
+async def check_active_exits_async() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(check_active_exits)
+
+
 # ════════════════════ Auto-monitor loop ════════════════════
 
 async def run_fno_monitor(bot):
@@ -2327,35 +2483,49 @@ async def run_fno_monitor(bot):
                 continue
 
             signals = await scan_all_indices_async()
-            if not signals:
+            if signals:
+                for sig in signals:
+                    text = format_alert_html(sig)
+                    _record_alert(sig)
+
+                    subscribers = get_subscribers_for_index(sig["nse"])
+                    if not subscribers:
+                        continue
+
+                    sent = 0
+                    for cid in subscribers:
+                        try:
+                            await bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+                            sent += 1
+                            await asyncio.sleep(0.1)
+                        except TelegramError as e:
+                            log.error("FnO alert failed for %s chat=%s: %s", sig["nse"], cid, e)
+                            if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
+                                remove_subscriber(cid)
+
+                    log.info(
+                        "FnO ALERT sent to %d users: %s %s %s %s @ %s",
+                        sent, sig["strategy"], sig["name"], sig["side"],
+                        sig["strike"], sig["premium"],
+                    )
+            else:
                 log.debug("FnO scan: no new signals this cycle")
-                await asyncio.sleep(interval)
-                continue
 
-            for sig in signals:
-                text = format_alert_html(sig)
-                _record_alert(sig)
-
-                subscribers = get_subscribers_for_index(sig["nse"])
+            exit_signals = await check_active_exits_async()
+            for ex_sig in exit_signals:
+                alert = ex_sig["alert"]
+                exit_html = ex_sig["html"]
+                subscribers = get_subscribers_for_index(alert["nse_symbol"])
                 if not subscribers:
                     continue
-
-                sent = 0
                 for cid in subscribers:
                     try:
-                        await bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
-                        sent += 1
+                        await bot.send_message(chat_id=cid, text=exit_html, parse_mode="HTML")
                         await asyncio.sleep(0.1)
                     except TelegramError as e:
-                        log.error("FnO alert failed for %s chat=%s: %s", sig["nse"], cid, e)
+                        log.error("Exit alert failed for chat=%s: %s", cid, e)
                         if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
                             remove_subscriber(cid)
-
-                log.info(
-                    "FnO ALERT sent to %d users: %s %s %s %s @ %s",
-                    sent, sig["strategy"], sig["name"], sig["side"],
-                    sig["strike"], sig["premium"],
-                )
 
         except Exception as e:
             log.exception("FnO monitor error: %s", e)

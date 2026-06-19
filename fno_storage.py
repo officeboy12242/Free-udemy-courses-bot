@@ -324,6 +324,8 @@ def record_alert(signal: dict[str, Any]) -> None:
     today = _ist_today()
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%dT%H:%M:%S")
     ex = signal.get("exits") or {}
+    s5 = round(float(signal.get("premium") or 0) * (1 + float(os.getenv("FNO_SCALP_T5_PCT", "5")) / 100), 2)
+    s10 = round(float(signal.get("premium") or 0) * (1 + float(os.getenv("FNO_SCALP_T10_PCT", "10")) / 100), 2)
     if use_mongodb():
         db = _get_mongo_db()
         aid = _next_alert_id(db)
@@ -337,6 +339,8 @@ def record_alert(signal: dict[str, Any]) -> None:
             "strike": signal["strike"],
             "entry_premium": signal.get("premium"),
             "sl_premium": ex.get("sl"),
+            "s5_premium": s5,
+            "s10_premium": s10,
             "t1_premium": ex.get("t1"),
             "t2_premium": ex.get("t2"),
             "spot_at_entry": signal.get("spot"),
@@ -345,6 +349,7 @@ def record_alert(signal: dict[str, Any]) -> None:
             "close_premium": None,
             "outcome": None,
             "pnl_pts": None,
+            "exit_status": "OPEN",
             "summarized": 0,
         })
         return
@@ -581,6 +586,60 @@ def update_alert_result(alert_id: int, close_ltp: float, outcome: str, pnl: floa
             """UPDATE fno_alerts SET close_premium=?, outcome=?, pnl_pts=?, summarized=1
                WHERE id=?""",
             (close_ltp, outcome, pnl, alert_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def get_active_alerts() -> list[dict[str, Any]]:
+    """Get today's alerts that are still OPEN (no exit triggered yet)."""
+    today = _ist_today()
+    if use_mongodb():
+        cursor = _get_mongo_db().fno_alerts.find(
+            {"alert_date": today, "exit_status": "OPEN"}
+        ).sort("alerted_at", 1)
+        return [_doc_to_alert(d) for d in cursor]
+    con = sqlite3.connect(DB_FILE)
+    try:
+        rows = con.execute(
+            """SELECT id, nse_symbol, index_name, strategy, side, strike,
+                      entry_premium, sl_premium, t1_premium, t2_premium,
+                      spot_at_entry, expiry, alerted_at,
+                      close_premium, outcome, pnl_pts, summarized
+               FROM fno_alerts WHERE alert_date = ? AND (outcome IS NULL OR outcome = '')
+               ORDER BY alerted_at ASC""",
+            (today,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "nse_symbol": r[1], "index_name": r[2] or r[1],
+                "strategy": r[3], "side": r[4], "strike": r[5],
+                "entry_premium": r[6], "sl_premium": r[7],
+                "t1_premium": r[8], "t2_premium": r[9],
+                "spot_at_entry": r[10], "expiry": r[11], "alerted_at": r[12],
+                "close_premium": r[13], "outcome": r[14], "pnl_pts": r[15],
+                "summarized": r[16], "alert_date": today,
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
+
+
+def update_exit_status(alert_id: int, exit_status: str, live_premium: float) -> None:
+    """Mark an alert with its exit status (S5, S10, T1, T2, SL)."""
+    if use_mongodb():
+        _get_mongo_db().fno_alerts.update_one(
+            {"id": alert_id},
+            {"$set": {"exit_status": exit_status, "close_premium": live_premium}},
+        )
+        return
+    con = sqlite3.connect(DB_FILE)
+    try:
+        con.execute(
+            "UPDATE fno_alerts SET close_premium=?, outcome=? WHERE id=?",
+            (live_premium, exit_status, alert_id),
         )
         con.commit()
     finally:
