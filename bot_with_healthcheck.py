@@ -41,6 +41,7 @@ from fno_entry_service import (
     filter_entry_payload_for_user,
     format_entry_telegram_html,
     run_fno_monitor,
+    run_fno_exit_monitor,
     run_fno_eod_summary,
     ensure_fno_tables,
     build_eod_summary_async,
@@ -2520,6 +2521,9 @@ async def main():
         log.info("📊 F&O trade history storage: %s", storage_backend_label())
         tasks.append(
             asyncio.create_task(run_fno_monitor(bot))
+        )
+        tasks.append(
+            asyncio.create_task(run_fno_exit_monitor(bot))
         )
         tasks.append(
             asyncio.create_task(run_fno_eod_summary(bot))

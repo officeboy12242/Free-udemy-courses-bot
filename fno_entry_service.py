@@ -71,6 +71,7 @@ load_dotenv()
 log = logging.getLogger(__name__)
 
 FNO_SCAN_INTERVAL = int(os.getenv("FNO_SCAN_INTERVAL", "180"))
+FNO_EXIT_CHECK_INTERVAL = int(os.getenv("FNO_EXIT_CHECK_INTERVAL", "30"))
 FNO_YAHOO_CACHE_TTL = int(os.getenv("FNO_YAHOO_CACHE_TTL", "120"))
 # Stricter filters for auto-alerts; /entry shows all setups + pass/fail vs same filters
 FNO_STRICT_FILTERS = os.getenv("FNO_STRICT_FILTERS", "1").strip().lower() in ("1", "true", "yes")
@@ -2416,6 +2417,7 @@ def check_active_exits() -> list[dict[str, Any]]:
     if not active:
         return []
 
+    log.info("Exit monitor: checking %d active alerts", len(active))
     nse = NSELive()
     chain_cache: dict[str, dict] = {}
     exit_signals: list[dict[str, Any]] = []
@@ -2426,11 +2428,24 @@ def check_active_exits() -> list[dict[str, Any]]:
             chain_cache[sym] = _parse_option_chain(sym, nse) or {}
         rows = chain_cache[sym].get("rows") or []
         if not rows:
+            log.warning("Exit monitor: no chain data for %s", sym)
             continue
 
         live = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
         if live is None or live <= 0:
+            log.warning(
+                "Exit monitor: no LTP for %s %s %s",
+                sym, alert["strike"], alert["side"],
+            )
             continue
+
+        entry = float(alert.get("entry_premium") or 0)
+        s5 = float(alert.get("s5_premium") or entry * 1.05)
+        log.info(
+            "Exit monitor: %s %s%s entry=%.2f live=%.2f s5=%.2f (%.1f%%)",
+            sym, alert["strike"], alert["side"], entry, live, s5,
+            ((live - entry) / entry * 100) if entry > 0 else 0,
+        )
 
         hit = _check_exit_level(alert, live)
         if hit is None:
@@ -2449,9 +2464,9 @@ def check_active_exits() -> list[dict[str, Any]]:
             "html": format_exit_alert_html(alert, level, live, pnl),
         })
         log.info(
-            "EXIT %s: %s %s %s @ %s → %s (%.2f pts)",
+            "EXIT HIT %s: %s %s %s @ %.2f -> %.2f (%.2f pts)",
             level, alert["index_name"], alert["strike"], alert["side"],
-            alert["entry_premium"], live, pnl,
+            entry, live, pnl,
         )
 
     return exit_signals
@@ -2648,11 +2663,59 @@ async def check_setup_invalidations_async() -> list[dict[str, Any]]:
 
 # ════════════════════ Auto-monitor loop ════════════════════
 
+async def _send_to_subscribers(bot, nse_symbol: str, html_text: str) -> None:
+    """Send a message to all subscribers of an index, removing blocked users."""
+    from telegram.error import TelegramError
+    subscribers = get_subscribers_for_index(nse_symbol)
+    if not subscribers:
+        return
+    for cid in subscribers:
+        try:
+            await bot.send_message(chat_id=cid, text=html_text, parse_mode="HTML")
+            await asyncio.sleep(0.1)
+        except TelegramError as e:
+            log.error("Send failed for chat=%s: %s", cid, e)
+            if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
+                remove_subscriber(cid)
+
+
+async def run_fno_exit_monitor(bot):
+    """Fast loop: check exit levels every 30s for active alerts (SL/targets/scalps)."""
+    interval = max(15, FNO_EXIT_CHECK_INTERVAL)
+    log.info("FnO EXIT monitor started: checking every %ds during market hours", interval)
+
+    while True:
+        try:
+            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+            market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+            market_close = now_ist.replace(hour=15, minute=35, second=0, microsecond=0)
+            is_weekday = now_ist.weekday() < 5
+
+            if not (is_weekday and market_open <= now_ist <= market_close):
+                await asyncio.sleep(interval)
+                continue
+
+            exit_signals = await check_active_exits_async()
+            for ex_sig in exit_signals:
+                alert = ex_sig["alert"]
+                await _send_to_subscribers(bot, alert["nse_symbol"], ex_sig["html"])
+
+            inv_signals = await check_setup_invalidations_async()
+            for inv in inv_signals:
+                alert = inv["alert"]
+                await _send_to_subscribers(bot, alert["nse_symbol"], inv["html"])
+
+        except Exception as e:
+            log.exception("FnO exit monitor error: %s", e)
+
+        await asyncio.sleep(interval)
+
+
 async def run_fno_monitor(bot):
     """Background loop: scan every FNO_SCAN_INTERVAL seconds, send alerts on new setups."""
     ensure_fno_tables()
     interval = max(60, FNO_SCAN_INTERVAL)
-    log.info("FnO monitor started: scanning every %ds during market hours", interval)
+    log.info("FnO ENTRY monitor started: scanning every %ds during market hours", interval)
 
     from telegram.error import TelegramError
 
@@ -2673,61 +2736,14 @@ async def run_fno_monitor(bot):
                 for sig in signals:
                     text = format_alert_html(sig)
                     _record_alert(sig)
-
-                    subscribers = get_subscribers_for_index(sig["nse"])
-                    if not subscribers:
-                        continue
-
-                    sent = 0
-                    for cid in subscribers:
-                        try:
-                            await bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
-                            sent += 1
-                            await asyncio.sleep(0.1)
-                        except TelegramError as e:
-                            log.error("FnO alert failed for %s chat=%s: %s", sig["nse"], cid, e)
-                            if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
-                                remove_subscriber(cid)
-
+                    await _send_to_subscribers(bot, sig["nse"], text)
                     log.info(
-                        "FnO ALERT sent to %d users: %s %s %s %s @ %s",
-                        sent, sig["strategy"], sig["name"], sig["side"],
+                        "FnO ALERT sent: %s %s %s %s @ %s",
+                        sig["strategy"], sig["name"], sig["side"],
                         sig["strike"], sig["premium"],
                     )
             else:
                 log.debug("FnO scan: no new signals this cycle")
-
-            exit_signals = await check_active_exits_async()
-            for ex_sig in exit_signals:
-                alert = ex_sig["alert"]
-                exit_html = ex_sig["html"]
-                subscribers = get_subscribers_for_index(alert["nse_symbol"])
-                if not subscribers:
-                    continue
-                for cid in subscribers:
-                    try:
-                        await bot.send_message(chat_id=cid, text=exit_html, parse_mode="HTML")
-                        await asyncio.sleep(0.1)
-                    except TelegramError as e:
-                        log.error("Exit alert failed for chat=%s: %s", cid, e)
-                        if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
-                            remove_subscriber(cid)
-
-            inv_signals = await check_setup_invalidations_async()
-            for inv in inv_signals:
-                alert = inv["alert"]
-                inv_html = inv["html"]
-                subscribers = get_subscribers_for_index(alert["nse_symbol"])
-                if not subscribers:
-                    continue
-                for cid in subscribers:
-                    try:
-                        await bot.send_message(chat_id=cid, text=inv_html, parse_mode="HTML")
-                        await asyncio.sleep(0.1)
-                    except TelegramError as e:
-                        log.error("Invalidation alert failed for chat=%s: %s", cid, e)
-                        if "Forbidden" in str(e) or "blocked" in str(e).lower() or "not found" in str(e).lower():
-                            remove_subscriber(cid)
 
         except Exception as e:
             log.exception("FnO monitor error: %s", e)
