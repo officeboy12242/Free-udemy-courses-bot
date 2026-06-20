@@ -2478,6 +2478,21 @@ async def api_movies_links(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
+async def _search_source_with_timeout(src: str, fn, query: str, limit: int, timeout: float = 15.0):
+    loop = asyncio.get_running_loop()
+    try:
+        return src, await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: fn(query, limit)),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Movie search-all [%s] timed out after %.0fs", src, timeout)
+        return src, []
+    except Exception as e:
+        log.warning("Movie search-all [%s] failed: %s", src, e)
+        return src, []
+
+
 async def api_movies_search_all(request: web.Request) -> web.Response:
     if not _check_movie_api_key(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -2489,19 +2504,18 @@ async def api_movies_search_all(request: web.Request) -> web.Response:
     except ValueError:
         limit = 10
 
-    loop = asyncio.get_running_loop()
-    tasks = {}
-    for src, fns in MOVIE_SOURCES.items():
-        tasks[src] = loop.run_in_executor(None, lambda f=fns["search"]: f(query, limit))
+    coros = [
+        _search_source_with_timeout(src, fns["search"], query, limit)
+        for src, fns in MOVIE_SOURCES.items()
+    ]
+    source_results = await asyncio.gather(*coros)
 
     results: list[dict] = []
     seen_titles: set[str] = set()
-    for src, task in tasks.items():
-        try:
-            items = await task
-        except Exception as e:
-            log.warning("Movie search-all [%s] failed: %s", src, e)
-            continue
+    sources_ok: list[str] = []
+    for src, items in source_results:
+        if items:
+            sources_ok.append(src)
         for item in (items or []):
             item["source"] = src
             title_key = (item.get("title") or "").strip().lower()
@@ -2510,7 +2524,12 @@ async def api_movies_search_all(request: web.Request) -> web.Response:
             seen_titles.add(title_key)
             results.append(item)
 
-    return web.json_response({"query": query, "total": len(results), "results": results})
+    return web.json_response({
+        "query": query,
+        "total": len(results),
+        "sources_searched": sources_ok,
+        "results": results,
+    })
 
 
 def create_web_app() -> web.Application:
