@@ -2358,6 +2358,154 @@ async def api_test_alert(request: web.Request) -> web.Response:
     )
 
 
+# ─── Movie API endpoints ─────────────────────────────────────────────────────
+
+MOVIE_SOURCES = {
+    "hdhub": {
+        "latest": hdhub_latest_movies,
+        "search": hdhub_search,
+        "links": hdhub_movie_links,
+    },
+    "hdh": {
+        "latest": hdh_latest_movies,
+        "search": hdh_search,
+        "links": hdh_movie_links,
+    },
+    "md": {
+        "latest": md_latest_movies,
+        "search": md_search,
+        "links": md_movie_links,
+    },
+    "hdmovie2": {
+        "latest": hdmovie2_latest_movies,
+        "search": hdmovie2_search,
+        "links": hdmovie2_movie_links,
+    },
+    "vega": {
+        "latest": vega_latest_movies,
+        "search": vega_search,
+        "links": vega_movie_links,
+    },
+    "bollyflix": {
+        "latest": bollyflix_latest_movies,
+        "search": bollyflix_search,
+        "links": bollyflix_movie_links,
+    },
+    "moviesmod": {
+        "latest": moviesmod_latest_movies,
+        "search": moviesmod_search,
+        "links": moviesmod_movie_links,
+    },
+}
+
+MOVIE_API_KEY = os.getenv("MOVIE_API_KEY", "").strip()
+
+
+def _check_movie_api_key(request: web.Request) -> bool:
+    if not MOVIE_API_KEY:
+        return True
+    key = request.query.get("key") or request.headers.get("X-API-Key", "")
+    return key == MOVIE_API_KEY
+
+
+async def api_movies_latest(request: web.Request) -> web.Response:
+    if not _check_movie_api_key(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    source = request.match_info["source"]
+    if source not in MOVIE_SOURCES:
+        return web.json_response(
+            {"error": f"unknown source '{source}'", "available": list(MOVIE_SOURCES)},
+            status=400,
+        )
+    try:
+        page = int(request.query.get("page", "1"))
+    except ValueError:
+        return web.json_response({"error": "invalid page"}, status=400)
+    try:
+        fn = MOVIE_SOURCES[source]["latest"]
+        results = await asyncio.get_running_loop().run_in_executor(None, lambda: fn(page))
+        return web.json_response({"source": source, "page": page, "results": results})
+    except Exception as e:
+        log.exception("Movie API latest error [%s]: %s", source, e)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_movies_search(request: web.Request) -> web.Response:
+    if not _check_movie_api_key(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    source = request.match_info["source"]
+    if source not in MOVIE_SOURCES:
+        return web.json_response(
+            {"error": f"unknown source '{source}'", "available": list(MOVIE_SOURCES)},
+            status=400,
+        )
+    query = request.query.get("q", "").strip()
+    if not query:
+        return web.json_response({"error": "missing ?q= search query"}, status=400)
+    try:
+        limit = int(request.query.get("limit", "10"))
+    except ValueError:
+        limit = 10
+    try:
+        fn = MOVIE_SOURCES[source]["search"]
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: fn(query, limit)
+        )
+        return web.json_response({"source": source, "query": query, "results": results})
+    except Exception as e:
+        log.exception("Movie API search error [%s]: %s", source, e)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_movies_links(request: web.Request) -> web.Response:
+    if not _check_movie_api_key(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    source = request.match_info["source"]
+    if source not in MOVIE_SOURCES:
+        return web.json_response(
+            {"error": f"unknown source '{source}'", "available": list(MOVIE_SOURCES)},
+            status=400,
+        )
+    url = request.query.get("url", "").strip()
+    if not url:
+        return web.json_response({"error": "missing ?url= movie page URL"}, status=400)
+    try:
+        fn = MOVIE_SOURCES[source]["links"]
+        data = await asyncio.get_running_loop().run_in_executor(None, lambda: fn(url))
+        return web.json_response({"source": source, "url": url, "data": data})
+    except Exception as e:
+        log.exception("Movie API links error [%s]: %s", source, e)
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_movies_search_all(request: web.Request) -> web.Response:
+    if not _check_movie_api_key(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    query = request.query.get("q", "").strip()
+    if not query:
+        return web.json_response({"error": "missing ?q= search query"}, status=400)
+    try:
+        limit = int(request.query.get("limit", "10"))
+    except ValueError:
+        limit = 10
+
+    loop = asyncio.get_running_loop()
+    tasks = {}
+    for src, fns in MOVIE_SOURCES.items():
+        tasks[src] = loop.run_in_executor(None, lambda f=fns["search"]: f(query, limit))
+
+    combined: dict[str, list] = {}
+    for src, task in tasks.items():
+        try:
+            combined[src] = await task
+        except Exception as e:
+            log.warning("Movie search-all [%s] failed: %s", src, e)
+            combined[src] = []
+
+    total = sum(len(v) for v in combined.values())
+    return web.json_response({"query": query, "total": total, "results": combined})
+
+
 def create_web_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health_check)
@@ -2366,6 +2514,10 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/dip-status", api_dip_status)
     app.router.add_get("/api/backtest", api_backtest)
     app.router.add_get("/api/test-alert", api_test_alert)
+    app.router.add_get("/api/movies/{source}/latest", api_movies_latest)
+    app.router.add_get("/api/movies/{source}/search", api_movies_search)
+    app.router.add_get("/api/movies/{source}/links", api_movies_links)
+    app.router.add_get("/api/movies/search", api_movies_search_all)
     app.router.add_get("/", dashboard_page)
     return app
 
