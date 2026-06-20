@@ -2494,16 +2494,23 @@ async def api_movies_search_all(request: web.Request) -> web.Response:
     for src, fns in MOVIE_SOURCES.items():
         tasks[src] = loop.run_in_executor(None, lambda f=fns["search"]: f(query, limit))
 
-    combined: dict[str, list] = {}
+    results: list[dict] = []
+    seen_titles: set[str] = set()
     for src, task in tasks.items():
         try:
-            combined[src] = await task
+            items = await task
         except Exception as e:
             log.warning("Movie search-all [%s] failed: %s", src, e)
-            combined[src] = []
+            continue
+        for item in (items or []):
+            item["source"] = src
+            title_key = (item.get("title") or "").strip().lower()
+            if title_key and title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+            results.append(item)
 
-    total = sum(len(v) for v in combined.values())
-    return web.json_response({"query": query, "total": total, "results": combined})
+    return web.json_response({"query": query, "total": len(results), "results": results})
 
 
 def create_web_app() -> web.Application:
