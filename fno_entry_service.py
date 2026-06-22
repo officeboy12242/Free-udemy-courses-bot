@@ -1234,7 +1234,7 @@ def _check_mean_reversion(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str,
     lower_zone = (spot - bb_lower) / bb_range
     upper_zone = (bb_upper - spot) / bb_range
 
-    if lower_zone < 0.10 and rsi < 32:
+    if lower_zone < 0.15 and rsi < 35:
         side = "CE"
         if vwap and spot > vwap:
             return None
@@ -1246,7 +1246,7 @@ def _check_mean_reversion(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str,
             reasons.append(f"PCR {pcr:.2f} supports bounce (PE heavy)")
         elif pcr < 0.8:
             return None
-    elif upper_zone < 0.10 and rsi > 68:
+    elif upper_zone < 0.15 and rsi > 65:
         side = "PE"
         if vwap and spot < vwap:
             return None
@@ -1382,8 +1382,10 @@ def _passes_auto_alert_quality(
         if adx is not None and adx >= 20:
             return False, extras, 0, "adx_too_high_for_mr"
         if adx is not None and adx < 15:
-            score += 15
+            score += 20
             extras.append(f"ADX {adx:.0f} flat -- ideal for mean reversion")
+        elif adx is not None:
+            score += 10
 
     vix = tech.get("vix")
     if vix is not None:
