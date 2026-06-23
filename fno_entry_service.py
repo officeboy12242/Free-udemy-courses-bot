@@ -91,7 +91,7 @@ FNO_REQUIRE_EMA_ALIGN = os.getenv("FNO_REQUIRE_EMA_ALIGN", "1").strip().lower() 
 FNO_CONFLUENCE_MIN_LAYERS = int(os.getenv("FNO_CONFLUENCE_MIN_LAYERS", "3"))
 FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true", "yes")
 FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "1"))
-FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "12"))
+FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "0"))
 FNO_MIN_QUALITY_SCORE = int(os.getenv("FNO_MIN_QUALITY_SCORE", "30"))
 FNO_LAST_ENTRY_HOUR = int(os.getenv("FNO_LAST_ENTRY_HOUR", "15"))
 FNO_LAST_ENTRY_MINUTE = int(os.getenv("FNO_LAST_ENTRY_MINUTE", "0"))
@@ -1337,14 +1337,15 @@ def _passes_auto_alert_quality(
     if not _is_prime_alert_window():
         return False, extras, 0, "time_window"
 
-    from fno_storage import use_mongodb, _get_mongo_db, _ist_today
-    if use_mongodb():
-        today_count = _get_mongo_db().fno_alerts.count_documents({
-            "alert_date": _ist_today(), "pick_type": "safe",
-            "exit_status": {"$nin": ["LEGACY"]},
-        })
-        if today_count >= FNO_MAX_DAILY_ALERTS:
-            return False, extras, 0, "daily_cap"
+    if FNO_MAX_DAILY_ALERTS > 0:
+        from fno_storage import use_mongodb, _get_mongo_db, _ist_today
+        if use_mongodb():
+            today_count = _get_mongo_db().fno_alerts.count_documents({
+                "alert_date": _ist_today(), "pick_type": "safe",
+                "exit_status": {"$nin": ["LEGACY"]},
+            })
+            if today_count >= FNO_MAX_DAILY_ALERTS:
+                return False, extras, 0, "daily_cap"
 
     vol = int(leg.get("volume") or 0)
     if vol < FNO_MIN_LEG_VOLUME:
