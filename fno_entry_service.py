@@ -91,7 +91,8 @@ FNO_REQUIRE_EMA_ALIGN = os.getenv("FNO_REQUIRE_EMA_ALIGN", "1").strip().lower() 
 FNO_CONFLUENCE_MIN_LAYERS = int(os.getenv("FNO_CONFLUENCE_MIN_LAYERS", "3"))
 FNO_SKIP_LUNCH = os.getenv("FNO_SKIP_LUNCH", "0").strip().lower() in ("1", "true", "yes")
 FNO_MAX_ALERTS_PER_INDEX = int(os.getenv("FNO_MAX_ALERTS_PER_INDEX", "1"))
-FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "0"))
+FNO_MAX_DAILY_ALERTS = int(os.getenv("FNO_MAX_DAILY_ALERTS", "15"))
+FNO_WIN_RATE_CAP_PCT = float(os.getenv("FNO_WIN_RATE_CAP_PCT", "65"))
 FNO_MIN_QUALITY_SCORE = int(os.getenv("FNO_MIN_QUALITY_SCORE", "30"))
 FNO_LAST_ENTRY_HOUR = int(os.getenv("FNO_LAST_ENTRY_HOUR", "15"))
 FNO_LAST_ENTRY_MINUTE = int(os.getenv("FNO_LAST_ENTRY_MINUTE", "0"))
@@ -1340,12 +1341,21 @@ def _passes_auto_alert_quality(
     if FNO_MAX_DAILY_ALERTS > 0:
         from fno_storage import use_mongodb, _get_mongo_db, _ist_today
         if use_mongodb():
-            today_count = _get_mongo_db().fno_alerts.count_documents({
-                "alert_date": _ist_today(), "pick_type": "safe",
-                "exit_status": {"$nin": ["LEGACY"]},
-            })
-            if today_count >= FNO_MAX_DAILY_ALERTS:
-                return False, extras, 0, "daily_cap"
+            db = _get_mongo_db()
+            today = _ist_today()
+            closed = list(db.fno_alerts.find({
+                "alert_date": today, "pick_type": "safe",
+                "exit_status": {"$nin": ["LEGACY", "OPEN"]},
+            }, {"exit_status": 1}))
+            total_closed = len(closed)
+            if total_closed >= FNO_MAX_DAILY_ALERTS:
+                wins = sum(
+                    1 for a in closed
+                    if a.get("exit_status") in ("S5", "S10", "T1", "T2")
+                )
+                win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
+                if win_rate >= FNO_WIN_RATE_CAP_PCT:
+                    return False, extras, 0, "daily_cap_winning"
 
     vol = int(leg.get("volume") or 0)
     if vol < FNO_MIN_LEG_VOLUME:
@@ -1493,7 +1503,7 @@ def _skip_reason_label(reason: str | None) -> str:
         "weak_confluence": f"Fewer than {FNO_CONFLUENCE_MIN_LAYERS}/4 confluence layers",
         "already_alerted": "Index+side already alerted today",
         "no_setup": "No strategy triggered",
-        "daily_cap": f"Daily alert cap ({FNO_MAX_DAILY_ALERTS}) reached",
+        "daily_cap_winning": f"Win rate >{FNO_WIN_RATE_CAP_PCT:.0f}% with {FNO_MAX_DAILY_ALERTS}+ trades -- capped",
         "low_quality_score": f"Quality score below {FNO_MIN_QUALITY_SCORE}",
         "rsi_against_ce": "RSI too low for CE trade",
         "rsi_against_pe": "RSI too high for PE trade",
