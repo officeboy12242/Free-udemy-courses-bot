@@ -114,6 +114,7 @@ def _doc_to_alert(doc: dict[str, Any]) -> dict[str, Any]:
         "strike": doc.get("strike"),
         "entry_premium": doc.get("entry_premium"),
         "sl_premium": doc.get("sl_premium"),
+        "sl_wide_premium": doc.get("sl_wide_premium"),
         "s3_premium": doc.get("s3_premium"),
         "s5_premium": doc.get("s5_premium"),
         "s10_premium": doc.get("s10_premium"),
@@ -182,6 +183,7 @@ def ensure_fno_storage() -> None:
         """)
         for col, typ in (
             ("index_name", "TEXT"), ("entry_premium", "REAL"), ("sl_premium", "REAL"),
+            ("sl_wide_premium", "REAL"),
             ("t1_premium", "REAL"), ("t2_premium", "REAL"), ("spot_at_entry", "REAL"),
             ("expiry", "TEXT"), ("close_premium", "REAL"), ("outcome", "TEXT"),
             ("pnl_pts", "REAL"), ("summarized", "INTEGER DEFAULT 0"),
@@ -399,6 +401,7 @@ def record_alert(
             "strike": strike,
             "entry_premium": round(premium, 2),
             "sl_premium": ex.get("sl"),
+            "sl_wide_premium": ex.get("sl_wide"),
             "s3_premium": ex.get("s3"),
             "s5_premium": s5,
             "s10_premium": s10,
