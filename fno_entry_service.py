@@ -117,7 +117,8 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
 ]
 
-SL_MULT = 0.86
+FNO_SL_PCT = float(os.getenv("FNO_SL_PCT", "3"))
+SL_MULT = 1.0 - FNO_SL_PCT / 100.0
 T1_MULT = 1.20
 T2_MULT = 1.35
 
