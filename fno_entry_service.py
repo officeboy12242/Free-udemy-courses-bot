@@ -134,6 +134,7 @@ def _lots_for_capital(capital: float, premium: float, lot_size: int) -> int:
     if cost_per_lot <= 0:
         return 0
     return max(1, int(capital // cost_per_lot))
+FNO_SCALP_T3_PCT = float(os.getenv("FNO_SCALP_T3_PCT", "3"))
 FNO_SCALP_T5_PCT = float(os.getenv("FNO_SCALP_T5_PCT", "5"))
 FNO_SCALP_T10_PCT = float(os.getenv("FNO_SCALP_T10_PCT", "10"))
 
@@ -811,9 +812,11 @@ def _pick_aggressive_strike(
 
 def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     prem = max(entry_premium, 5.0)
+    s3_mult = 1.0 + FNO_SCALP_T3_PCT / 100.0
     s5_mult = 1.0 + FNO_SCALP_T5_PCT / 100.0
     s10_mult = 1.0 + FNO_SCALP_T10_PCT / 100.0
     sl = round(prem * SL_MULT, 2)
+    s3 = round(prem * s3_mult, 2)
     s5 = round(prem * s5_mult, 2)
     s10 = round(prem * s10_mult, 2)
     t1 = round(prem * T1_MULT, 2)
@@ -821,12 +824,14 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     lot = lot_size if lot_size > 0 else 1
     d: dict[str, Any] = {
         "entry": round(prem, 2),
-        "sl": sl, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
+        "sl": sl, "s3": s3, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
         "sl_pts": round(prem - sl, 2),
+        "s3_pts": round(s3 - prem, 2),
         "s5_pts": round(s5 - prem, 2),
         "s10_pts": round(s10 - prem, 2),
         "t1_pts": round(t1 - prem, 2),
         "t2_pts": round(t2 - prem, 2),
+        "s3_pct": FNO_SCALP_T3_PCT,
         "s5_pct": FNO_SCALP_T5_PCT,
         "s10_pct": FNO_SCALP_T10_PCT,
         "rr": round((t1 - prem) / (prem - sl), 1) if prem > sl else 0.0,
@@ -834,6 +839,7 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     }
     if lot_size > 0:
         d["sl_rs"] = round((prem - sl) * lot, 0)
+        d["s3_rs"] = round((s3 - prem) * lot, 0)
         d["s5_rs"] = round((s5 - prem) * lot, 0)
         d["s10_rs"] = round((s10 - prem) * lot, 0)
         d["t1_rs"] = round((t1 - prem) * lot, 0)
@@ -843,15 +849,22 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
 
 
 def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
-    """Quick 5–10% scalp levels + T1/T2/SL block for alerts and /entry."""
+    """Quick 3-5-10% scalp levels + T1/T2/SL block for alerts and /entry."""
+    p3 = ex.get("s3_pct", FNO_SCALP_T3_PCT)
     p5 = ex.get("s5_pct", FNO_SCALP_T5_PCT)
     p10 = ex.get("s10_pct", FNO_SCALP_T10_PCT)
     has_lot = bool(ex.get("lot"))
+    s3_rs = f"  \u20b9{int(ex['s3_rs']):,}/lot" if has_lot and ex.get("s3_rs") else ""
     s5_rs = f"  \u20b9{int(ex['s5_rs']):,}/lot" if has_lot else ""
     s10_rs = f"  \u20b9{int(ex['s10_rs']):,}/lot" if has_lot else ""
     t1_rs = f"  \u20b9{int(ex['t1_rs']):,}/lot" if has_lot else ""
     t2_rs = f"  \u20b9{int(ex['t2_rs']):,}/lot" if has_lot else ""
     sl_rs = f"  \u20b9{int(ex['sl_rs']):,}/lot" if has_lot else ""
+    quick3 = (
+        f"\u2502  \U0001f4b5 <b>+{p3:.0f}%</b>  {_ru(ex['s3'])}"
+        f"  <i>+{ex['s3_pts']:.2f} pts{s3_rs}"
+        + (" (quick book ~20%)</i>\n" if book_hints else "</i>\n")
+    )
     quick5 = (
         f"\u2502  \u26a1 <b>+{p5:.0f}%</b>  {_ru(ex['s5'])}"
         f"  <i>+{ex['s5_pts']:.2f} pts{s5_rs}"
@@ -868,7 +881,7 @@ def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
     if has_lot:
         cap_line = f"\u2502  \U0001f4b0 Capital: <b>\u20b9{int(ex['capital']):,}</b> per lot ({ex['lot']})\n"
     return (
-        f"{quick5}{quick10}"
+        f"{quick3}{quick5}{quick10}"
         f"\u2502\n"
         f"\u2502  \U0001f3af <b>T1  {_ru(ex['t1'])}</b>"
         f"  <i>+{ex['t1_pts']:.2f} pts{t1_rs}{t1_hint}</i>\n"
@@ -1351,7 +1364,7 @@ def _passes_auto_alert_quality(
             if total_closed >= FNO_MAX_DAILY_ALERTS:
                 wins = sum(
                     1 for a in closed
-                    if a.get("exit_status") in ("S5", "S10", "T1", "T2")
+                    if a.get("exit_status") in ("S3", "S5", "S10", "T1", "T2")
                 )
                 win_rate = (wins / total_closed * 100) if total_closed > 0 else 0
                 if win_rate >= FNO_WIN_RATE_CAP_PCT:
@@ -2064,6 +2077,7 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
 def _classify_outcome(entry: float, sl: float, t1: float, t2: float, close_ltp: float) -> tuple[str, float]:
     """Return (outcome_label, pnl_pts) based on close premium vs entry/SL/targets."""
     pnl = round(close_ltp - entry, 2)
+    s3 = round(entry * (1.0 + FNO_SCALP_T3_PCT / 100.0), 2)
     s5 = round(entry * (1.0 + FNO_SCALP_T5_PCT / 100.0), 2)
     s10 = round(entry * (1.0 + FNO_SCALP_T10_PCT / 100.0), 2)
     if close_ltp >= t2:
@@ -2074,6 +2088,8 @@ def _classify_outcome(entry: float, sl: float, t1: float, t2: float, close_ltp: 
         return "SCALP 10%", pnl
     if close_ltp >= s5:
         return "SCALP 5%", pnl
+    if close_ltp >= s3:
+        return "SCALP 3%", pnl
     if close_ltp <= sl:
         return "SL LOSS", pnl
     if pnl > 0:
@@ -2097,7 +2113,7 @@ def _strike_close_ltp(
 
 def _summary_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     wins = sum(1 for r in results if r.get("outcome") in (
-        "T1 WIN", "T2 WIN", "PARTIAL WIN", "SCALP 5%", "SCALP 10%",
+        "T1 WIN", "T2 WIN", "PARTIAL WIN", "SCALP 3%", "SCALP 5%", "SCALP 10%",
     ))
     losses = sum(1 for r in results if r.get("outcome") in ("SL LOSS", "PARTIAL LOSS", "SETUP BROKE"))
     decided = wins + losses
@@ -2279,6 +2295,7 @@ def _outcome_emoji(outcome: str) -> str:
         "T1 WIN": "\U0001f7e2",
         "SCALP 10%": "\U0001f7e1",
         "SCALP 5%": "\U0001f7e1",
+        "SCALP 3%": "\U0001f7e2",
         "PARTIAL WIN": "\U0001f7e1",
         "FLAT": "\u26aa",
         "PARTIAL LOSS": "\U0001f7e0",
@@ -2479,6 +2496,7 @@ async def run_fno_eod_summary(bot):
 
 EXIT_LEVELS = [
     ("SL", "sl_premium", "SL LOSS"),
+    ("S3", "s3_premium", "SCALP 3%"),
     ("S5", "s5_premium", "SCALP 5%"),
     ("S10", "s10_premium", "SCALP 10%"),
     ("T1", "t1_premium", "T1 WIN"),
@@ -2495,6 +2513,7 @@ def _check_exit_level(alert: dict[str, Any], live_prem: float) -> tuple[str, str
     sl = float(alert.get("sl_premium") or entry * SL_MULT)
     t2 = float(alert.get("t2_premium") or entry * T2_MULT)
     t1 = float(alert.get("t1_premium") or entry * T1_MULT)
+    s3 = float(alert.get("s3_premium") or entry * 1.03)
     s5 = float(alert.get("s5_premium") or entry * 1.05)
     s10 = float(alert.get("s10_premium") or entry * 1.10)
 
@@ -2510,6 +2529,8 @@ def _check_exit_level(alert: dict[str, Any], live_prem: float) -> tuple[str, str
         return "S10", "SCALP 10%", pnl
     if live_prem >= s5:
         return "S5", "SCALP 5%", pnl
+    if live_prem >= s3:
+        return "S3", "SCALP 3%", pnl
     return None
 
 
@@ -2566,7 +2587,7 @@ def _format_exit_trace_html(alert: dict[str, Any], level: str | None = None) -> 
     spot = alert.get("spot_at_entry")
 
     level_keys = {
-        "SL": "sl_premium", "S5": "s5_premium", "S10": "s10_premium",
+        "SL": "sl_premium", "S3": "s3_premium", "S5": "s5_premium", "S10": "s10_premium",
         "T1": "t1_premium", "T2": "t2_premium",
     }
     level_line = ""
@@ -2611,7 +2632,7 @@ def _trade_status_emoji(alert: dict[str, Any]) -> str:
     status = alert.get("exit_status") or "OPEN"
     if status == "OPEN":
         return "\U0001f7e2"
-    if status in ("S5", "S10", "T1", "T2"):
+    if status in ("S3", "S5", "S10", "T1", "T2"):
         return "\u26a1"
     if status == "SL":
         return "\U0001f534"
@@ -2669,8 +2690,8 @@ def format_trade_detail_html(alert: dict[str, Any], live_prem: float | None = No
         lines.append(f"Live: <b>{_ru(live_prem)}</b>  ({sign}{pnl:.2f} pts / {sign}{pnl_pct}%)")
         lines.append("")
         lines.append("<b>Targets:</b>")
-        for tag, key in (("SL", "sl_premium"), ("+5%", "s5_premium"), ("+10%", "s10_premium"),
-                         ("T1", "t1_premium"), ("T2", "t2_premium")):
+        for tag, key in (("SL", "sl_premium"), ("+3%", "s3_premium"), ("+5%", "s5_premium"),
+                         ("+10%", "s10_premium"), ("T1", "t1_premium"), ("T2", "t2_premium")):
             val = alert.get(key)
             if val is not None:
                 hit = ""
