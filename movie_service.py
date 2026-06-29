@@ -264,12 +264,14 @@ def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
         return []
 
 
-def hdh_movie_links(movie_url: str) -> dict[str, Any]:
+def hdh_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     """Return poster + list of quality/link blocks for a 4KHDHub movie page."""
     try:
         session = _session_for("4khdhub.link")
         session.headers["Referer"] = HDH_CATEGORY
-        resp = _get(movie_url, timeout=20)
+        page_timeout = 10 if fast else 20
+        page_retries = 0 if fast else 2
+        resp = _get(movie_url, timeout=page_timeout, retries=page_retries)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -488,7 +490,7 @@ def _expand_mdrive(href: str, label: str, link_text: str) -> list[dict[str, str]
         return [{"label": label, "name": link_text, "url": href}]
 
 
-def md_movie_links(movie_url: str) -> dict[str, Any]:
+def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     """Return poster + list of quality/link rows for a MoviesDrive movie page.
 
     Handles two page layouts:
@@ -497,7 +499,9 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
     Also resolves mdrive.lol intermediary pages to real HubCloud/GDFlix links.
     """
     try:
-        resp = _get(movie_url, timeout=15)
+        page_timeout = 10 if fast else 15
+        page_retries = 0 if fast else 2
+        resp = _get(movie_url, timeout=page_timeout, retries=page_retries)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -573,12 +577,12 @@ def md_movie_links(movie_url: str) -> dict[str, Any]:
 
 # ─── Search ──────────────────────────────────────────────────────────────────
 
-def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+def hdh_search(query: str, limit: int = 10, *, timeout: int = 20, retries: int = 2) -> list[dict[str, str]]:
     """Search 4KHDHub using the ?s= query parameter."""
     try:
         session = _session_for("4khdhub.link")
         session.headers["Referer"] = HDH_BASE + "/"
-        resp = _get(f"{HDH_BASE}/", params={"s": query}, timeout=20)
+        resp = _get(f"{HDH_BASE}/", params={"s": query}, timeout=timeout, retries=retries)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         movies = []
@@ -602,14 +606,20 @@ def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         return []
 
 
-def md_search(query: str, limit: int = 10) -> list[dict[str, str]]:
+def md_search(
+    query: str,
+    limit: int = 10,
+    *,
+    timeout: int = 15,
+    retries: int = 2,
+) -> list[dict[str, str]]:
     """Search MoviesDrive via the /search.php JSON API (GET ?q=<query>&page=<page>)."""
     try:
-        # The frontend JS uses GET with ?q= and ?page= params
         resp = _get(
             "https://new2.moviesdrives.my/search.php",
             params={"q": query, "page": 1},
-            timeout=15,
+            timeout=timeout,
+            retries=retries,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -2355,7 +2365,12 @@ def _notify_hdhub_search_broken(query: str, reason: str, *, severity: str = "err
         log.error("HDHub search alert failed: %s", exc)
 
 
-def _hdhub_search_typesense(query: str, limit: int = 10) -> tuple[list[dict], str | None]:
+def _hdhub_search_typesense(
+    query: str,
+    limit: int = 10,
+    *,
+    timeout: int = 20,
+) -> tuple[list[dict], str | None]:
     """Search via HDHub4u Typesense proxy (requires site Referer)."""
     headers = {
         **HEADERS,
@@ -2378,12 +2393,12 @@ def _hdhub_search_typesense(query: str, limit: int = 10) -> tuple[list[dict], st
                 params=params,
                 headers=headers,
                 impersonate="chrome",
-                timeout=20,
+                timeout=timeout,
             )
         else:
             sess = requests.Session()
             sess.headers.update(headers)
-            resp = sess.get(_HDHUB_SEARCH_API, params=params, timeout=20)
+            resp = sess.get(_HDHUB_SEARCH_API, params=params, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
@@ -2487,17 +2502,19 @@ def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
     return movies
 
 
-def hdhub_search(query: str, limit: int = 10) -> list[dict]:
+def hdhub_search(query: str, limit: int = 10, *, fast: bool = False) -> list[dict]:
     """Search HDHub4u via Typesense proxy, then recent-page scan fallback."""
     q = (query or "").strip()
     if not q:
         return []
 
-    movies, ts_error = _hdhub_search_typesense(q, limit)
+    ts_timeout = 8 if fast else 20
+    movies, ts_error = _hdhub_search_typesense(q, limit, timeout=ts_timeout)
     if movies:
         return movies
 
-    fallback = _hdhub_search_latest_scan(q, limit)
+    scan_pages = 2 if fast else 8
+    fallback = _hdhub_search_latest_scan(q, limit, max_pages=scan_pages)
     if fallback:
         if ts_error:
             _notify_hdhub_search_broken(
@@ -2515,7 +2532,7 @@ def hdhub_search(query: str, limit: int = 10) -> list[dict]:
     return []
 
 
-def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
+def hdhub_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     """Scrape download links from an HDHub4u movie or series page.
 
     Returns::
@@ -2528,8 +2545,10 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
         }
     """
     soup = None
+    page_timeout = 12 if fast else 25
+    page_retries = 0 if fast else 2
     try:
-        resp = _get(movie_url, timeout=25)
+        resp = _get(movie_url, timeout=page_timeout, retries=page_retries)
         soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as exc:
         log.warning("hdhub_movie_links initial fetch %s failed: %s", movie_url, exc)
@@ -2560,12 +2579,16 @@ def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
     else:
         _needs_render = True
 
-    if _needs_render:
+    if _needs_render and not fast:
         log.info("hdhub_movie_links: no links in static HTML, trying Playwright for %s", movie_url)
         rendered_html = _get_rendered_html(movie_url, timeout=30, wait_ms=5000)
         if rendered_html:
             soup = BeautifulSoup(rendered_html, "html.parser")
         elif soup is None:
+            return {"poster": "", "info": {}, "links": [], "episodes": [], "is_series": False}
+    elif _needs_render and fast:
+        log.info("hdhub_movie_links: fast mode — skipping Playwright for %s", movie_url)
+        if soup is None:
             return {"poster": "", "info": {}, "links": [], "episodes": [], "is_series": False}
 
     og = soup.find("meta", property="og:image")
@@ -3506,6 +3529,32 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
 
 # ─── REST API helpers (download links with size / audio metadata) ─────────────
 
+MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "10")))
+MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "14")))
+MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "120")))
+MOVIES_API_MAX_WORKERS = max(2, min(12, int(os.getenv("MOVIES_API_MAX_WORKERS", "6"))))
+_api_cache: dict[str, tuple[float, Any]] = {}
+
+
+def _api_cache_get(key: str) -> Any | None:
+    if MOVIES_API_CACHE_TTL <= 0:
+        return None
+    item = _api_cache.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > MOVIES_API_CACHE_TTL:
+        _api_cache.pop(key, None)
+        return None
+    return value
+
+
+def _api_cache_set(key: str, value: Any) -> None:
+    if MOVIES_API_CACHE_TTL <= 0:
+        return
+    _api_cache[key] = (time.time(), value)
+
+
 MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
     "hdhub4u": "hdhub",
     "hdhub": "hdhub",
@@ -3674,95 +3723,249 @@ def _flat_links_from_md(data: dict[str, Any]) -> list[dict[str, str]]:
     return _dedupe_api_links(out)
 
 
-def movie_page_download_links(source: str, page_url: str) -> dict[str, Any]:
+def movie_page_download_links(
+    source: str,
+    page_url: str,
+    *,
+    fast: bool = True,
+) -> dict[str, Any]:
     """Scrape one movie page and return download links with size/audio metadata."""
+    cache_key = f"links:{source}:{page_url}:{'fast' if fast else 'full'}"
+    cached = _api_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     key = _normalize_movie_source(source)
     if key == "hdhub":
-        data = hdhub_movie_links(page_url)
+        data = hdhub_movie_links(page_url, fast=fast)
         links = _flat_links_from_hdhub(data)
         source_label = "hdhub4u"
     elif key == "hdh":
-        data = hdh_movie_links(page_url)
+        data = hdh_movie_links(page_url, fast=fast)
         links = _flat_links_from_hdh(data)
         source_label = "4khdhub"
     else:
-        data = md_movie_links(page_url)
+        data = md_movie_links(page_url, fast=fast)
         links = _flat_links_from_md(data)
         source_label = "moviesdrive"
-    return {"source": source_label, "page_url": page_url, "links": links}
+    result = {"source": source_label, "page_url": page_url, "links": links}
+    _api_cache_set(cache_key, result)
+    return result
 
 
-def movies_search_combined(query: str, limit_per_source: int = 5) -> list[dict[str, str]]:
-    """Search HDHub4u, 4KHDHub, and MoviesDrive; return title + page URL only."""
+def _movies_search_one_source(
+    source_label: str,
+    search_fn: Any,
+    source_key: str,
+    query: str,
+    limit: int,
+    *,
+    fast: bool,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    try:
+        if search_fn is hdhub_search:
+            movies = search_fn(query, limit, fast=fast)
+        elif search_fn is md_search:
+            movies = search_fn(
+                query,
+                limit,
+                timeout=6 if fast else 15,
+                retries=0 if fast else 2,
+            )
+        elif search_fn is hdh_search:
+            movies = search_fn(
+                query,
+                limit,
+                timeout=8 if fast else 20,
+                retries=0 if fast else 2,
+            )
+        else:
+            movies = search_fn(query, limit)
+        for movie in movies:
+            page_url = movie.get("url", "")
+            if not page_url:
+                continue
+            rows.append({
+                "source": source_label,
+                "source_key": source_key,
+                "title": movie.get("title", "Unknown"),
+                "page_url": page_url,
+            })
+    except Exception as exc:
+        log.error("movies_search_combined %s failed: %s", source_label, exc)
+    return rows
+
+
+def movies_search_combined(
+    query: str,
+    limit_per_source: int = 5,
+    *,
+    fast: bool = True,
+) -> list[dict[str, str]]:
+    """Search HDHub4u, 4KHDHub, and MoviesDrive in parallel."""
     q = (query or "").strip()
     if not q:
         return []
     limit = max(1, min(int(limit_per_source), 20))
-    out: list[dict[str, str]] = []
-    for source_label, search_fn, source_key in (
+    cache_key = f"search:{q}:{limit}:{'fast' if fast else 'full'}"
+    cached = _api_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    sources = (
         ("hdhub4u", hdhub_search, "hdhub"),
         ("4khdhub", hdh_search, "hdh"),
         ("moviesdrive", md_search, "md"),
-    ):
+    )
+    out: list[dict[str, str]] = []
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = [
+            pool.submit(
+                _movies_search_one_source,
+                source_label,
+                search_fn,
+                source_key,
+                q,
+                limit,
+                fast=fast,
+            )
+            for source_label, search_fn, source_key in sources
+        ]
+        timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
         try:
-            for movie in search_fn(q, limit):
-                page_url = movie.get("url", "")
-                if not page_url:
-                    continue
-                out.append({
-                    "source": source_label,
-                    "source_key": source_key,
-                    "title": movie.get("title", "Unknown"),
-                    "page_url": page_url,
-                })
+            for fut in as_completed(futures, timeout=timeout):
+                try:
+                    out.extend(fut.result())
+                except Exception as exc:
+                    log.warning("movies_search_combined source failed: %s", exc)
         except Exception as exc:
-            log.error("movies_search_combined %s failed: %s", source_label, exc)
+            log.warning("movies_search_combined parallel timeout/error: %s", exc)
+
+    _api_cache_set(cache_key, out)
     return out
 
 
-def movies_latest_combined(page: int = 1, limit_per_source: int = 10) -> list[dict[str, str]]:
-    """Latest listings from all three sources (no posters)."""
+def _movies_latest_one_source(
+    source_label: str,
+    fetch_fn: Any,
+    source_key: str,
+    page: int,
+    limit: int,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    try:
+        movies = fetch_fn(page) if source_key != "hdhub" else fetch_fn(page, limit)
+        for movie in movies[:limit]:
+            page_url = movie.get("url", "")
+            if not page_url:
+                continue
+            rows.append({
+                "source": source_label,
+                "source_key": source_key,
+                "title": movie.get("title", "Unknown"),
+                "page_url": page_url,
+            })
+    except Exception as exc:
+        log.error("movies_latest_combined %s failed: %s", source_label, exc)
+    return rows
+
+
+def movies_latest_combined(
+    page: int = 1,
+    limit_per_source: int = 10,
+    *,
+    fast: bool = True,
+) -> list[dict[str, str]]:
+    """Latest listings from all three sources in parallel."""
     page_n = max(1, int(page))
     limit = max(1, min(int(limit_per_source), 20))
-    out: list[dict[str, str]] = []
-    for source_label, fetch_fn, source_key in (
+    cache_key = f"latest:{page_n}:{limit}"
+    cached = _api_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    sources = (
         ("hdhub4u", hdhub_latest_movies, "hdhub"),
         ("4khdhub", hdh_latest_movies, "hdh"),
         ("moviesdrive", md_latest_movies, "md"),
-    ):
+    )
+    out: list[dict[str, str]] = []
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = [
+            pool.submit(_movies_latest_one_source, label, fn, key, page_n, limit)
+            for label, fn, key in sources
+        ]
+        timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
         try:
-            movies = fetch_fn(page_n) if source_key != "hdhub" else fetch_fn(page_n, limit)
-            for movie in movies[:limit]:
-                page_url = movie.get("url", "")
-                if not page_url:
-                    continue
-                out.append({
-                    "source": source_label,
-                    "source_key": source_key,
-                    "title": movie.get("title", "Unknown"),
-                    "page_url": page_url,
-                })
+            for fut in as_completed(futures, timeout=timeout):
+                try:
+                    out.extend(fut.result())
+                except Exception as exc:
+                    log.warning("movies_latest_combined source failed: %s", exc)
         except Exception as exc:
-            log.error("movies_latest_combined %s failed: %s", source_label, exc)
+            log.warning("movies_latest_combined parallel timeout/error: %s", exc)
+
+    _api_cache_set(cache_key, out)
     return out
 
 
-def movies_aggregate_links(query: str, limit_per_source: int = 3) -> dict[str, Any]:
-    """Search all three sites and fetch flat download links for each hit."""
-    listings = movies_search_combined(query, limit_per_source)
+def _aggregate_one_item(item: dict[str, str], *, fast: bool) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "source": item["source"],
+        "title": item["title"],
+        "page_url": item["page_url"],
+        "links": [],
+    }
+    try:
+        detail = movie_page_download_links(item["source_key"], item["page_url"], fast=fast)
+        entry["links"] = detail["links"]
+    except Exception as exc:
+        log.error("movies_aggregate_links %s failed: %s", item["page_url"], exc)
+        entry["error"] = str(exc)
+    return entry
+
+
+def movies_aggregate_links(
+    query: str,
+    limit_per_source: int = 3,
+    *,
+    fast: bool = True,
+) -> dict[str, Any]:
+    """Search all three sites and fetch download links for each hit in parallel."""
+    q = (query or "").strip()
+    limit = max(1, min(int(limit_per_source), 10))
+    cache_key = f"agg:{q}:{limit}:{'fast' if fast else 'full'}"
+    cached = _api_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    listings = movies_search_combined(q, limit, fast=fast)
     results: list[dict[str, Any]] = []
-    for item in listings:
-        entry: dict[str, Any] = {
-            "source": item["source"],
-            "title": item["title"],
-            "page_url": item["page_url"],
-            "links": [],
-        }
-        try:
-            detail = movie_page_download_links(item["source_key"], item["page_url"])
-            entry["links"] = detail["links"]
-        except Exception as exc:
-            log.error("movies_aggregate_links %s failed: %s", item["page_url"], exc)
-            entry["error"] = str(exc)
-        results.append(entry)
-    return {"query": query, "count": len(results), "results": results}
+    if listings:
+        workers = min(MOVIES_API_MAX_WORKERS, len(listings))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_aggregate_one_item, item, fast=fast)
+                for item in listings
+            ]
+            try:
+                for fut in as_completed(futures, timeout=MOVIES_API_LINK_TIMEOUT):
+                    results.append(fut.result())
+            except Exception as exc:
+                log.warning("movies_aggregate_links partial timeout: %s", exc)
+                seen_urls = {r.get("page_url") for r in results}
+                for fut in futures:
+                    if not fut.done() or fut.cancelled():
+                        continue
+                    try:
+                        row = fut.result()
+                        if row.get("page_url") not in seen_urls:
+                            results.append(row)
+                            seen_urls.add(row.get("page_url"))
+                    except Exception:
+                        pass
+
+    payload = {"query": q, "count": len(results), "results": results}
+    _api_cache_set(cache_key, payload)
+    return payload
