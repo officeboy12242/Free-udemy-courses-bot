@@ -3349,3 +3349,163 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
         lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
 
     return "\n".join(lines)
+
+
+# ─── REST API helpers (links-only — no posters / size / audio metadata) ───────
+
+MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
+    "hdhub4u": "hdhub",
+    "hdhub": "hdhub",
+    "4khdhub": "hdh",
+    "hdh": "hdh",
+    "moviesdrive": "md",
+    "md": "md",
+}
+
+
+def _normalize_movie_source(source: str) -> str:
+    key = (source or "").strip().lower()
+    normalized = MOVIE_API_SOURCE_ALIASES.get(key)
+    if not normalized:
+        raise ValueError(f"unknown source '{source}' (use hdhub, hdh, or md)")
+    return normalized
+
+
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        u = (url or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _flat_urls_from_hdhub(data: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if href.startswith("http"):
+            urls.append(href)
+    for ep in data.get("episodes", []):
+        for ql in ep.get("qualities", {}).values():
+            for link in ql:
+                href = link.get("url", "")
+                if href.startswith("http"):
+                    urls.append(href)
+    return _dedupe_urls(urls)
+
+
+def _flat_urls_from_hdh(data: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for block in data.get("qualities", []):
+        for link in block.get("links", []):
+            href = link.get("url", "")
+            if href.startswith("http"):
+                urls.append(href)
+    return _dedupe_urls(urls)
+
+
+def _flat_urls_from_md(data: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if href.startswith("http"):
+            urls.append(href)
+    return _dedupe_urls(urls)
+
+
+def movie_page_download_links(source: str, page_url: str) -> dict[str, Any]:
+    """Scrape one movie page and return download URLs only."""
+    key = _normalize_movie_source(source)
+    if key == "hdhub":
+        data = hdhub_movie_links(page_url)
+        links = _flat_urls_from_hdhub(data)
+        source_label = "hdhub4u"
+    elif key == "hdh":
+        data = hdh_movie_links(page_url)
+        links = _flat_urls_from_hdh(data)
+        source_label = "4khdhub"
+    else:
+        data = md_movie_links(page_url)
+        links = _flat_urls_from_md(data)
+        source_label = "moviesdrive"
+    return {"source": source_label, "page_url": page_url, "links": links}
+
+
+def movies_search_combined(query: str, limit_per_source: int = 5) -> list[dict[str, str]]:
+    """Search HDHub4u, 4KHDHub, and MoviesDrive; return title + page URL only."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit = max(1, min(int(limit_per_source), 20))
+    out: list[dict[str, str]] = []
+    for source_label, search_fn, source_key in (
+        ("hdhub4u", hdhub_search, "hdhub"),
+        ("4khdhub", hdh_search, "hdh"),
+        ("moviesdrive", md_search, "md"),
+    ):
+        try:
+            for movie in search_fn(q, limit):
+                page_url = movie.get("url", "")
+                if not page_url:
+                    continue
+                out.append({
+                    "source": source_label,
+                    "source_key": source_key,
+                    "title": movie.get("title", "Unknown"),
+                    "page_url": page_url,
+                })
+        except Exception as exc:
+            log.error("movies_search_combined %s failed: %s", source_label, exc)
+    return out
+
+
+def movies_latest_combined(page: int = 1, limit_per_source: int = 10) -> list[dict[str, str]]:
+    """Latest listings from all three sources (no posters)."""
+    page_n = max(1, int(page))
+    limit = max(1, min(int(limit_per_source), 20))
+    out: list[dict[str, str]] = []
+    for source_label, fetch_fn, source_key in (
+        ("hdhub4u", hdhub_latest_movies, "hdhub"),
+        ("4khdhub", hdh_latest_movies, "hdh"),
+        ("moviesdrive", md_latest_movies, "md"),
+    ):
+        try:
+            movies = fetch_fn(page_n) if source_key != "hdhub" else fetch_fn(page_n, limit)
+            for movie in movies[:limit]:
+                page_url = movie.get("url", "")
+                if not page_url:
+                    continue
+                out.append({
+                    "source": source_label,
+                    "source_key": source_key,
+                    "title": movie.get("title", "Unknown"),
+                    "page_url": page_url,
+                })
+        except Exception as exc:
+            log.error("movies_latest_combined %s failed: %s", source_label, exc)
+    return out
+
+
+def movies_aggregate_links(query: str, limit_per_source: int = 3) -> dict[str, Any]:
+    """Search all three sites and fetch flat download links for each hit."""
+    listings = movies_search_combined(query, limit_per_source)
+    results: list[dict[str, Any]] = []
+    for item in listings:
+        entry: dict[str, Any] = {
+            "source": item["source"],
+            "title": item["title"],
+            "page_url": item["page_url"],
+            "links": [],
+        }
+        try:
+            detail = movie_page_download_links(item["source_key"], item["page_url"])
+            entry["links"] = detail["links"]
+        except Exception as exc:
+            log.error("movies_aggregate_links %s failed: %s", item["page_url"], exc)
+            entry["error"] = str(exc)
+        results.append(entry)
+    return {"query": query, "count": len(results), "results": results}

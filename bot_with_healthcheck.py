@@ -108,6 +108,8 @@ from movie_service import (
     zeefliz_search, zeefliz_movie_links, zeefliz_latest_movies, format_zeefliz_message,
     hdhub_search, hdh_search, md_search, hdmovie2_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
+    movies_search_combined, movies_latest_combined, movies_aggregate_links,
+    movie_page_download_links,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -2358,6 +2360,82 @@ async def api_test_alert(request: web.Request) -> web.Response:
     )
 
 
+def _movies_api_limit(raw: str | None, *, default: int, maximum: int) -> int:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("limit must be an integer")
+    if value < 1 or value > maximum:
+        raise ValueError(f"limit must be between 1 and {maximum}")
+    return value
+
+
+async def api_movies_search(request: web.Request) -> web.Response:
+    """Search HDHub4u + 4KHDHub + MoviesDrive (titles and page URLs only)."""
+    query = (request.query.get("q") or "").strip()
+    if not query:
+        return web.json_response({"error": "q required"}, status=400)
+    try:
+        limit = _movies_api_limit(request.query.get("limit"), default=5, maximum=20)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    results = await asyncio.to_thread(movies_search_combined, query, limit)
+    public = [
+        {"source": r["source"], "title": r["title"], "page_url": r["page_url"]}
+        for r in results
+    ]
+    return web.json_response({"query": query, "count": len(public), "results": public})
+
+
+async def api_movies_latest(request: web.Request) -> web.Response:
+    """Latest movies from all three sources (no posters)."""
+    try:
+        page = max(1, int(request.query.get("page", "1")))
+        limit = _movies_api_limit(request.query.get("limit"), default=10, maximum=20)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    results = await asyncio.to_thread(movies_latest_combined, page, limit)
+    public = [
+        {"source": r["source"], "title": r["title"], "page_url": r["page_url"]}
+        for r in results
+    ]
+    return web.json_response({"page": page, "count": len(public), "results": public})
+
+
+async def api_movies_links(request: web.Request) -> web.Response:
+    """Download links only for one movie page (no poster / size / audio)."""
+    page_url = (request.query.get("url") or "").strip()
+    source = (request.query.get("source") or "").strip()
+    if not page_url or not source:
+        return web.json_response(
+            {"error": "url and source required (hdhub, hdh, or md)"},
+            status=400,
+        )
+    try:
+        data = await asyncio.to_thread(movie_page_download_links, source, page_url)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        log.exception("api_movies_links failed")
+        return web.json_response({"error": "scrape_failed", "detail": str(exc)}, status=502)
+    return web.json_response(data)
+
+
+async def api_movies(request: web.Request) -> web.Response:
+    """Search all three sites and return download links for each result."""
+    query = (request.query.get("q") or "").strip()
+    if not query:
+        return web.json_response({"error": "q required"}, status=400)
+    try:
+        limit = _movies_api_limit(request.query.get("limit"), default=3, maximum=10)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    data = await asyncio.to_thread(movies_aggregate_links, query, limit)
+    return web.json_response(data)
+
+
 def create_web_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health_check)
@@ -2366,6 +2444,10 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/dip-status", api_dip_status)
     app.router.add_get("/api/backtest", api_backtest)
     app.router.add_get("/api/test-alert", api_test_alert)
+    app.router.add_get("/api/movies", api_movies)
+    app.router.add_get("/api/movies/search", api_movies_search)
+    app.router.add_get("/api/movies/latest", api_movies_latest)
+    app.router.add_get("/api/movies/links", api_movies_links)
     app.router.add_get("/", dashboard_page)
     return app
 
@@ -2376,7 +2458,7 @@ async def start_http_server(app: web.Application):
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(
-        "🌐 HTTP server on port %s (/, /health, /dashboard, /api/market, /api/dip-status, …)",
+        "🌐 HTTP server on port %s (/, /health, /dashboard, /api/market, /api/movies, …)",
         PORT,
     )
 
