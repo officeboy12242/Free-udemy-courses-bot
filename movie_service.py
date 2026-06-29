@@ -1,6 +1,6 @@
 """
 Movie scraper — supports multiple sources:
-  - HDHub4u         (https://new1.hdhub4u.limo/)          ← primary
+  - HDHub4u         (https://new2.hdhub4u.cl/)          ← primary
   - 4KHDHub         (https://4khdhub.link/category/hindi-movies/)
   - MoviesDrive     (https://new2.moviesdrives.my/)
   - HDMovie2        (https://newhdmovie2.pro/)
@@ -75,7 +75,8 @@ _NO_VERIFY_HOSTS = {
     "4khdhub.link",
     "cryptoinsights.site",
     "hblinks.org",
-    "new1.hdhub4u.limo",  # HDHub4u - SSL cert issues
+    "new2.hdhub4u.cl",    # HDHub4u - SSL cert issues
+    "new1.hdhub4u.limo",  # HDHub4u legacy mirror
     "hdhub4u.limo",
     "linksmod.top",  # MoviesMod intermediary - SSL issues
     "episodes.modpro.blog",  # MoviesMod redirector - SSL issues
@@ -2261,10 +2262,10 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HDHub4u  (https://new1.hdhub4u.limo/)  — primary source
+#  HDHub4u  (https://new2.hdhub4u.cl/)  — primary source
 # ══════════════════════════════════════════════════════════════════════════════
 
-HDHUB_BASE        = os.getenv("HDHUB_BASE_URL", "https://new1.hdhub4u.limo")
+HDHUB_BASE        = os.getenv("HDHUB_BASE_URL", "https://new2.hdhub4u.cl")
 _HDHUB_SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search"
 _HDHUB_SKIP_LABELS = {"stream"}
 
@@ -2325,8 +2326,43 @@ def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
     return movies
 
 
+def _hdhub_search_wp(query: str, limit: int = 10) -> list[dict]:
+    """Fallback search via WordPress ?s= on the live HDHub4u site."""
+    try:
+        resp = _get(f"{HDHUB_BASE.rstrip('/')}/", params={"s": query}, timeout=25)
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        log.error("hdhub_search_wp '%s' failed: %s", query, exc)
+        return []
+
+    movies: list[dict] = []
+    for li in soup.select("ul.recent-movies li.thumb, article .thumb, .thumb"):
+        if len(movies) >= limit:
+            break
+        fig = li.find("figcaption")
+        a = li.find("a", href=True)
+        if not (a and fig):
+            continue
+        title = fig.get_text(strip=True)
+        href = a["href"]
+        if title and href:
+            movies.append({"title": title, "url": href, "poster": ""})
+    if movies:
+        return movies
+
+    for a in soup.select("h2.entry-title a[href], h3.entry-title a[href]"):
+        if len(movies) >= limit:
+            break
+        title = a.get_text(strip=True)
+        href = a.get("href", "")
+        if title and href:
+            movies.append({"title": title, "url": href, "poster": ""})
+    return movies[:limit]
+
+
 def hdhub_search(query: str, limit: int = 10) -> list[dict]:
-    """Search HDHub4u via Typesense API (JS search backend)."""
+    """Search HDHub4u via Typesense API, with WordPress ?s= fallback."""
+    movies: list[dict] = []
     try:
         sess = requests.Session()
         sess.headers.update(HEADERS)
@@ -2343,23 +2379,27 @@ def hdhub_search(query: str, limit: int = 10) -> list[dict]:
             timeout=20,
         )
         data = resp.json()
+        for hit in data.get("hits", []):
+            doc       = hit.get("document", {})
+            title     = doc.get("post_title", "")
+            permalink = doc.get("permalink", "")
+            thumbnail = doc.get("post_thumbnail", "")
+            if title and permalink:
+                if permalink.startswith("http"):
+                    page_url = permalink
+                else:
+                    page_url = HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/")
+                movies.append({
+                    "title":  title,
+                    "url":    page_url,
+                    "poster": thumbnail,
+                })
     except Exception as exc:
-        log.error("hdhub_search '%s' failed: %s", query, exc)
-        return []
+        log.warning("hdhub_search typesense '%s' failed: %s", query, exc)
 
-    movies: list[dict] = []
-    for hit in data.get("hits", []):
-        doc       = hit.get("document", {})
-        title     = doc.get("post_title", "")
-        permalink = doc.get("permalink", "")
-        thumbnail = doc.get("post_thumbnail", "")
-        if title and permalink:
-            movies.append({
-                "title":  title,
-                "url":    HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/"),
-                "poster": thumbnail,
-            })
-    return movies
+    if movies:
+        return movies[:limit]
+    return _hdhub_search_wp(query, limit)
 
 
 def hdhub_movie_links(movie_url: str) -> dict[str, Any]:

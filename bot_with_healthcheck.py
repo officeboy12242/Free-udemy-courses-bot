@@ -831,7 +831,7 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     from movie_service import SCRAPER_API_KEY, BOLLY_BASE, _get as movie_get
     tests = [
-        ("HDHub4u",        "https://new1.hdhub4u.limo/"),
+        ("HDHub4u",        "https://new2.hdhub4u.cl/"),
         ("4KHDHub",        "https://4khdhub.link/category/hindi-movies/"),
         ("MoviesDrive",    "https://new2.moviesdrives.my/"),
         ("HDMovie2",       "https://newhdmovie2.pro/"),
