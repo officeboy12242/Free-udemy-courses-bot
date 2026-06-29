@@ -117,10 +117,8 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
 ]
 
-FNO_SL_PCT = float(os.getenv("FNO_SL_PCT", "3"))
+FNO_SL_PCT = float(os.getenv("FNO_SL_PCT", "14"))
 SL_MULT = 1.0 - FNO_SL_PCT / 100.0
-SL_WIDE_PCT = float(os.getenv("FNO_SL_WIDE_PCT", "14"))
-SL_WIDE_MULT = 1.0 - SL_WIDE_PCT / 100.0
 T1_MULT = 1.20
 T2_MULT = 1.35
 
@@ -819,7 +817,6 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     s5_mult = 1.0 + FNO_SCALP_T5_PCT / 100.0
     s10_mult = 1.0 + FNO_SCALP_T10_PCT / 100.0
     sl = round(prem * SL_MULT, 2)
-    sl_wide = round(prem * SL_WIDE_MULT, 2)
     s3 = round(prem * s3_mult, 2)
     s5 = round(prem * s5_mult, 2)
     s10 = round(prem * s10_mult, 2)
@@ -828,10 +825,8 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     lot = lot_size if lot_size > 0 else 1
     d: dict[str, Any] = {
         "entry": round(prem, 2),
-        "sl": sl, "sl_wide": sl_wide,
-        "s3": s3, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
+        "sl": sl, "s3": s3, "s5": s5, "s10": s10, "t1": t1, "t2": t2,
         "sl_pts": round(prem - sl, 2),
-        "sl_wide_pts": round(prem - sl_wide, 2),
         "s3_pts": round(s3 - prem, 2),
         "s5_pts": round(s5 - prem, 2),
         "s10_pts": round(s10 - prem, 2),
@@ -840,12 +835,11 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
         "s3_pct": FNO_SCALP_T3_PCT,
         "s5_pct": FNO_SCALP_T5_PCT,
         "s10_pct": FNO_SCALP_T10_PCT,
-        "rr": round((t1 - prem) / (prem - sl_wide), 1) if prem > sl_wide else 0.0,
+        "rr": round((t1 - prem) / (prem - sl), 1) if prem > sl else 0.0,
         "lot": lot_size,
     }
     if lot_size > 0:
         d["sl_rs"] = round((prem - sl) * lot, 0)
-        d["sl_wide_rs"] = round((prem - sl_wide) * lot, 0)
         d["s3_rs"] = round((s3 - prem) * lot, 0)
         d["s5_rs"] = round((s5 - prem) * lot, 0)
         d["s10_rs"] = round((s10 - prem) * lot, 0)
@@ -867,7 +861,6 @@ def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
     t1_rs = f"  \u20b9{int(ex['t1_rs']):,}/lot" if has_lot else ""
     t2_rs = f"  \u20b9{int(ex['t2_rs']):,}/lot" if has_lot else ""
     sl_rs = f"  \u20b9{int(ex['sl_rs']):,}/lot" if has_lot else ""
-    sl_wide_rs = f"  \u20b9{int(ex['sl_wide_rs']):,}/lot" if has_lot and ex.get("sl_wide_rs") else ""
     quick3 = (
         f"\u2502  \U0001f4b5 <b>+{p3:.0f}%</b>  {_ru(ex['s3'])}"
         f"  <i>+{ex['s3_pts']:.2f} pts{s3_rs}"
@@ -895,12 +888,10 @@ def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
         f"  <i>+{ex['t1_pts']:.2f} pts{t1_rs}{t1_hint}</i>\n"
         f"\u2502  \U0001f3af <b>T2  {_ru(ex['t2'])}</b>"
         f"  <i>+{ex['t2_pts']:.2f} pts{t2_rs}{t2_hint}</i>\n"
-        f"\u2502  \U0001f53b <b>SL (scalp)  {_ru(ex['sl'])}</b>"
-        f"  <i>\u2212{ex['sl_pts']:.2f} pts{sl_rs} (before S3)</i>\n"
-        f"\u2502  \U0001f6e1\ufe0f <b>SL (wide)   {_ru(ex['sl_wide'])}</b>"
-        f"  <i>\u2212{ex['sl_wide_pts']:.2f} pts{sl_wide_rs} (after S3, for T1/T2)</i>\n"
+        f"\u2502  \U0001f53b <b>SL  {_ru(ex['sl'])}</b>"
+        f"  <i>\u2212{ex['sl_pts']:.2f} pts{sl_rs} (hard exit)</i>\n"
         f"{cap_line}"
-        f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>  <i>(to T1 vs wide SL)</i>\n"
+        f"\u2502  \U0001f4d0 R:R  <b>{ex['rr']}x</b>  <i>(to T1 vs SL)</i>\n"
     )
 
 
@@ -2515,12 +2506,7 @@ EXIT_LEVELS = [
 
 
 def _check_exit_level(alert: dict[str, Any], live_prem: float) -> tuple[str, str, float] | None:
-    """Return (level_tag, outcome, pnl_pts) if an exit level is hit, else None.
-
-    Two SLs:
-      sl_premium      = tight scalp SL (3%) — used for exit trigger
-      sl_wide_premium  = wide SL (14%)       — displayed for manual big-target traders
-    """
+    """Return (level_tag, outcome, pnl_pts) if an exit level is hit, else None."""
     entry = float(alert.get("entry_premium") or 0)
     if entry <= 0 or live_prem <= 0:
         return None
@@ -2603,7 +2589,7 @@ def _format_exit_trace_html(alert: dict[str, Any], level: str | None = None) -> 
 
     level_keys = {
         "SL": "sl_premium", "S3": "s3_premium", "S5": "s5_premium", "S10": "s10_premium",
-        "T1": "t1_premium", "T2": "t2_premium", "SL_WIDE": "sl_wide_premium",
+        "T1": "t1_premium", "T2": "t2_premium",
     }
     level_line = ""
     if level and level in level_keys:
@@ -2705,15 +2691,14 @@ def format_trade_detail_html(alert: dict[str, Any], live_prem: float | None = No
         lines.append(f"Live: <b>{_ru(live_prem)}</b>  ({sign}{pnl:.2f} pts / {sign}{pnl_pct}%)")
         lines.append("")
         lines.append("<b>Targets:</b>")
-        for tag, key in (("SL", "sl_premium"), ("SL\u2093", "sl_wide_premium"),
-                         ("+3%", "s3_premium"), ("+5%", "s5_premium"),
+        for tag, key in (("SL", "sl_premium"), ("+3%", "s3_premium"), ("+5%", "s5_premium"),
                          ("+10%", "s10_premium"), ("T1", "t1_premium"), ("T2", "t2_premium")):
             val = alert.get(key)
             if val is not None:
                 hit = ""
-                if tag in ("SL", "SL\u2093") and live_prem <= float(val):
+                if tag == "SL" and live_prem <= float(val):
                     hit = " \u26a0\ufe0f"
-                elif tag not in ("SL", "SL\u2093") and live_prem >= float(val):
+                elif tag != "SL" and live_prem >= float(val):
                     hit = " \u2705"
                 lines.append(f"  {tag}: {_ru(float(val))}{hit}")
     elif alert.get("close_premium") is not None:
