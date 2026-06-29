@@ -584,6 +584,8 @@ def hdh_search(query: str, limit: int = 10) -> list[dict[str, str]]:
         for card in soup.select(".movie-card"):
             title_el = card.select_one(".movie-card-title")
             title = title_el.text.strip() if title_el else "Unknown"
+            if not _title_matches_query(title, query):
+                continue
             poster_el = card.select_one("img")
             poster = poster_el.get("src", "") if poster_el else ""
             link = card.get("href") or ""
@@ -2266,8 +2268,104 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 HDHUB_BASE        = os.getenv("HDHUB_BASE_URL", "https://new2.hdhub4u.cl")
-_HDHUB_SEARCH_API = "https://search.hdhub4u.glass/collections/post/documents/search"
+_HDHUB_SEARCH_API = os.getenv(
+    "HDHUB_SEARCH_API",
+    "https://search.pingora.fyi/collections/post/documents/search",
+)
 _HDHUB_SKIP_LABELS = {"stream"}
+
+
+def _query_tokens(query: str) -> list[str]:
+    return [t for t in re.split(r"\s+", (query or "").strip().lower()) if len(t) >= 2]
+
+
+def _title_matches_query(title: str, query: str) -> bool:
+    tokens = _query_tokens(query)
+    if not tokens:
+        return False
+    title_l = (title or "").lower()
+    return all(tok in title_l for tok in tokens)
+
+
+def _hdhub_page_url(permalink: str) -> str:
+    if permalink.startswith("http"):
+        return permalink
+    return HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/")
+
+
+def _hdhub_search_typesense(query: str, limit: int = 10) -> list[dict]:
+    """Search via HDHub4u Typesense proxy (requires site Referer)."""
+    headers = {
+        **HEADERS,
+        "Referer": HDHUB_BASE.rstrip("/") + "/",
+        "Origin": HDHUB_BASE.rstrip("/"),
+    }
+    params = {
+        "q": query,
+        "query_by": "post_title,category,stars,director,imdb_id",
+        "query_by_weights": "4,2,2,2,4",
+        "sort_by": "sort_by_date:desc",
+        "limit": limit,
+        "highlight_fields": "none",
+        "use_cache": "true",
+    }
+    try:
+        if _CFFI_AVAILABLE:
+            resp = cffi_requests.get(
+                _HDHUB_SEARCH_API,
+                params=params,
+                headers=headers,
+                impersonate="chrome",
+                timeout=20,
+            )
+        else:
+            sess = requests.Session()
+            sess.headers.update(headers)
+            resp = sess.get(_HDHUB_SEARCH_API, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("hdhub_search typesense '%s' failed: %s", query, exc)
+        return []
+
+    movies: list[dict] = []
+    for hit in data.get("hits", []):
+        doc = hit.get("document", {})
+        title = doc.get("post_title", "")
+        permalink = doc.get("permalink", "")
+        thumbnail = doc.get("post_thumbnail", "")
+        if title and permalink:
+            movies.append({
+                "title": title,
+                "url": _hdhub_page_url(permalink),
+                "poster": thumbnail,
+            })
+    return movies[:limit]
+
+
+def _hdhub_search_latest_scan(query: str, limit: int = 10, max_pages: int = 8) -> list[dict]:
+    """Fallback: scan recent listing pages and match query tokens in titles."""
+    tokens = _query_tokens(query)
+    if not tokens:
+        return []
+    matches: list[dict] = []
+    seen_urls: set[str] = set()
+    for page in range(1, max_pages + 1):
+        batch = hdhub_latest_movies(page, 50)
+        if not batch:
+            break
+        for movie in batch:
+            title = movie.get("title", "")
+            url = movie.get("url", "")
+            if not title or not url or url in seen_urls:
+                continue
+            if not _title_matches_query(title, query):
+                continue
+            seen_urls.add(url)
+            matches.append({"title": title, "url": url, "poster": movie.get("poster", "")})
+            if len(matches) >= limit:
+                return matches
+    return matches
 
 
 def _hdhub_clean_poster(src: str) -> str:
@@ -2326,80 +2424,12 @@ def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
     return movies
 
 
-def _hdhub_search_wp(query: str, limit: int = 10) -> list[dict]:
-    """Fallback search via WordPress ?s= on the live HDHub4u site."""
-    try:
-        resp = _get(f"{HDHUB_BASE.rstrip('/')}/", params={"s": query}, timeout=25)
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as exc:
-        log.error("hdhub_search_wp '%s' failed: %s", query, exc)
-        return []
-
-    movies: list[dict] = []
-    for li in soup.select("ul.recent-movies li.thumb, article .thumb, .thumb"):
-        if len(movies) >= limit:
-            break
-        fig = li.find("figcaption")
-        a = li.find("a", href=True)
-        if not (a and fig):
-            continue
-        title = fig.get_text(strip=True)
-        href = a["href"]
-        if title and href:
-            movies.append({"title": title, "url": href, "poster": ""})
+def hdhub_search(query: str, limit: int = 10) -> list[dict]:
+    """Search HDHub4u via Typesense proxy, then recent-page scan fallback."""
+    movies = _hdhub_search_typesense(query, limit)
     if movies:
         return movies
-
-    for a in soup.select("h2.entry-title a[href], h3.entry-title a[href]"):
-        if len(movies) >= limit:
-            break
-        title = a.get_text(strip=True)
-        href = a.get("href", "")
-        if title and href:
-            movies.append({"title": title, "url": href, "poster": ""})
-    return movies[:limit]
-
-
-def hdhub_search(query: str, limit: int = 10) -> list[dict]:
-    """Search HDHub4u via Typesense API, with WordPress ?s= fallback."""
-    movies: list[dict] = []
-    try:
-        sess = requests.Session()
-        sess.headers.update(HEADERS)
-        resp = sess.get(
-            _HDHUB_SEARCH_API,
-            params={
-                "q":                query,
-                "query_by":         "post_title,category,stars,director,imdb_id",
-                "sort_by":          "sort_by_date:desc",
-                "limit":            limit,
-                "highlight_fields": "none",
-                "use_cache":        "true",
-            },
-            timeout=20,
-        )
-        data = resp.json()
-        for hit in data.get("hits", []):
-            doc       = hit.get("document", {})
-            title     = doc.get("post_title", "")
-            permalink = doc.get("permalink", "")
-            thumbnail = doc.get("post_thumbnail", "")
-            if title and permalink:
-                if permalink.startswith("http"):
-                    page_url = permalink
-                else:
-                    page_url = HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/")
-                movies.append({
-                    "title":  title,
-                    "url":    page_url,
-                    "poster": thumbnail,
-                })
-    except Exception as exc:
-        log.warning("hdhub_search typesense '%s' failed: %s", query, exc)
-
-    if movies:
-        return movies[:limit]
-    return _hdhub_search_wp(query, limit)
+    return _hdhub_search_latest_scan(query, limit)
 
 
 def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
