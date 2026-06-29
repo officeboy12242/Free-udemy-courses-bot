@@ -234,6 +234,41 @@ def ensure_fno_storage() -> None:
         con.close()
 
 
+def clear_today_fno_data() -> dict[str, int]:
+    """Delete all F&O records for today so scanning/alerts can start fresh."""
+    today = _ist_today()
+    counts: dict[str, int] = {}
+
+    if use_mongodb():
+        db = _get_mongo_db()
+        for coll, label in (
+            ("fno_alerts", "alerts"),
+            ("fno_alert_tg", "telegram_refs"),
+            ("fno_scan_stats", "scan_stats"),
+            ("fno_eod_sent", "eod_sent"),
+        ):
+            r = db[coll].delete_many({"alert_date": today})
+            counts[label] = r.deleted_count
+        log.info("F&O MongoDB: cleared today (%s) — %s", today, counts)
+        return counts
+
+    con = sqlite3.connect(DB_FILE)
+    try:
+        for table, label in (
+            ("fno_alerts", "alerts"),
+            ("fno_alert_tg", "telegram_refs"),
+            ("fno_scan_stats", "scan_stats"),
+            ("fno_eod_sent", "eod_sent"),
+        ):
+            cur = con.execute(f"DELETE FROM {table} WHERE alert_date = ?", (today,))
+            counts[label] = cur.rowcount
+        con.commit()
+        log.info("F&O SQLite: cleared today (%s) — %s", today, counts)
+        return counts
+    finally:
+        con.close()
+
+
 def eod_summary_sent_today() -> bool:
     today = _ist_today()
     if use_mongodb():
