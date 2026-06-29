@@ -14,6 +14,7 @@ Movie scraper — supports multiple sources:
 from __future__ import annotations
 
 import base64
+import html
 import json
 import logging
 import os
@@ -2273,6 +2274,13 @@ _HDHUB_SEARCH_API = os.getenv(
     "https://search.pingora.fyi/collections/post/documents/search",
 )
 _HDHUB_SKIP_LABELS = {"stream"}
+_HDHUB_SEARCH_ALERT_ENABLED = os.getenv("HDHUB_SEARCH_ALERT_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_HDHUB_SEARCH_ALERT_COOLDOWN = max(
+    300, int(os.getenv("HDHUB_SEARCH_ALERT_COOLDOWN", "1800"))
+)
+_hdhub_search_alert_last_at = 0.0
 
 
 def _query_tokens(query: str) -> list[str]:
@@ -2293,7 +2301,61 @@ def _hdhub_page_url(permalink: str) -> str:
     return HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/")
 
 
-def _hdhub_search_typesense(query: str, limit: int = 10) -> list[dict]:
+def _hdhub_search_alert_chat_id() -> int | None:
+    for key in ("HDHUB_SEARCH_ALERT_CHAT_ID", "ADMIN_ID", "OWNER_ID", "MARKET_ALERT_CHAT_ID"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def _notify_hdhub_search_broken(query: str, reason: str, *, severity: str = "error") -> None:
+    """Telegram alert when HDHub4u search pipeline fails (cooldown to avoid spam)."""
+    if not _HDHUB_SEARCH_ALERT_ENABLED:
+        return
+    chat_id = _hdhub_search_alert_chat_id()
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    if not chat_id or not bot_token:
+        log.warning("HDHub search alert skipped (BOT_TOKEN or alert chat id missing)")
+        return
+
+    global _hdhub_search_alert_last_at
+    now = time.time()
+    if now - _hdhub_search_alert_last_at < _HDHUB_SEARCH_ALERT_COOLDOWN:
+        return
+    _hdhub_search_alert_last_at = now
+
+    icon = "\u26a0\ufe0f" if severity == "warn" else "\U0001f6a8"
+    text = (
+        f"{icon} <b>HDHub4u search issue</b>\n\n"
+        f"Query: <code>{html.escape(query)}</code>\n"
+        f"Reason: {html.escape(reason)}\n"
+        f"Base: <code>{html.escape(HDHUB_BASE)}</code>\n"
+        f"API: <code>{html.escape(_HDHUB_SEARCH_API)}</code>\n\n"
+        "<i>Search may need a fix — check Pingora/Typesense or site changes.</i>"
+    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.error("HDHub search alert HTTP %s: %s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        log.error("HDHub search alert failed: %s", exc)
+
+
+def _hdhub_search_typesense(query: str, limit: int = 10) -> tuple[list[dict], str | None]:
     """Search via HDHub4u Typesense proxy (requires site Referer)."""
     headers = {
         **HEADERS,
@@ -2325,8 +2387,9 @@ def _hdhub_search_typesense(query: str, limit: int = 10) -> list[dict]:
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        log.warning("hdhub_search typesense '%s' failed: %s", query, exc)
-        return []
+        reason = f"{type(exc).__name__}: {exc}"
+        log.warning("hdhub_search typesense '%s' failed: %s", query, reason)
+        return [], reason
 
     movies: list[dict] = []
     for hit in data.get("hits", []):
@@ -2340,7 +2403,7 @@ def _hdhub_search_typesense(query: str, limit: int = 10) -> list[dict]:
                 "url": _hdhub_page_url(permalink),
                 "poster": thumbnail,
             })
-    return movies[:limit]
+    return movies[:limit], None
 
 
 def _hdhub_search_latest_scan(query: str, limit: int = 10, max_pages: int = 8) -> list[dict]:
@@ -2426,10 +2489,30 @@ def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
 
 def hdhub_search(query: str, limit: int = 10) -> list[dict]:
     """Search HDHub4u via Typesense proxy, then recent-page scan fallback."""
-    movies = _hdhub_search_typesense(query, limit)
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    movies, ts_error = _hdhub_search_typesense(q, limit)
     if movies:
         return movies
-    return _hdhub_search_latest_scan(query, limit)
+
+    fallback = _hdhub_search_latest_scan(q, limit)
+    if fallback:
+        if ts_error:
+            _notify_hdhub_search_broken(
+                q,
+                f"Typesense failed ({ts_error}); using latest-page fallback only",
+                severity="warn",
+            )
+        return fallback
+
+    if ts_error:
+        reason = f"Typesense failed ({ts_error}) and latest-page scan found nothing"
+    else:
+        reason = "Typesense returned no hits and latest-page scan found nothing"
+    _notify_hdhub_search_broken(q, reason)
+    return []
 
 
 def hdhub_movie_links(movie_url: str) -> dict[str, Any]:
