@@ -3421,7 +3421,7 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
     return "\n".join(lines)
 
 
-# ─── REST API helpers (links-only — no posters / size / audio metadata) ───────
+# ─── REST API helpers (download links with size / audio metadata) ─────────────
 
 MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
     "hdhub4u": "hdhub",
@@ -3441,66 +3441,170 @@ def _normalize_movie_source(source: str) -> str:
     return normalized
 
 
-def _dedupe_urls(urls: list[str]) -> list[str]:
+def _api_clean(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _api_extract_size(text: str) -> str:
+    m = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB|gb|mb))", text or "", re.I)
+    return m.group(1).upper().replace(" ", "") if m else ""
+
+
+def _api_extract_quality(text: str) -> str:
+    m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", text or "", re.I)
+    return m.group(1).upper() if m else ""
+
+
+def _api_extract_audio(text: str) -> str:
+    if not text:
+        return ""
+    bracket = re.search(r"\[([^\]]+)\]", text)
+    if bracket:
+        inner = bracket.group(1)
+        if re.search(r"hindi|english|tamil|telugu|malayalam|kannada|dual|multi|dd\d", inner, re.I):
+            return _api_clean(inner)
+    m = re.search(
+        r"((?:Hindi|English|Tamil|Telugu|Malayalam|Kannada|Dual Audio|Multi Audio)"
+        r"[^|\n\[]*)",
+        text,
+        re.I,
+    )
+    return _api_clean(m.group(1)) if m else ""
+
+
+def _api_link_entry(
+    url: str,
+    *,
+    label: str = "",
+    quality: str = "",
+    size: str = "",
+    audio: str = "",
+    episode: str = "",
+) -> dict[str, str]:
+    entry: dict[str, str] = {"url": url}
+    if label:
+        entry["label"] = label
+    if quality:
+        entry["quality"] = quality
+    if size:
+        entry["size"] = size
+    if audio:
+        entry["audio"] = audio
+    if episode:
+        entry["episode"] = episode
+    return entry
+
+
+def _dedupe_api_links(links: list[dict[str, str]]) -> list[dict[str, str]]:
     seen: set[str] = set()
-    out: list[str] = []
-    for url in urls:
-        u = (url or "").strip()
-        if not u or u in seen:
+    out: list[dict[str, str]] = []
+    for item in links:
+        url = (item.get("url") or "").strip()
+        if not url or url in seen:
             continue
-        seen.add(u)
-        out.append(u)
+        seen.add(url)
+        out.append(item)
     return out
 
 
-def _flat_urls_from_hdhub(data: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
+def _flat_links_from_hdhub(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    page_quality = _api_clean(info.get("quality", ""))
+    out: list[dict[str, str]] = []
+
     for link in data.get("links", []):
         href = link.get("url", "")
-        if href.startswith("http"):
-            urls.append(href)
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        out.append(_api_link_entry(
+            href,
+            label=label,
+            quality=_api_extract_quality(label) or _api_extract_quality(page_quality) or page_quality,
+            size=_api_extract_size(label) or _api_extract_size(page_quality),
+            audio=_api_extract_audio(label) or _api_extract_audio(page_quality) or page_audio,
+        ))
+
     for ep in data.get("episodes", []):
-        for ql in ep.get("qualities", {}).values():
+        ep_name = _api_clean(ep.get("ep", ""))
+        for quality, ql in ep.get("qualities", {}).items():
+            q_label = _api_clean(quality)
             for link in ql:
                 href = link.get("url", "")
-                if href.startswith("http"):
-                    urls.append(href)
-    return _dedupe_urls(urls)
+                if not href.startswith("http"):
+                    continue
+                label = _api_clean(link.get("label", ""))
+                merged = " ".join(x for x in (q_label, label, ep_name) if x)
+                out.append(_api_link_entry(
+                    href,
+                    label=label or q_label,
+                    quality=_api_extract_quality(merged) or q_label,
+                    size=_api_extract_size(merged),
+                    audio=_api_extract_audio(merged) or page_audio,
+                    episode=ep_name,
+                ))
+    return _dedupe_api_links(out)
 
 
-def _flat_urls_from_hdh(data: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
+def _flat_links_from_hdh(data: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
     for block in data.get("qualities", []):
+        quality = _api_clean(block.get("quality", ""))
+        size = _api_clean(block.get("size", "")) or _api_extract_size(quality)
+        audio = _api_clean(block.get("audio", "")) or _api_extract_audio(quality)
+        fmt = _api_clean(block.get("format", ""))
         for link in block.get("links", []):
             href = link.get("url", "")
-            if href.startswith("http"):
-                urls.append(href)
-    return _dedupe_urls(urls)
+            if not href.startswith("http"):
+                continue
+            name = _api_clean(link.get("name", ""))
+            merged = " ".join(x for x in (quality, name, fmt) if x)
+            out.append(_api_link_entry(
+                href,
+                label=name,
+                quality=_api_extract_quality(merged) or quality,
+                size=size or _api_extract_size(merged),
+                audio=audio or _api_extract_audio(merged),
+            ))
+    return _dedupe_api_links(out)
 
 
-def _flat_urls_from_md(data: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
+def _flat_links_from_md(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    out: list[dict[str, str]] = []
     for link in data.get("links", []):
         href = link.get("url", "")
-        if href.startswith("http"):
-            urls.append(href)
-    return _dedupe_urls(urls)
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        name = _api_clean(link.get("name", ""))
+        merged = " ".join(x for x in (label, name) if x)
+        out.append(_api_link_entry(
+            href,
+            label=name or label,
+            quality=_api_extract_quality(merged),
+            size=_api_extract_size(merged),
+            audio=_api_extract_audio(merged) or page_audio,
+        ))
+    return _dedupe_api_links(out)
 
 
 def movie_page_download_links(source: str, page_url: str) -> dict[str, Any]:
-    """Scrape one movie page and return download URLs only."""
+    """Scrape one movie page and return download links with size/audio metadata."""
     key = _normalize_movie_source(source)
     if key == "hdhub":
         data = hdhub_movie_links(page_url)
-        links = _flat_urls_from_hdhub(data)
+        links = _flat_links_from_hdhub(data)
         source_label = "hdhub4u"
     elif key == "hdh":
         data = hdh_movie_links(page_url)
-        links = _flat_urls_from_hdh(data)
+        links = _flat_links_from_hdh(data)
         source_label = "4khdhub"
     else:
         data = md_movie_links(page_url)
-        links = _flat_urls_from_md(data)
+        links = _flat_links_from_md(data)
         source_label = "moviesdrive"
     return {"source": source_label, "page_url": page_url, "links": links}
 

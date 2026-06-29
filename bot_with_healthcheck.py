@@ -2405,7 +2405,7 @@ async def api_movies_latest(request: web.Request) -> web.Response:
 
 
 async def api_movies_links(request: web.Request) -> web.Response:
-    """Download links only for one movie page (no poster / size / audio)."""
+    """Download links for one movie page (url, size, audio, quality)."""
     page_url = (request.query.get("url") or "").strip()
     source = (request.query.get("source") or "").strip()
     if not page_url or not source:
