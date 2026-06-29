@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urlparse
 
@@ -2302,7 +2303,21 @@ def _title_matches_query(title: str, query: str) -> bool:
     if not tokens:
         return False
     title_l = (title or "").lower()
-    return all(tok in title_l for tok in tokens)
+    title_words = re.findall(r"[a-z0-9]+", title_l)
+
+    def _token_matches(tok: str) -> bool:
+        if tok in title_l:
+            return True
+        if len(tok) < 4:
+            return False
+        for word in title_words:
+            if len(word) < 3:
+                continue
+            if SequenceMatcher(None, tok, word).ratio() >= 0.85:
+                return True
+        return False
+
+    return all(_token_matches(tok) for tok in tokens)
 
 
 def _hdhub_page_url(permalink: str) -> str:
