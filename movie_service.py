@@ -525,6 +525,22 @@ def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
 
         links: list[dict[str, str]] = []
         current_label = "Download"
+        current_quality = ""
+
+        def _md_append(href: str, label: str, link_text: str, quality: str) -> None:
+            if "mdrive.lol" in href:
+                for row in _expand_mdrive(href, label, link_text):
+                    row["quality"] = quality or _api_extract_quality(
+                        f"{row.get('label', '')} {row.get('name', '')}"
+                    )
+                    links.append(row)
+            else:
+                links.append({
+                    "label": label,
+                    "name": f"{link_text} ({_provider_name(href)})",
+                    "url": href,
+                    "quality": quality,
+                })
 
         for elem in content.descendants:
             # Skip non-tag nodes and deeply nested elements we handle via parent
@@ -534,18 +550,21 @@ def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
             # h5 heading — update label and capture ALL inline <a> links
             if elem.name == "h5":
                 current_label = re.sub(r"\s+", " ", elem.get_text(" ", strip=True))
+                # Keep last quality when heading is only "Zip [2.14GB]" etc.
+                heading_quality = _api_extract_quality(current_label)
+                if heading_quality:
+                    current_quality = heading_quality
                 for a_tag in elem.find_all("a", href=True):
                     href = a_tag.get("href", "")
                     link_text = re.sub(r"\s+", " ", a_tag.get_text(strip=True)) or current_label
+                    link_quality = (
+                        _api_extract_quality(f"{current_label} {link_text}")
+                        or current_quality
+                    )
+                    if link_quality:
+                        current_quality = link_quality
                     if href and _is_download_link(href):
-                        if "mdrive.lol" in href:
-                            links.extend(_expand_mdrive(href, current_label, link_text))
-                        else:
-                            links.append({
-                                "label": current_label,
-                                "name": f"{link_text} ({_provider_name(href)})",
-                                "url": href,
-                            })
+                        _md_append(href, current_label, link_text, link_quality)
                 continue
 
             # <a> tags that are NOT inside an h5 (handled above already)
@@ -556,14 +575,14 @@ def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
                 href = elem.get("href", "")
                 if href and _is_download_link(href):
                     link_text = re.sub(r"\s+", " ", elem.get_text(strip=True)) or current_label
-                    if "mdrive.lol" in href:
-                        links.extend(_expand_mdrive(href, current_label, link_text))
-                    else:
-                        links.append({
-                            "label": current_label,
-                            "name": f"{link_text} ({_provider_name(href)})",
-                            "url": href,
-                        })
+                    # Zip rows often sit under a bare "Zip [size]" heading — inherit quality
+                    link_quality = (
+                        _api_extract_quality(f"{current_label} {link_text}")
+                        or current_quality
+                    )
+                    if link_quality:
+                        current_quality = link_quality
+                    _md_append(href, current_label, link_text, link_quality)
 
         # Remove duplicates preserving order
         seen: set[str] = set()
@@ -631,6 +650,8 @@ def md_search(
             permalink = doc.get("permalink", "")
             poster = doc.get("post_thumbnail", "")
             if not permalink:
+                continue
+            if not _title_matches_query(title, query):
                 continue
             url = "https://new2.moviesdrives.my" + permalink if not permalink.startswith("http") else permalink
             movies.append({"title": title, "url": url, "poster": poster, "source": "md"})
@@ -2294,8 +2315,16 @@ _HDHUB_SEARCH_ALERT_COOLDOWN = max(
 _hdhub_search_alert_last_at = 0.0
 
 
+_QUERY_STOPWORDS = frozenset({
+    "a", "an", "and", "or", "the", "of", "in", "on", "to", "for", "with",
+})
+
+
 def _query_tokens(query: str) -> list[str]:
-    return [t for t in re.split(r"\s+", (query or "").strip().lower()) if len(t) >= 2]
+    return [
+        t for t in re.split(r"\s+", (query or "").strip().lower())
+        if len(t) >= 2 and t not in _QUERY_STOPWORDS
+    ]
 
 
 def _title_matches_query(title: str, query: str) -> bool:
@@ -2427,13 +2456,18 @@ def _hdhub_search_typesense(
         title = doc.get("post_title", "")
         permalink = doc.get("permalink", "")
         thumbnail = doc.get("post_thumbnail", "")
-        if title and permalink:
-            movies.append({
-                "title": title,
-                "url": _hdhub_page_url(permalink),
-                "poster": thumbnail,
-            })
-    return movies[:limit], None
+        if not title or not permalink:
+            continue
+        if not _title_matches_query(title, query):
+            continue
+        movies.append({
+            "title": title,
+            "url": _hdhub_page_url(permalink),
+            "poster": thumbnail,
+        })
+        if len(movies) >= limit:
+            break
+    return movies, None
 
 
 def _hdhub_search_latest_scan(query: str, limit: int = 10, max_pages: int = 8) -> list[dict]:
@@ -3728,11 +3762,21 @@ def _flat_links_from_md(data: dict[str, Any]) -> list[dict[str, str]]:
         label = _api_clean(link.get("label", ""))
         name = _api_clean(link.get("name", ""))
         merged = " ".join(x for x in (label, name) if x)
+        quality = (
+            _api_clean(link.get("quality", ""))
+            or _api_extract_quality(merged)
+        )
+        size = _api_extract_size(merged)
+        display = name or label
+        # Zip packs often omit quality in link text — surface it in the label
+        if quality and quality.lower() not in display.lower():
+            if re.search(r"\bzip\b", display, re.I) or size:
+                display = f"{quality} {display}".strip()
         out.append(_api_link_entry(
             href,
-            label=name or label,
-            quality=_api_extract_quality(merged),
-            size=_api_extract_size(merged),
+            label=display,
+            quality=quality,
+            size=size,
             audio=_api_extract_audio(merged) or page_audio,
         ))
     return _dedupe_api_links(out)
