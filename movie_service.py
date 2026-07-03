@@ -13,6 +13,7 @@ Movie scraper — supports multiple sources:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import json
@@ -24,6 +25,7 @@ import urllib.parse
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -241,7 +243,7 @@ def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
     try:
         url = HDH_CATEGORY if page == 1 else f"{HDH_BASE}/category/hindi-movies/page/{page}/"
         # Prime the session with the homepage first (gets cookies, sets Referer)
-        session = _session_for("4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
         session.headers["Referer"] = HDH_BASE + "/"
         resp = _get(url, timeout=20)
         resp.raise_for_status()
@@ -268,7 +270,7 @@ def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
 def hdh_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     """Return poster + list of quality/link blocks for a 4KHDHub movie page."""
     try:
-        session = _session_for("4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
         session.headers["Referer"] = HDH_CATEGORY
         page_timeout = 10 if fast else 20
         page_retries = 0 if fast else 2
@@ -454,6 +456,13 @@ def _is_download_link(href: str) -> bool:
     href_lower = href.lower()
     if any(x in href_lower for x in _EXCLUDE_PATTERNS):
         return False
+    # Never treat the current MoviesDrive host as a download provider
+    try:
+        md_host = urlparse(MD_BASE).netloc.lower()
+        if md_host and md_host in href_lower:
+            return False
+    except Exception:
+        pass
     return any(p in href_lower for p in _DOWNLOAD_PATTERNS)
 
 
@@ -600,7 +609,7 @@ def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
 def hdh_search(query: str, limit: int = 10, *, timeout: int = 20, retries: int = 2) -> list[dict[str, str]]:
     """Search 4KHDHub using the ?s= query parameter."""
     try:
-        session = _session_for("4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
         session.headers["Referer"] = HDH_BASE + "/"
         resp = _get(f"{HDH_BASE}/", params={"s": query}, timeout=timeout, retries=retries)
         resp.raise_for_status()
@@ -636,7 +645,7 @@ def md_search(
     """Search MoviesDrive via the /search.php JSON API (GET ?q=<query>&page=<page>)."""
     try:
         resp = _get(
-            "https://new2.moviesdrives.my/search.php",
+            f"{MD_BASE.rstrip('/')}/search.php",
             params={"q": query, "page": 1},
             timeout=timeout,
             retries=retries,
@@ -653,7 +662,12 @@ def md_search(
                 continue
             if not _title_matches_query(title, query):
                 continue
-            url = "https://new2.moviesdrives.my" + permalink if not permalink.startswith("http") else permalink
+            url = (
+                permalink if permalink.startswith("http")
+                else MD_BASE.rstrip("/") + (
+                    permalink if permalink.startswith("/") else f"/{permalink}"
+                )
+            )
             movies.append({"title": title, "url": url, "poster": poster, "source": "md"})
             if len(movies) >= limit:
                 break
@@ -4028,3 +4042,454 @@ def movies_aggregate_links(
     payload = {"query": q, "count": len(results), "results": results}
     _api_cache_set(cache_key, payload)
     return payload
+
+
+# ─── Movie site URL registry (runtime update via bot) ─────────────────────────
+
+MOVIE_SITE_REGISTRY: dict[str, dict[str, str]] = {
+    "hdhub": {
+        "label": "HDHub4u",
+        "env": "HDHUB_BASE_URL",
+        "default": "https://new2.hdhub4u.cl",
+        "health_path": "/",
+    },
+    "hdh": {
+        "label": "4KHDHub",
+        "env": "HDH_BASE_URL",
+        "default": "https://4khdhub.link",
+        "health_path": "/category/hindi-movies/",
+    },
+    "md": {
+        "label": "MoviesDrive",
+        "env": "MD_BASE_URL",
+        "default": "https://new2.moviesdrives.my",
+        "health_path": "/",
+    },
+    "hdmovie2": {
+        "label": "HDMovie2",
+        "env": "HDMOVIE2_BASE_URL",
+        "default": "https://newhdmovie2.pro",
+        "health_path": "/",
+    },
+    "vega": {
+        "label": "Vegamovies",
+        "env": "VEGA_BASE_URL",
+        "default": "https://vegamovies.global",
+        "health_path": "/",
+    },
+    "sdmp": {
+        "label": "SDMoviesPoint",
+        "env": "SDMP_BASE_URL",
+        "default": "https://sd1.sdmoviespoint.trade",
+        "health_path": "/",
+    },
+    "bolly": {
+        "label": "BollyFlix",
+        "env": "BOLLYFLIX_BASE_URL",
+        "default": "https://new.bollyflix.gd",
+        "health_path": "/",
+    },
+    "moviesmod": {
+        "label": "MoviesMod",
+        "env": "MOVIESMOD_BASE_URL",
+        "default": "https://moviesmod.farm",
+        "health_path": "/",
+    },
+    "atoz": {
+        "label": "AtoZ Cinemas",
+        "env": "ATOZ_BASE_URL",
+        "default": "https://atoz.cinemaz.workers.dev",
+        "health_path": "/",
+    },
+    "zeefliz": {
+        "label": "ZeeFliz",
+        "env": "ZEEFLIZ_BASE_URL",
+        "default": "https://zeefliz.beer",
+        "health_path": "/",
+    },
+}
+
+_SITE_URL_STORE_FILE = Path(
+    os.getenv("MOVIE_SITE_URLS_FILE", "movie_site_urls.json")
+)
+_SITE_HEALTH_COOLDOWN = max(
+    300, int(os.getenv("MOVIE_SITE_HEALTH_COOLDOWN", "21600"))
+)
+_SITE_HEALTH_INTERVAL = max(
+    300, int(os.getenv("MOVIE_SITE_HEALTH_INTERVAL", "1800"))
+)
+_site_health_alert_at: dict[str, float] = {}
+_site_fail_streak: dict[str, int] = {}
+
+
+def normalize_site_url(url: str) -> str:
+    """Normalize a site base URL (https, no trailing slash)."""
+    u = (url or "").strip()
+    if not u:
+        raise ValueError("URL is empty")
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    parsed = urlparse(u)
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL: {url}")
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+
+def get_site_url(key: str) -> str:
+    meta = MOVIE_SITE_REGISTRY.get(key)
+    if not meta:
+        raise KeyError(f"Unknown site key: {key}")
+    return _current_site_urls().get(key) or meta["default"]
+
+
+def _current_site_urls() -> dict[str, str]:
+    return {
+        "hdhub": HDHUB_BASE.rstrip("/"),
+        "hdh": HDH_BASE.rstrip("/"),
+        "md": MD_BASE.rstrip("/"),
+        "hdmovie2": HDMOVIE2_BASE.rstrip("/"),
+        "vega": VEGA_BASE.rstrip("/"),
+        "sdmp": SDMP_BASE.rstrip("/"),
+        "bolly": BOLLY_BASE.rstrip("/"),
+        "moviesmod": MOVIESMOD_BASE.rstrip("/"),
+        "atoz": ATOZ_BASE.rstrip("/"),
+        "zeefliz": ZEEFLIZ_BASE.rstrip("/"),
+    }
+
+
+def list_movie_sites() -> list[dict[str, str]]:
+    """Return all managed movie sites with current URLs."""
+    urls = _current_site_urls()
+    out: list[dict[str, str]] = []
+    for key, meta in MOVIE_SITE_REGISTRY.items():
+        out.append({
+            "key": key,
+            "label": meta["label"],
+            "env": meta["env"],
+            "url": urls.get(key, meta["default"]),
+            "default": meta["default"],
+        })
+    return out
+
+
+def _apply_site_url(key: str, url: str) -> None:
+    """Update live module globals for one site."""
+    global HDHUB_BASE, HDH_BASE, HDH_CATEGORY, MD_BASE
+    global HDMOVIE2_BASE, VEGA_BASE, _VEGA_SEARCH_URL, SDMP_BASE
+    global BOLLY_BASE, MOVIESMOD_BASE, ATOZ_BASE, ZEEFLIZ_BASE
+
+    url = normalize_site_url(url)
+    host = urlparse(url).netloc.lower()
+    if host:
+        _NO_VERIFY_HOSTS.add(host)
+
+    if key == "hdhub":
+        HDHUB_BASE = url
+        os.environ["HDHUB_BASE_URL"] = url
+    elif key == "hdh":
+        HDH_BASE = url
+        HDH_CATEGORY = f"{HDH_BASE}/category/hindi-movies/"
+        os.environ["HDH_BASE_URL"] = url
+    elif key == "md":
+        MD_BASE = url
+        os.environ["MD_BASE_URL"] = url
+    elif key == "hdmovie2":
+        HDMOVIE2_BASE = url
+        os.environ["HDMOVIE2_BASE_URL"] = url
+    elif key == "vega":
+        VEGA_BASE = url
+        _VEGA_SEARCH_URL = VEGA_BASE + "/?do=search&subaction=search&story={}"
+        os.environ["VEGA_BASE_URL"] = url
+    elif key == "sdmp":
+        SDMP_BASE = url
+        os.environ["SDMP_BASE_URL"] = url
+    elif key == "bolly":
+        BOLLY_BASE = url
+        os.environ["BOLLYFLIX_BASE_URL"] = url
+    elif key == "moviesmod":
+        MOVIESMOD_BASE = url
+        os.environ["MOVIESMOD_BASE_URL"] = url
+    elif key == "atoz":
+        ATOZ_BASE = url
+        os.environ["ATOZ_BASE_URL"] = url
+    elif key == "zeefliz":
+        ZEEFLIZ_BASE = url
+        os.environ["ZEEFLIZ_BASE_URL"] = url
+    else:
+        raise KeyError(f"Unknown site key: {key}")
+
+    # Drop cached API responses so new domain is used immediately
+    _api_cache.clear()
+
+
+def _load_site_url_overrides() -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    # MongoDB first (survives Render redeploys)
+    try:
+        from fno_storage import use_mongodb, _get_mongo_db
+        if use_mongodb():
+            doc = _get_mongo_db().movie_site_urls.find_one({"_id": "urls"})
+            if doc and isinstance(doc.get("sites"), dict):
+                for k, v in doc["sites"].items():
+                    if k in MOVIE_SITE_REGISTRY and v:
+                        overrides[k] = normalize_site_url(str(v))
+    except Exception as exc:
+        log.debug("movie site urls mongo load skipped: %s", exc)
+
+    # Local JSON fallback / merge (file wins over mongo for local dev)
+    try:
+        if _SITE_URL_STORE_FILE.exists():
+            data = json.loads(_SITE_URL_STORE_FILE.read_text(encoding="utf-8"))
+            sites = data.get("sites", data) if isinstance(data, dict) else {}
+            if isinstance(sites, dict):
+                for k, v in sites.items():
+                    if k in MOVIE_SITE_REGISTRY and v:
+                        overrides[k] = normalize_site_url(str(v))
+    except Exception as exc:
+        log.warning("movie site urls file load failed: %s", exc)
+    return overrides
+
+
+def _persist_site_urls(urls: dict[str, str]) -> list[str]:
+    """Persist site URLs. Returns list of storage backends written."""
+    saved: list[str] = []
+    payload = {"sites": urls, "updated_at": time.time()}
+
+    try:
+        from fno_storage import use_mongodb, _get_mongo_db
+        if use_mongodb():
+            _get_mongo_db().movie_site_urls.update_one(
+                {"_id": "urls"},
+                {"$set": payload},
+                upsert=True,
+            )
+            saved.append("mongodb")
+    except Exception as exc:
+        log.warning("movie site urls mongo save failed: %s", exc)
+
+    try:
+        _SITE_URL_STORE_FILE.write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+        saved.append(str(_SITE_URL_STORE_FILE))
+    except Exception as exc:
+        log.warning("movie site urls file save failed: %s", exc)
+
+    # Best-effort .env update for local / Render disk
+    try:
+        env_path = Path(".env")
+        if env_path.exists():
+            text = env_path.read_text(encoding="utf-8")
+            for key, url in urls.items():
+                env_key = MOVIE_SITE_REGISTRY[key]["env"]
+                line = f"{env_key}={url}"
+                if re.search(rf"^{re.escape(env_key)}=.*$", text, flags=re.M):
+                    text = re.sub(
+                        rf"^{re.escape(env_key)}=.*$",
+                        line,
+                        text,
+                        flags=re.M,
+                    )
+                else:
+                    text = text.rstrip() + f"\n{line}\n"
+            env_path.write_text(text, encoding="utf-8")
+            saved.append(".env")
+    except Exception as exc:
+        log.debug("movie site urls .env save skipped: %s", exc)
+
+    return saved
+
+
+def set_site_url(key: str, url: str) -> dict[str, Any]:
+    """Update one site base URL live and persist it."""
+    key = (key or "").strip().lower()
+    if key not in MOVIE_SITE_REGISTRY:
+        known = ", ".join(MOVIE_SITE_REGISTRY)
+        raise KeyError(f"Unknown site '{key}'. Use one of: {known}")
+    old = get_site_url(key)
+    new = normalize_site_url(url)
+    _apply_site_url(key, new)
+    urls = _current_site_urls()
+    saved = _persist_site_urls(urls)
+    log.info("Movie site %s URL updated: %s → %s (saved=%s)", key, old, new, saved)
+    return {
+        "key": key,
+        "label": MOVIE_SITE_REGISTRY[key]["label"],
+        "old_url": old,
+        "url": new,
+        "saved_to": saved,
+    }
+
+
+def init_movie_site_urls() -> None:
+    """Load persisted overrides (Mongo/JSON) over env defaults."""
+    overrides = _load_site_url_overrides()
+    for key, url in overrides.items():
+        try:
+            _apply_site_url(key, url)
+            log.info("Loaded movie site URL override %s=%s", key, url)
+        except Exception as exc:
+            log.warning("Skip site URL override %s: %s", key, exc)
+
+
+def check_movie_site(key: str, *, timeout: int = 15) -> dict[str, Any]:
+    """Probe one movie site. Detects hard failures and host redirects."""
+    meta = MOVIE_SITE_REGISTRY[key]
+    base = get_site_url(key)
+    path = meta.get("health_path") or "/"
+    probe = base.rstrip("/") + (path if path.startswith("/") else f"/{path}")
+    result: dict[str, Any] = {
+        "key": key,
+        "label": meta["label"],
+        "url": base,
+        "probe_url": probe,
+        "ok": False,
+        "status_code": 0,
+        "final_url": "",
+        "redirected": False,
+        "error": "",
+    }
+    try:
+        host = urlparse(probe).netloc
+        verify = host not in _NO_VERIFY_HOSTS
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        with warnings.catch_warnings():
+            if not verify:
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            resp = session.get(
+                probe,
+                timeout=timeout,
+                verify=verify,
+                allow_redirects=True,
+            )
+        result["status_code"] = int(resp.status_code)
+        result["final_url"] = str(resp.url)
+        final_host = urlparse(str(resp.url)).netloc.lower()
+        base_host = urlparse(base).netloc.lower()
+        if final_host and base_host and final_host != base_host:
+            result["redirected"] = True
+            result["error"] = f"redirected to {final_host}"
+            # Prompt admin to update to the new host
+            result["ok"] = False
+            result["suggested_url"] = f"{urlparse(str(resp.url)).scheme}://{final_host}"
+        elif 200 <= resp.status_code < 400 and len(resp.content) > 200:
+            result["ok"] = True
+        else:
+            result["error"] = f"HTTP {resp.status_code} ({len(resp.content)} bytes)"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def check_all_movie_sites(*, timeout: int = 15) -> list[dict[str, Any]]:
+    return [check_movie_site(key, timeout=timeout) for key in MOVIE_SITE_REGISTRY]
+
+
+def _site_health_chat_id() -> int | None:
+    for key in ("ADMIN_ID", "OWNER_ID", "MARKET_ALERT_CHAT_ID", "HDHUB_SEARCH_ALERT_CHAT_ID"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return None
+
+
+def format_site_health_alert(row: dict[str, Any]) -> str:
+    key = row["key"]
+    label = row["label"]
+    url = row["url"]
+    err = html.escape(row.get("error") or "unknown error")
+    lines = [
+        "⚠️ <b>Movie site needs URL update</b>",
+        "",
+        f"<b>{html.escape(label)}</b> (<code>{html.escape(key)}</code>)",
+        f"Current: <code>{html.escape(url)}</code>",
+        f"Issue: <code>{err}</code>",
+    ]
+    suggested = row.get("suggested_url")
+    if suggested:
+        lines.append(f"Redirected to: <code>{html.escape(suggested)}</code>")
+        lines.append("")
+        lines.append("Update now:")
+        lines.append(f"<code>/setsite {key} {html.escape(suggested)}</code>")
+    else:
+        lines.append("")
+        lines.append("Domain may have moved. Update with:")
+        lines.append(f"<code>/setsite {key} https://new-domain.example</code>")
+    lines.append("")
+    lines.append("<code>/sites</code> — list all site URLs")
+    lines.append("<code>/movietest</code> — re-check connectivity")
+    return "\n".join(lines)
+
+
+def format_sites_list_html() -> str:
+    lines = ["🌐 <b>Movie site URLs</b>", ""]
+    for row in list_movie_sites():
+        lines.append(
+            f"• <b>{html.escape(row['label'])}</b> "
+            f"(<code>{html.escape(row['key'])}</code>)\n"
+            f"  <code>{html.escape(row['url'])}</code>"
+        )
+    lines.append("")
+    lines.append("<b>Update:</b> <code>/setsite &lt;key&gt; &lt;url&gt;</code>")
+    lines.append("<b>Example:</b> <code>/setsite hdhub https://new2.hdhub4u.cl</code>")
+    return "\n".join(lines)
+
+
+async def run_movie_site_monitor(bot: Any) -> None:
+    """Periodically probe movie sites and Telegram-alert admin on failures."""
+    chat_id = _site_health_chat_id()
+    if not chat_id:
+        log.warning("Movie site monitor disabled (no ADMIN_ID / OWNER_ID)")
+        return
+    log.info(
+        "Movie site health monitor every %ss → chat %s",
+        _SITE_HEALTH_INTERVAL,
+        chat_id,
+    )
+    # First run after a short delay so startup isn't blocked
+    await asyncio.sleep(45)
+    while True:
+        try:
+            rows = await asyncio.to_thread(check_all_movie_sites, timeout=12)
+            now = time.time()
+            for row in rows:
+                key = row["key"]
+                if row.get("ok"):
+                    _site_fail_streak[key] = 0
+                    continue
+                streak = _site_fail_streak.get(key, 0) + 1
+                _site_fail_streak[key] = streak
+                # Require 2 consecutive failures before alerting
+                if streak < 2:
+                    continue
+                last = _site_health_alert_at.get(key, 0.0)
+                if now - last < _SITE_HEALTH_COOLDOWN:
+                    continue
+                _site_health_alert_at[key] = now
+                text = format_site_health_alert(row)
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    log.warning(
+                        "Movie site alert sent for %s: %s",
+                        key,
+                        row.get("error"),
+                    )
+                except Exception as exc:
+                    log.error("Movie site alert send failed: %s", exc)
+        except Exception as exc:
+            log.error("Movie site monitor loop error: %s", exc)
+        await asyncio.sleep(_SITE_HEALTH_INTERVAL)
+
+
+# Call init_movie_site_urls() from bot startup (not at import — avoids Mongo hang).

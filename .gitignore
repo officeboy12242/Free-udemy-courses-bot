@@ -1,5 +1,6 @@
 # Environment variables
 .env
+movie_site_urls.json
 
 # Python
 __pycache__/

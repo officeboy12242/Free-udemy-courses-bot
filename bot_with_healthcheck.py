@@ -110,6 +110,9 @@ from movie_service import (
     bollyflix_search, moviesmod_search, atoz_search,
     movies_search_combined, movies_latest_combined, movies_aggregate_links,
     movie_page_download_links,
+    list_movie_sites, set_site_url, format_sites_list_html,
+    check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
+    init_movie_site_urls,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -487,6 +490,9 @@ Reuses the same live message (no spam):
 <b>📽️ MOVIES</b>
 /movies — browse latest movies
 /search &lt;title&gt; — search movies
+/sites — list movie site URLs
+/setsite &lt;key&gt; &lt;url&gt; — update a site domain live
+/movietest — connectivity check (alerts if domain moved)
 
 <b>📰 NEWS</b>
 /news — preview &amp; post tech news
@@ -819,6 +825,76 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List current movie site base URLs. Owner only."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
+        return
+    await update.effective_message.reply_html(
+        format_sites_list_html(),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_setsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Update a movie site base URL live. Owner only.
+
+    Usage: /setsite hdhub https://new2.hdhub4u.cl
+    """
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
+        return
+
+    keys = ", ".join(MOVIE_SITE_REGISTRY)
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_html(
+            "📝 <b>Update movie site URL</b>\n\n"
+            "<code>/setsite &lt;key&gt; &lt;url&gt;</code>\n\n"
+            f"<b>Keys:</b> <code>{html.escape(keys)}</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/setsite hdhub https://new2.hdhub4u.cl</code>\n"
+            "<code>/setsite md https://new2.moviesdrives.my</code>\n\n"
+            "Use <code>/sites</code> to see current URLs.",
+            disable_web_page_preview=True,
+        )
+        return
+
+    key = context.args[0].strip().lower()
+    new_url = " ".join(context.args[1:]).strip()
+    try:
+        result = await asyncio.to_thread(set_site_url, key, new_url)
+    except KeyError as exc:
+        await update.effective_message.reply_html(
+            f"❌ {html.escape(str(exc))}\n\n"
+            f"<b>Keys:</b> <code>{html.escape(keys)}</code>"
+        )
+        return
+    except ValueError as exc:
+        await update.effective_message.reply_html(f"❌ {html.escape(str(exc))}")
+        return
+    except Exception as exc:
+        log.exception("setsite failed")
+        await update.effective_message.reply_html(
+            f"❌ Failed to update site URL:\n<code>{html.escape(str(exc))}</code>"
+        )
+        return
+
+    saved = ", ".join(result.get("saved_to") or []) or "memory only (this session)"
+    await update.effective_message.reply_html(
+        f"✅ <b>{html.escape(result['label'])}</b> updated\n\n"
+        f"<b>Key:</b> <code>{html.escape(result['key'])}</code>\n"
+        f"<b>Old:</b> <code>{html.escape(result['old_url'])}</code>\n"
+        f"<b>New:</b> <code>{html.escape(result['url'])}</code>\n\n"
+        f"<i>Saved to: {html.escape(saved)}</i>\n"
+        f"Takes effect immediately for bot + API.",
+        disable_web_page_preview=True,
+    )
+
+
 async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Test connectivity to movie sites. Owner only."""
     if not update.effective_message or not update.effective_user:
@@ -829,32 +905,46 @@ async def cmd_movietest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     msg = await update.effective_message.reply_text("🔍 Testing connectivity to movie sites…")
 
-    from movie_service import SCRAPER_API_KEY, BOLLY_BASE, _get as movie_get
-    tests = [
-        ("HDHub4u",        "https://new2.hdhub4u.cl/"),
-        ("4KHDHub",        "https://4khdhub.link/category/hindi-movies/"),
-        ("MoviesDrive",    "https://new2.moviesdrives.my/"),
-        ("HDMovie2",       "https://newhdmovie2.pro/"),
-        ("Vegamovies",     "https://vegamovies.global/"),
-        ("SDMoviesPoint",  "https://sd1.sdmoviespoint.trade/"),
-        ("BollyFlix",      f"{BOLLY_BASE}/"),
-    ]
+    rows = await asyncio.to_thread(check_all_movie_sites, timeout=15)
+    lines = ["<b>Movie Site Connectivity Test</b>", ""]
+    broken: list[dict] = []
+    for row in rows:
+        if row.get("ok"):
+            lines.append(
+                f"✅ <b>{html.escape(row['label'])}</b> "
+                f"(<code>{html.escape(row['key'])}</code>)\n"
+                f"  <code>{html.escape(row['url'])}</code> — HTTP {row.get('status_code', '?')}"
+            )
+        else:
+            broken.append(row)
+            err = html.escape((row.get("error") or "failed")[:120])
+            lines.append(
+                f"❌ <b>{html.escape(row['label'])}</b> "
+                f"(<code>{html.escape(row['key'])}</code>)\n"
+                f"  <code>{html.escape(row['url'])}</code>\n"
+                f"  {err}"
+            )
+            suggested = row.get("suggested_url")
+            if suggested:
+                lines.append(
+                    f"  → update: <code>/setsite {html.escape(row['key'])} "
+                    f"{html.escape(suggested)}</code>"
+                )
+            else:
+                lines.append(
+                    f"  → update: <code>/setsite {html.escape(row['key'])} "
+                    f"https://new-domain.example</code>"
+                )
 
-    mode = f"ScraperAPI (key set ✅)" if SCRAPER_API_KEY else "Direct (no proxy ⚠️ — may be blocked on cloud)"
-    lines = [f"<b>Movie Site Connectivity Test</b>", f"Mode: <i>{mode}</i>\n"]
+    if broken:
+        lines.append(
+            f"\n⚠️ <b>{len(broken)}</b> site(s) need attention. "
+            "Domain may have changed — use <code>/setsite</code> to update."
+        )
+    else:
+        lines.append("\n✅ All sites reachable.")
 
-    for label, url in tests:
-        try:
-            r = await asyncio.to_thread(movie_get, url, 1, timeout=20)
-            icon = "✅" if r.status_code == 200 else "⚠️"
-            lines.append(f"{icon} <b>{label}</b>: HTTP {r.status_code} ({len(r.content):,} bytes)")
-        except Exception as e:
-            lines.append(f"❌ <b>{label}</b>: {type(e).__name__}: {str(e)[:120]}")
-
-    if not SCRAPER_API_KEY:
-        lines.append("\n💡 Set <code>SCRAPER_API_KEY</code> in env to bypass Cloudflare on cloud hosts.\nFree at scraperapi.com (5,000 req/month)")
-
-    await msg.edit_text("\n".join(lines), parse_mode="HTML")
+    await msg.edit_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1844,6 +1934,8 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("myalerts", cmd_myalerts))
     app.add_handler(CommandHandler("movies", cmd_movies))
     app.add_handler(CommandHandler("movietest", cmd_movietest))
+    app.add_handler(CommandHandler("sites", cmd_sites))
+    app.add_handler(CommandHandler("setsite", cmd_setsite))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
@@ -2567,6 +2659,11 @@ async def main():
     else:
         init_db()
     ensure_news_table()
+    try:
+        init_movie_site_urls()
+        log.info("Movie site URLs loaded (env + persisted overrides)")
+    except Exception as exc:
+        log.warning("init_movie_site_urls failed: %s", exc)
     
     # Initialize bot pool for parallel downloads/uploads
     num_bots = await init_bot_pool()
@@ -2604,6 +2701,7 @@ async def main():
         asyncio.create_task(run_course_loop(bot)),
         asyncio.create_task(run_news_autopost(bot)),
         asyncio.create_task(auto_enroll_job(tg_app)),
+        asyncio.create_task(run_movie_site_monitor(bot)),
     ]
     if MARKET_FEATURES_ENABLED:
         log.info(
