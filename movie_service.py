@@ -3625,14 +3625,68 @@ MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
     "hdh": "hdh",
     "moviesdrive": "md",
     "md": "md",
+    "hdmovie2": "hdmovie2",
+    "newhdmovie2": "hdmovie2",
+    "vegamovies": "vega",
+    "vega": "vega",
+    "sdmoviespoint": "sdmp",
+    "sdmp": "sdmp",
+    "bollyflix": "bolly",
+    "bolly": "bolly",
+    "moviesmod": "moviesmod",
+    "atoz": "atoz",
+    "atozcinemas": "atoz",
 }
+
+MOVIE_API_SOURCE_LABELS: dict[str, str] = {
+    "hdhub": "hdhub4u",
+    "hdh": "4khdhub",
+    "md": "moviesdrive",
+    "hdmovie2": "hdmovie2",
+    "vega": "vegamovies",
+    "sdmp": "sdmoviespoint",
+    "bolly": "bollyflix",
+    "moviesmod": "moviesmod",
+    "atoz": "atoz",
+}
+
+# Combined REST API sources (all movie sites except ZeeFliz)
+MOVIE_API_SEARCH_SOURCES: tuple[tuple[str, Any, str], ...] = (
+    ("hdhub4u", hdhub_search, "hdhub"),
+    ("4khdhub", hdh_search, "hdh"),
+    ("moviesdrive", md_search, "md"),
+    ("hdmovie2", hdmovie2_search, "hdmovie2"),
+    ("vegamovies", vega_search, "vega"),
+    ("sdmoviespoint", sdmp_search, "sdmp"),
+    ("bollyflix", bollyflix_search, "bolly"),
+    ("moviesmod", moviesmod_search, "moviesmod"),
+    ("atoz", atoz_search, "atoz"),
+)
+
+MOVIE_API_LATEST_SOURCES: tuple[tuple[str, Any, str], ...] = (
+    ("hdhub4u", hdhub_latest_movies, "hdhub"),
+    ("4khdhub", hdh_latest_movies, "hdh"),
+    ("moviesdrive", md_latest_movies, "md"),
+    ("hdmovie2", hdmovie2_latest_movies, "hdmovie2"),
+    ("vegamovies", vega_latest_movies, "vega"),
+    ("sdmoviespoint", sdmp_latest_movies, "sdmp"),
+    ("bollyflix", bollyflix_latest_movies, "bolly"),
+    ("moviesmod", moviesmod_latest_movies, "moviesmod"),
+    ("atoz", atoz_latest_movies, "atoz"),
+)
+
+# Latest fetchers that accept (page, limit)
+_MOVIE_API_LATEST_WITH_LIMIT = frozenset({
+    "hdhub", "vega", "sdmp", "bolly", "moviesmod", "atoz",
+})
 
 
 def _normalize_movie_source(source: str) -> str:
     key = (source or "").strip().lower()
     normalized = MOVIE_API_SOURCE_ALIASES.get(key)
     if not normalized:
-        raise ValueError(f"unknown source '{source}' (use hdhub, hdh, or md)")
+        keys = ", ".join(sorted(MOVIE_API_SOURCE_LABELS))
+        raise ValueError(f"unknown source '{source}' (use one of: {keys})")
     return normalized
 
 
@@ -3796,6 +3850,125 @@ def _flat_links_from_md(data: dict[str, Any]) -> list[dict[str, str]]:
     return _dedupe_api_links(out)
 
 
+def _flat_links_from_hdmovie2(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        out.append(_api_link_entry(
+            href,
+            label=label,
+            quality=_api_extract_quality(label),
+            size=_api_extract_size(label),
+            audio=_api_extract_audio(label) or page_audio,
+        ))
+    return _dedupe_api_links(out)
+
+
+def _flat_links_from_vega(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if not href.startswith("http"):
+            continue
+        quality = _api_clean(link.get("quality", ""))
+        size = _api_clean(link.get("size", "")) or _api_extract_size(quality)
+        merged = " ".join(x for x in (quality, size) if x)
+        out.append(_api_link_entry(
+            href,
+            label=quality or "Download",
+            quality=_api_extract_quality(merged) or quality,
+            size=size or _api_extract_size(merged),
+            audio=_api_extract_audio(merged) or page_audio,
+        ))
+    return _dedupe_api_links(out)
+
+
+def _flat_links_from_sdmp(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        size = _api_clean(link.get("size", "")) or _api_extract_size(label)
+        out.append(_api_link_entry(
+            href,
+            label=label,
+            quality=_api_extract_quality(label),
+            size=size,
+            audio=_api_extract_audio(label) or page_audio,
+        ))
+    return _dedupe_api_links(out)
+
+
+def _flat_links_from_bolly(data: dict[str, Any]) -> list[dict[str, str]]:
+    info = data.get("info") or {}
+    page_audio = _api_clean(info.get("language", ""))
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        name = _api_clean(link.get("name", ""))
+        merged = " ".join(x for x in (label, name) if x)
+        out.append(_api_link_entry(
+            href,
+            label=name or label,
+            quality=_api_extract_quality(merged),
+            size=_api_extract_size(merged),
+            audio=_api_extract_audio(merged) or page_audio,
+            episode=label if data.get("is_series") and "episode" in label.lower() else "",
+        ))
+    return _dedupe_api_links(out)
+
+
+def _flat_links_from_moviesmod(data: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        raw_url = (link.get("url") or "").strip()
+        if not raw_url:
+            continue
+        label = _api_clean(link.get("label", ""))
+        for href in re.split(r"[\r\n]+", raw_url):
+            href = href.strip()
+            if not href.startswith("http"):
+                continue
+            out.append(_api_link_entry(
+                href,
+                label=label,
+                quality=_api_extract_quality(label),
+                size=_api_extract_size(label),
+                audio=_api_extract_audio(label),
+            ))
+    return _dedupe_api_links(out)
+
+
+def _flat_links_from_atoz(data: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for link in data.get("links", []):
+        href = link.get("url", "")
+        if not href.startswith("http"):
+            continue
+        label = _api_clean(link.get("label", ""))
+        out.append(_api_link_entry(
+            href,
+            label=label,
+            quality=_api_extract_quality(label),
+            size=_api_extract_size(label),
+        ))
+    return _dedupe_api_links(out)
+
+
 def movie_page_download_links(
     source: str,
     page_url: str,
@@ -3812,16 +3985,37 @@ def movie_page_download_links(
     if key == "hdhub":
         data = hdhub_movie_links(page_url, fast=fast)
         links = _flat_links_from_hdhub(data)
-        source_label = "hdhub4u"
     elif key == "hdh":
         data = hdh_movie_links(page_url, fast=fast)
         links = _flat_links_from_hdh(data)
-        source_label = "4khdhub"
-    else:
+    elif key == "md":
         data = md_movie_links(page_url, fast=fast)
         links = _flat_links_from_md(data)
-        source_label = "moviesdrive"
-    result = {"source": source_label, "page_url": page_url, "links": links}
+    elif key == "hdmovie2":
+        data = hdmovie2_movie_links(page_url)
+        links = _flat_links_from_hdmovie2(data)
+    elif key == "vega":
+        data = vega_movie_links(page_url)
+        links = _flat_links_from_vega(data)
+    elif key == "sdmp":
+        data = sdmp_movie_links(page_url)
+        links = _flat_links_from_sdmp(data)
+    elif key == "bolly":
+        data = bollyflix_movie_links(page_url)
+        links = _flat_links_from_bolly(data)
+    elif key == "moviesmod":
+        data = moviesmod_movie_links(page_url)
+        links = _flat_links_from_moviesmod(data)
+    elif key == "atoz":
+        data = atoz_movie_links(page_url)
+        links = _flat_links_from_atoz(data)
+    else:
+        raise ValueError(f"unsupported source '{source}'")
+    result = {
+        "source": MOVIE_API_SOURCE_LABELS[key],
+        "page_url": page_url,
+        "links": links,
+    }
     _api_cache_set(cache_key, result)
     return result
 
@@ -3853,11 +4047,16 @@ def _movies_search_one_source(
                 timeout=8 if fast else 20,
                 retries=0 if fast else 2,
             )
+        elif fast:
+            movies = search_fn(query, min(limit, 5))
         else:
             movies = search_fn(query, limit)
         for movie in movies:
             page_url = movie.get("url", "")
             if not page_url:
+                continue
+            title = movie.get("title", "Unknown")
+            if search_fn not in (hdhub_search, md_search) and not _title_matches_query(title, query):
                 continue
             rows.append({
                 "source": source_label,
@@ -3876,23 +4075,20 @@ def movies_search_combined(
     *,
     fast: bool = True,
 ) -> list[dict[str, str]]:
-    """Search HDHub4u, 4KHDHub, and MoviesDrive in parallel."""
+    """Search all movie API sources in parallel (except ZeeFliz)."""
     q = (query or "").strip()
     if not q:
         return []
     limit = max(1, min(int(limit_per_source), 20))
-    cache_key = f"search:{q}:{limit}:{'fast' if fast else 'full'}"
+    cache_key = f"search:v2:{q}:{limit}:{'fast' if fast else 'full'}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    sources = (
-        ("hdhub4u", hdhub_search, "hdhub"),
-        ("4khdhub", hdh_search, "hdh"),
-        ("moviesdrive", md_search, "md"),
-    )
+    sources = MOVIE_API_SEARCH_SOURCES
     out: list[dict[str, str]] = []
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+    workers = min(len(sources), MOVIES_API_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
             pool.submit(
                 _movies_search_one_source,
@@ -3928,7 +4124,10 @@ def _movies_latest_one_source(
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     try:
-        movies = fetch_fn(page) if source_key != "hdhub" else fetch_fn(page, limit)
+        if source_key in _MOVIE_API_LATEST_WITH_LIMIT:
+            movies = fetch_fn(page, limit)
+        else:
+            movies = fetch_fn(page)
         for movie in movies[:limit]:
             page_url = movie.get("url", "")
             if not page_url:
@@ -3950,21 +4149,18 @@ def movies_latest_combined(
     *,
     fast: bool = True,
 ) -> list[dict[str, str]]:
-    """Latest listings from all three sources in parallel."""
+    """Latest listings from all movie API sources in parallel (except ZeeFlix)."""
     page_n = max(1, int(page))
     limit = max(1, min(int(limit_per_source), 20))
-    cache_key = f"latest:{page_n}:{limit}"
+    cache_key = f"latest:v2:{page_n}:{limit}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    sources = (
-        ("hdhub4u", hdhub_latest_movies, "hdhub"),
-        ("4khdhub", hdh_latest_movies, "hdh"),
-        ("moviesdrive", md_latest_movies, "md"),
-    )
+    sources = MOVIE_API_LATEST_SOURCES
     out: list[dict[str, str]] = []
-    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+    workers = min(len(sources), MOVIES_API_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
             pool.submit(_movies_latest_one_source, label, fn, key, page_n, limit)
             for label, fn, key in sources
@@ -4008,7 +4204,7 @@ def movies_aggregate_links(
     """Search all three sites and fetch download links for each hit in parallel."""
     q = (query or "").strip()
     limit = max(1, min(int(limit_per_source), 10))
-    cache_key = f"agg:{q}:{limit}:{'fast' if fast else 'full'}"
+    cache_key = f"agg:v2:{q}:{limit}:{'fast' if fast else 'full'}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached

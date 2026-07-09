@@ -2465,7 +2465,7 @@ def _movies_api_limit(raw: str | None, *, default: int, maximum: int) -> int:
 
 
 async def api_movies_search(request: web.Request) -> web.Response:
-    """Search HDHub4u + 4KHDHub + MoviesDrive (titles and page URLs only)."""
+    """Search all movie sources (titles and page URLs only; excludes ZeeFlix)."""
     query = (request.query.get("q") or "").strip()
     if not query:
         return web.json_response({"error": "q required"}, status=400)
@@ -2482,7 +2482,7 @@ async def api_movies_search(request: web.Request) -> web.Response:
 
 
 async def api_movies_latest(request: web.Request) -> web.Response:
-    """Latest movies from all three sources (no posters)."""
+    """Latest movies from all API sources (no posters; excludes ZeeFlix)."""
     try:
         page = max(1, int(request.query.get("page", "1")))
         limit = _movies_api_limit(request.query.get("limit"), default=10, maximum=20)
@@ -2502,7 +2502,12 @@ async def api_movies_links(request: web.Request) -> web.Response:
     source = (request.query.get("source") or "").strip()
     if not page_url or not source:
         return web.json_response(
-            {"error": "url and source required (hdhub, hdh, or md)"},
+            {
+                "error": (
+                    "url and source required "
+                    "(hdhub, hdh, md, hdmovie2, vega, sdmp, bolly, moviesmod, atoz)"
+                ),
+            },
             status=400,
         )
     try:
@@ -2516,7 +2521,7 @@ async def api_movies_links(request: web.Request) -> web.Response:
 
 
 async def api_movies(request: web.Request) -> web.Response:
-    """Search all three sites and return download links for each result."""
+    """Search all movie API sources and return download links for each result."""
     query = (request.query.get("q") or "").strip()
     if not query:
         return web.json_response({"error": "q required"}, status=400)
