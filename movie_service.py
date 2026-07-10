@@ -4700,30 +4700,34 @@ def format_site_health_alert(
         if saved:
             lines.append(f"Saved to: <code>{html.escape(', '.join(str(s) for s in saved))}</code>")
         lines.append("")
-        lines.append("<code>/sites</code> — verify all URLs")
-        lines.append("<code>/movietest</code> — re-check connectivity")
+        lines.append("No action needed unless the new URL is wrong.")
+        lines.append(
+            f"If wrong: <code>/setsite {html.escape(key)} https://correct-domain.example</code>"
+        )
+        lines.append("<code>/sites</code> · <code>/movietest</code>")
         return "\n".join(lines)
 
+    suggested = row.get("suggested_url")
     lines = [
-        "⚠️ <b>Movie site needs URL update</b>",
+        "⚠️ <b>Movie site needs manual URL update</b>",
         "",
         f"<b>{html.escape(label)}</b> (<code>{html.escape(key)}</code>)",
         f"Current: <code>{html.escape(url)}</code>",
         f"Issue: <code>{err}</code>",
     ]
-    suggested = row.get("suggested_url")
     if suggested:
-        lines.append(f"Redirected to: <code>{html.escape(suggested)}</code>")
+        lines.append(f"Detected redirect: <code>{html.escape(suggested)}</code>")
         lines.append("")
-        lines.append("Update now:")
+        lines.append("Auto-update could not apply. Set manually:")
         lines.append(f"<code>/setsite {key} {html.escape(suggested)}</code>")
     else:
         lines.append("")
-        lines.append("Domain may have moved. Update with:")
+        lines.append("Could not detect the new domain automatically.")
+        lines.append("Find the new site URL and run:")
         lines.append(f"<code>/setsite {key} https://new-domain.example</code>")
     lines.append("")
-    lines.append("<code>/sites</code> — list all site URLs")
-    lines.append("<code>/movietest</code> — re-check connectivity")
+    lines.append("<code>/sites</code> — list all URLs")
+    lines.append("<code>/movietest</code> — re-check after update")
     return "\n".join(lines)
 
 
@@ -4736,7 +4740,8 @@ def format_sites_list_html() -> str:
             f"  <code>{html.escape(row['url'])}</code>"
         )
     lines.append("")
-    lines.append("<b>Update:</b> <code>/setsite &lt;key&gt; &lt;url&gt;</code>")
+    lines.append("<b>Auto:</b> redirects are updated automatically + Telegram alert")
+    lines.append("<b>Manual:</b> <code>/setsite &lt;key&gt; &lt;url&gt;</code> when auto-detect fails")
     lines.append("<b>Example:</b> <code>/setsite hdhub https://new2.hdhub4u.cl</code>")
     return "\n".join(lines)
 
@@ -4765,14 +4770,26 @@ async def _process_site_health_rows(bot: Any, chat_id: int, rows: list[dict[str,
                 auto_fixed = await asyncio.to_thread(
                     set_site_url, key, row["suggested_url"],
                 )
-                log.info(
-                    "Movie site %s auto-updated via redirect: %s → %s",
-                    key,
-                    auto_fixed.get("old_url"),
-                    auto_fixed.get("url"),
-                )
+                # Re-check — if still broken, clear auto_fixed so user gets /setsite prompt
+                recheck = await asyncio.to_thread(check_movie_site, key, timeout=12)
+                if not recheck.get("ok"):
+                    log.warning(
+                        "Movie site %s still unhealthy after auto-update to %s",
+                        key,
+                        auto_fixed.get("url"),
+                    )
+                    row = {**row, **recheck, "error": recheck.get("error") or row.get("error")}
+                    auto_fixed = None
+                else:
+                    log.info(
+                        "Movie site %s auto-updated via redirect: %s → %s",
+                        key,
+                        auto_fixed.get("old_url"),
+                        auto_fixed.get("url"),
+                    )
             except Exception as exc:
                 log.error("Movie site auto-update failed for %s: %s", key, exc)
+                row = {**row, "error": f"auto-update failed: {exc}"}
 
         _site_health_alert_at[key] = now
         text = format_site_health_alert(row, auto_fixed=auto_fixed)

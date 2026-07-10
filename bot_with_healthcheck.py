@@ -492,8 +492,8 @@ Reuses the same live message (no spam):
 /movies — browse latest movies
 /search &lt;title&gt; — search movies
 /sites — list movie site URLs
-/setsite &lt;key&gt; &lt;url&gt; — update a site domain live
-/movietest — connectivity check (alerts if domain moved)
+/setsite &lt;key&gt; &lt;url&gt; — manual update (when auto-detect fails)
+/movietest — connectivity check (auto-fixes redirects)
 
 <b>📰 NEWS</b>
 /news — preview &amp; post tech news
@@ -853,7 +853,9 @@ async def cmd_setsite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     keys = ", ".join(MOVIE_SITE_REGISTRY)
     if not context.args or len(context.args) < 2:
         await update.effective_message.reply_html(
-            "📝 <b>Update movie site URL</b>\n\n"
+            "📝 <b>Update movie site URL (manual)</b>\n\n"
+            "Redirects are <b>auto-updated</b> on bot startup + every health check.\n"
+            "Use this only when auto-detect could not find the correct domain.\n\n"
             "<code>/setsite &lt;key&gt; &lt;url&gt;</code>\n\n"
             f"<b>Keys:</b> <code>{html.escape(keys)}</code>\n\n"
             "<b>Example:</b>\n"
