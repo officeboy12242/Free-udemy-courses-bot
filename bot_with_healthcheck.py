@@ -15,6 +15,7 @@ import sqlite3
 import html
 import re
 import requests
+from typing import Any
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
@@ -109,7 +110,7 @@ from movie_service import (
     hdhub_search, hdh_search, md_search, hdmovie2_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
     movies_search_combined, movies_latest_combined, movies_aggregate_links,
-    movie_page_download_links,
+    movie_page_download_links, movies_search_source, movies_search_with_links,
     list_movie_sites, set_site_url, format_sites_list_html,
     check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
     init_movie_site_urls,
@@ -2465,7 +2466,7 @@ def _movies_api_limit(raw: str | None, *, default: int, maximum: int) -> int:
 
 
 async def api_movies_search(request: web.Request) -> web.Response:
-    """Search all movie sources (titles and page URLs only; excludes ZeeFlix)."""
+    """Search movie sources. Optional: source=hdh, links=1 for download links."""
     query = (request.query.get("q") or "").strip()
     if not query:
         return web.json_response({"error": "q required"}, status=400)
@@ -2473,12 +2474,60 @@ async def api_movies_search(request: web.Request) -> web.Response:
         limit = _movies_api_limit(request.query.get("limit"), default=5, maximum=20)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
-    results = await asyncio.to_thread(movies_search_combined, query, limit)
-    public = [
-        {"source": r["source"], "title": r["title"], "page_url": r["page_url"]}
-        for r in results
-    ]
-    return web.json_response({"query": query, "count": len(public), "results": public})
+
+    source = (request.query.get("source") or "").strip() or None
+    include_links = (request.query.get("links") or "").strip().lower() in ("1", "true", "yes")
+
+    if include_links:
+        try:
+            results = await asyncio.to_thread(
+                movies_search_with_links, query, limit, source=source,
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        public = [
+            {
+                "source": r["source"],
+                "source_key": r.get("source_key", ""),
+                "title": r["title"],
+                "page_url": r["page_url"],
+                "links": r.get("links", []),
+                **({"error": r["error"]} if r.get("error") else {}),
+            }
+            for r in results
+        ]
+    elif source:
+        try:
+            results = await asyncio.to_thread(movies_search_source, query, source, limit)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        public = [
+            {
+                "source": r["source"],
+                "source_key": r.get("source_key", ""),
+                "title": r["title"],
+                "page_url": r["page_url"],
+            }
+            for r in results
+        ]
+    else:
+        results = await asyncio.to_thread(movies_search_combined, query, limit)
+        public = [
+            {
+                "source": r["source"],
+                "source_key": r.get("source_key", ""),
+                "title": r["title"],
+                "page_url": r["page_url"],
+            }
+            for r in results
+        ]
+
+    payload: dict[str, Any] = {"query": query, "count": len(public), "results": public}
+    if source:
+        payload["source"] = source
+    if include_links:
+        payload["links"] = True
+    return web.json_response(payload)
 
 
 async def api_movies_latest(request: web.Request) -> web.Response:

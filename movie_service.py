@@ -231,7 +231,7 @@ def _get_rendered_html(url: str, timeout: int = 30, wait_ms: int = 8000) -> str 
 
 # ─── 4KHDHub ────────────────────────────────────────────────────────────────
 
-HDH_BASE     = os.getenv("HDH_BASE_URL", "https://4khdhub.link")
+HDH_BASE     = os.getenv("HDH_BASE_URL", "https://4khdhub.one")
 HDH_CATEGORY = f"{HDH_BASE}/category/hindi-movies/"
 
 
@@ -4115,6 +4115,86 @@ def movies_search_combined(
     return out
 
 
+def movies_search_source(
+    query: str,
+    source: str,
+    limit: int = 5,
+    *,
+    fast: bool = True,
+) -> list[dict[str, str]]:
+    """Search a single movie API source by key (e.g. hdh, hdhub, md)."""
+    key = _normalize_movie_source(source)
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit_n = max(1, min(int(limit), 20))
+    for source_label, search_fn, source_key in MOVIE_API_SEARCH_SOURCES:
+        if source_key != key:
+            continue
+        return _movies_search_one_source(
+            source_label, search_fn, source_key, q, limit_n, fast=fast,
+        )
+    return []
+
+
+def movies_search_with_links(
+    query: str,
+    limit_per_source: int = 5,
+    *,
+    source: str | None = None,
+    fast: bool = True,
+) -> list[dict[str, Any]]:
+    """Search and attach download links to each hit."""
+    if source:
+        listings = movies_search_source(query, source, limit_per_source, fast=fast)
+    else:
+        listings = movies_search_combined(query, limit_per_source, fast=fast)
+
+    if not listings:
+        return []
+
+    results: list[dict[str, Any]] = []
+    workers = min(MOVIES_API_MAX_WORKERS, len(listings))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_aggregate_one_item, item, fast=fast): item
+            for item in listings
+        }
+        try:
+            for fut in as_completed(futures, timeout=MOVIES_API_LINK_TIMEOUT):
+                row = fut.result()
+                item = futures[fut]
+                results.append({
+                    "source": item["source"],
+                    "source_key": item["source_key"],
+                    "title": row["title"],
+                    "page_url": row["page_url"],
+                    "links": row.get("links", []),
+                    **({"error": row["error"]} if row.get("error") else {}),
+                })
+        except Exception as exc:
+            log.warning("movies_search_with_links partial timeout: %s", exc)
+            seen = {r.get("page_url") for r in results}
+            for fut, item in futures.items():
+                if not fut.done() or fut.cancelled():
+                    continue
+                try:
+                    row = fut.result()
+                    if row.get("page_url") not in seen:
+                        results.append({
+                            "source": item["source"],
+                            "source_key": item["source_key"],
+                            "title": row["title"],
+                            "page_url": row["page_url"],
+                            "links": row.get("links", []),
+                            **({"error": row["error"]} if row.get("error") else {}),
+                        })
+                        seen.add(row.get("page_url"))
+                except Exception:
+                    pass
+    return results
+
+
 def _movies_latest_one_source(
     source_label: str,
     fetch_fn: Any,
@@ -4252,7 +4332,7 @@ MOVIE_SITE_REGISTRY: dict[str, dict[str, str]] = {
     "hdh": {
         "label": "4KHDHub",
         "env": "HDH_BASE_URL",
-        "default": "https://4khdhub.link",
+        "default": "https://4khdhub.one",
         "health_path": "/category/hindi-movies/",
     },
     "md": {
