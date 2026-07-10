@@ -113,7 +113,7 @@ from movie_service import (
     movie_page_download_links, movies_search_source, movies_search_with_links,
     list_movie_sites, set_site_url, format_sites_list_html,
     check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
-    init_movie_site_urls,
+    init_movie_site_urls, run_startup_site_health,
 )
 
 # ─── Load env ────────────────────────────────────────────────────────────────
@@ -2755,6 +2755,7 @@ async def main():
         asyncio.create_task(run_course_loop(bot)),
         asyncio.create_task(run_news_autopost(bot)),
         asyncio.create_task(auto_enroll_job(tg_app)),
+        asyncio.create_task(run_startup_site_health(bot)),
         asyncio.create_task(run_movie_site_monitor(bot)),
     ]
     if MARKET_FEATURES_ENABLED:

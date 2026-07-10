@@ -4394,6 +4394,9 @@ _SITE_HEALTH_COOLDOWN = max(
 _SITE_HEALTH_INTERVAL = max(
     300, int(os.getenv("MOVIE_SITE_HEALTH_INTERVAL", "1800"))
 )
+_MOVIE_SITE_AUTO_UPDATE_REDIRECT = os.getenv(
+    "MOVIE_SITE_AUTO_UPDATE_REDIRECT", "1",
+).strip().lower() not in ("0", "false", "no", "off")
 _site_health_alert_at: dict[str, float] = {}
 _site_fail_streak: dict[str, int] = {}
 
@@ -4675,11 +4678,32 @@ def _site_health_chat_id() -> int | None:
     return None
 
 
-def format_site_health_alert(row: dict[str, Any]) -> str:
+def format_site_health_alert(
+    row: dict[str, Any],
+    *,
+    auto_fixed: dict[str, Any] | None = None,
+) -> str:
     key = row["key"]
     label = row["label"]
     url = row["url"]
     err = html.escape(row.get("error") or "unknown error")
+    if auto_fixed:
+        lines = [
+            "✅ <b>Movie site URL auto-updated</b>",
+            "",
+            f"<b>{html.escape(label)}</b> (<code>{html.escape(key)}</code>)",
+            f"Old: <code>{html.escape(auto_fixed.get('old_url', url))}</code>",
+            f"New: <code>{html.escape(auto_fixed.get('url', ''))}</code>",
+            f"Reason: <code>{err}</code>",
+        ]
+        saved = auto_fixed.get("saved_to") or []
+        if saved:
+            lines.append(f"Saved to: <code>{html.escape(', '.join(str(s) for s in saved))}</code>")
+        lines.append("")
+        lines.append("<code>/sites</code> — verify all URLs")
+        lines.append("<code>/movietest</code> — re-check connectivity")
+        return "\n".join(lines)
+
     lines = [
         "⚠️ <b>Movie site needs URL update</b>",
         "",
@@ -4717,6 +4741,70 @@ def format_sites_list_html() -> str:
     return "\n".join(lines)
 
 
+async def _process_site_health_rows(bot: Any, chat_id: int, rows: list[dict[str, Any]]) -> None:
+    """Evaluate health rows, auto-fix redirects, and Telegram-alert admin."""
+    now = time.time()
+    for row in rows:
+        key = row["key"]
+        if row.get("ok"):
+            _site_fail_streak[key] = 0
+            continue
+
+        redirected = bool(row.get("redirected"))
+        streak = _site_fail_streak.get(key, 0) + 1
+        _site_fail_streak[key] = streak
+        # Redirects are definitive — alert on first detection; hard failures need 2 in a row
+        if streak < (1 if redirected else 2):
+            continue
+        if now - _site_health_alert_at.get(key, 0.0) < _SITE_HEALTH_COOLDOWN:
+            continue
+
+        auto_fixed: dict[str, Any] | None = None
+        if redirected and _MOVIE_SITE_AUTO_UPDATE_REDIRECT and row.get("suggested_url"):
+            try:
+                auto_fixed = await asyncio.to_thread(
+                    set_site_url, key, row["suggested_url"],
+                )
+                log.info(
+                    "Movie site %s auto-updated via redirect: %s → %s",
+                    key,
+                    auto_fixed.get("old_url"),
+                    auto_fixed.get("url"),
+                )
+            except Exception as exc:
+                log.error("Movie site auto-update failed for %s: %s", key, exc)
+
+        _site_health_alert_at[key] = now
+        text = format_site_health_alert(row, auto_fixed=auto_fixed)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            log.warning(
+                "Movie site alert sent for %s: %s (auto_fixed=%s)",
+                key,
+                row.get("error"),
+                bool(auto_fixed),
+            )
+        except Exception as exc:
+            log.error("Movie site alert send failed: %s", exc)
+
+
+async def run_startup_site_health(bot: Any) -> None:
+    """One-shot health check right after bot boot (catches stale Mongo/env URLs)."""
+    chat_id = _site_health_chat_id()
+    if not chat_id:
+        return
+    try:
+        rows = await asyncio.to_thread(check_all_movie_sites, timeout=12)
+        await _process_site_health_rows(bot, chat_id, rows)
+    except Exception as exc:
+        log.error("Startup site health check failed: %s", exc)
+
+
 async def run_movie_site_monitor(bot: Any) -> None:
     """Periodically probe movie sites and Telegram-alert admin on failures."""
     chat_id = _site_health_chat_id()
@@ -4733,36 +4821,7 @@ async def run_movie_site_monitor(bot: Any) -> None:
     while True:
         try:
             rows = await asyncio.to_thread(check_all_movie_sites, timeout=12)
-            now = time.time()
-            for row in rows:
-                key = row["key"]
-                if row.get("ok"):
-                    _site_fail_streak[key] = 0
-                    continue
-                streak = _site_fail_streak.get(key, 0) + 1
-                _site_fail_streak[key] = streak
-                # Require 2 consecutive failures before alerting
-                if streak < 2:
-                    continue
-                last = _site_health_alert_at.get(key, 0.0)
-                if now - last < _SITE_HEALTH_COOLDOWN:
-                    continue
-                _site_health_alert_at[key] = now
-                text = format_site_health_alert(row)
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                    log.warning(
-                        "Movie site alert sent for %s: %s",
-                        key,
-                        row.get("error"),
-                    )
-                except Exception as exc:
-                    log.error("Movie site alert send failed: %s", exc)
+            await _process_site_health_rows(bot, chat_id, rows)
         except Exception as exc:
             log.error("Movie site monitor loop error: %s", exc)
         await asyncio.sleep(_SITE_HEALTH_INTERVAL)
