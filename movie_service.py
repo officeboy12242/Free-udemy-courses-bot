@@ -23,7 +23,7 @@ import re
 import time
 import urllib.parse
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -3593,10 +3593,15 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
 # ─── REST API helpers (download links with size / audio metadata) ─────────────
 
 MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "10")))
+MOVIES_API_PER_SOURCE_TIMEOUT = max(3, int(os.getenv("MOVIES_API_PER_SOURCE_TIMEOUT", "8")))
 MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "14")))
 MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "120")))
-MOVIES_API_MAX_WORKERS = max(2, min(12, int(os.getenv("MOVIES_API_MAX_WORKERS", "6"))))
+MOVIES_API_MAX_WORKERS = max(2, min(12, int(os.getenv("MOVIES_API_MAX_WORKERS", "9"))))
+MOVIES_API_SKIP_UNHEALTHY_SECONDS = max(
+    60, int(os.getenv("MOVIES_API_SKIP_UNHEALTHY_SECONDS", "1800")),
+)
 _api_cache: dict[str, tuple[float, Any]] = {}
+_site_api_skip_until: dict[str, float] = {}
 
 
 def _api_cache_get(key: str) -> Any | None:
@@ -3616,6 +3621,128 @@ def _api_cache_set(key: str, value: Any) -> None:
     if MOVIES_API_CACHE_TTL <= 0:
         return
     _api_cache[key] = (time.time(), value)
+
+
+def mark_site_api_skip(source_key: str, *, seconds: int | None = None) -> None:
+    """Temporarily skip a source in combined API calls (stale/broken domain)."""
+    ttl = seconds if seconds is not None else MOVIES_API_SKIP_UNHEALTHY_SECONDS
+    _site_api_skip_until[source_key] = time.time() + max(60, ttl)
+    log.info("API will skip source %s for %ss", source_key, ttl)
+
+
+def clear_site_api_skip(source_key: str) -> None:
+    _site_api_skip_until.pop(source_key, None)
+
+
+def _api_filter_sources(
+    sources: tuple[tuple[str, Any, str], ...],
+) -> tuple[tuple[str, Any, str], ...]:
+    """Drop sources flagged unhealthy so they don't block working ones."""
+    now = time.time()
+    active: list[tuple[str, Any, str]] = []
+    for row in sources:
+        _, _, key = row
+        until = _site_api_skip_until.get(key, 0.0)
+        if until > now:
+            log.debug("API skipping unhealthy source %s (%.0fs left)", key, until - now)
+            continue
+        active.append(row)
+    return tuple(active)
+
+
+def _call_timed(timeout_sec: float, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run fn with a hard wall-clock cap so one slow site cannot block the pool."""
+    with ThreadPoolExecutor(max_workers=1) as mini:
+        fut = mini.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout_sec)
+        except Exception as exc:
+            log.warning("API source hard-timeout after %.1fs: %s", timeout_sec, exc)
+            return []
+
+
+def _parallel_collect_rows(
+    futures_map: dict[Future, str],
+    *,
+    total_timeout: float,
+    label: str,
+) -> list[dict[str, str]]:
+    """Collect list rows from parallel tasks; return partial results on timeout."""
+    out: list[dict[str, str]] = []
+    pending = set(futures_map.keys())
+    deadline = time.time() + total_timeout
+    while pending and time.time() < deadline:
+        done, pending = wait(
+            pending,
+            timeout=max(0.05, deadline - time.time()),
+            return_when=FIRST_COMPLETED,
+        )
+        for fut in done:
+            key = futures_map.get(fut, "?")
+            try:
+                rows = fut.result()
+                if rows:
+                    out.extend(rows)
+            except Exception as exc:
+                log.warning("%s %s failed: %s", label, key, exc)
+    if pending:
+        skipped = [futures_map[f] for f in pending]
+        log.warning(
+            "%s skipped %d slow source(s) after %.1fs: %s",
+            label, len(pending), total_timeout, ", ".join(skipped),
+        )
+        for fut in pending:
+            fut.cancel()
+    return out
+
+
+def _parallel_collect_dicts(
+    futures_map: dict[Future, str],
+    *,
+    total_timeout: float,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Collect dict results from parallel tasks; harvest completed on timeout."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    pending = set(futures_map.keys())
+    deadline = time.time() + total_timeout
+
+    def _append(row: dict[str, Any]) -> None:
+        page_url = row.get("page_url") or ""
+        if page_url and page_url in seen:
+            return
+        if page_url:
+            seen.add(page_url)
+        out.append(row)
+
+    while pending and time.time() < deadline:
+        done, pending = wait(
+            pending,
+            timeout=max(0.05, deadline - time.time()),
+            return_when=FIRST_COMPLETED,
+        )
+        for fut in done:
+            key = futures_map.get(fut, "?")
+            try:
+                _append(fut.result())
+            except Exception as exc:
+                log.warning("%s %s failed: %s", label, key, exc)
+
+    if pending:
+        log.warning(
+            "%s link fetch timeout — keeping %d result(s), skipped %d",
+            label, len(out), len(pending),
+        )
+        for fut in pending:
+            if fut.done() and not fut.cancelled():
+                try:
+                    _append(fut.result())
+                except Exception:
+                    pass
+            else:
+                fut.cancel()
+    return out
 
 
 MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
@@ -4080,17 +4207,23 @@ def movies_search_combined(
     if not q:
         return []
     limit = max(1, min(int(limit_per_source), 20))
-    cache_key = f"search:v2:{q}:{limit}:{'fast' if fast else 'full'}"
+    cache_key = f"search:v3:{q}:{limit}:{'fast' if fast else 'full'}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    sources = MOVIE_API_SEARCH_SOURCES
+    sources = _api_filter_sources(MOVIE_API_SEARCH_SOURCES)
+    if not sources:
+        sources = MOVIE_API_SEARCH_SOURCES  # all skipped — try anyway
     out: list[dict[str, str]] = []
+    per_src = MOVIES_API_PER_SOURCE_TIMEOUT if fast else 30
     workers = min(len(sources), MOVIES_API_MAX_WORKERS)
+    futures_map: dict[Future, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(
+        for source_label, search_fn, source_key in sources:
+            fut = pool.submit(
+                _call_timed,
+                per_src,
                 _movies_search_one_source,
                 source_label,
                 search_fn,
@@ -4099,17 +4232,11 @@ def movies_search_combined(
                 limit,
                 fast=fast,
             )
-            for source_label, search_fn, source_key in sources
-        ]
+            futures_map[fut] = source_key
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
-        try:
-            for fut in as_completed(futures, timeout=timeout):
-                try:
-                    out.extend(fut.result())
-                except Exception as exc:
-                    log.warning("movies_search_combined source failed: %s", exc)
-        except Exception as exc:
-            log.warning("movies_search_combined parallel timeout/error: %s", exc)
+        out = _parallel_collect_rows(
+            futures_map, total_timeout=timeout, label="movies_search_combined",
+        )
 
     _api_cache_set(cache_key, out)
     return out
@@ -4153,45 +4280,40 @@ def movies_search_with_links(
     if not listings:
         return []
 
-    results: list[dict[str, Any]] = []
-    workers = min(MOVIES_API_MAX_WORKERS, len(listings))
+    per_link = min(MOVIES_API_PER_SOURCE_TIMEOUT, MOVIES_API_LINK_TIMEOUT) if fast else MOVIES_API_LINK_TIMEOUT
+    futures_map: dict[Future, str] = {}
+    workers = min(len(listings), MOVIES_API_MAX_WORKERS)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_aggregate_one_item, item, fast=fast): item
-            for item in listings
-        }
-        try:
-            for fut in as_completed(futures, timeout=MOVIES_API_LINK_TIMEOUT):
-                row = fut.result()
-                item = futures[fut]
-                results.append({
-                    "source": item["source"],
-                    "source_key": item["source_key"],
-                    "title": row["title"],
-                    "page_url": row["page_url"],
-                    "links": row.get("links", []),
-                    **({"error": row["error"]} if row.get("error") else {}),
-                })
-        except Exception as exc:
-            log.warning("movies_search_with_links partial timeout: %s", exc)
-            seen = {r.get("page_url") for r in results}
-            for fut, item in futures.items():
-                if not fut.done() or fut.cancelled():
-                    continue
-                try:
-                    row = fut.result()
-                    if row.get("page_url") not in seen:
-                        results.append({
-                            "source": item["source"],
-                            "source_key": item["source_key"],
-                            "title": row["title"],
-                            "page_url": row["page_url"],
-                            "links": row.get("links", []),
-                            **({"error": row["error"]} if row.get("error") else {}),
-                        })
-                        seen.add(row.get("page_url"))
-                except Exception:
-                    pass
+        for item in listings:
+            fut = pool.submit(
+                _call_timed,
+                per_link,
+                _aggregate_one_item,
+                item,
+                fast=fast,
+            )
+            futures_map[fut] = item.get("source_key", item.get("source", "?"))
+
+        raw = _parallel_collect_dicts(
+            futures_map,
+            total_timeout=MOVIES_API_LINK_TIMEOUT,
+            label="movies_search_with_links",
+        )
+
+    results: list[dict[str, Any]] = []
+    for row in raw:
+        item = next(
+            (x for x in listings if x.get("page_url") == row.get("page_url")),
+            {},
+        )
+        results.append({
+            "source": item.get("source", row.get("source", "")),
+            "source_key": item.get("source_key", ""),
+            "title": row.get("title", ""),
+            "page_url": row.get("page_url", ""),
+            "links": row.get("links", []),
+            **({"error": row["error"]} if row.get("error") else {}),
+        })
     return results
 
 
@@ -4232,28 +4354,35 @@ def movies_latest_combined(
     """Latest listings from all movie API sources in parallel (except ZeeFlix)."""
     page_n = max(1, int(page))
     limit = max(1, min(int(limit_per_source), 20))
-    cache_key = f"latest:v2:{page_n}:{limit}"
+    cache_key = f"latest:v3:{page_n}:{limit}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
 
-    sources = MOVIE_API_LATEST_SOURCES
+    sources = _api_filter_sources(MOVIE_API_LATEST_SOURCES)
+    if not sources:
+        sources = MOVIE_API_LATEST_SOURCES
     out: list[dict[str, str]] = []
+    per_src = MOVIES_API_PER_SOURCE_TIMEOUT if fast else 30
     workers = min(len(sources), MOVIES_API_MAX_WORKERS)
+    futures_map: dict[Future, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(_movies_latest_one_source, label, fn, key, page_n, limit)
-            for label, fn, key in sources
-        ]
+        for label, fn, key in sources:
+            fut = pool.submit(
+                _call_timed,
+                per_src,
+                _movies_latest_one_source,
+                label,
+                fn,
+                key,
+                page_n,
+                limit,
+            )
+            futures_map[fut] = key
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
-        try:
-            for fut in as_completed(futures, timeout=timeout):
-                try:
-                    out.extend(fut.result())
-                except Exception as exc:
-                    log.warning("movies_latest_combined source failed: %s", exc)
-        except Exception as exc:
-            log.warning("movies_latest_combined parallel timeout/error: %s", exc)
+        out = _parallel_collect_rows(
+            futures_map, total_timeout=timeout, label="movies_latest_combined",
+        )
 
     _api_cache_set(cache_key, out)
     return out
@@ -4292,28 +4421,24 @@ def movies_aggregate_links(
     listings = movies_search_combined(q, limit, fast=fast)
     results: list[dict[str, Any]] = []
     if listings:
+        per_link = min(MOVIES_API_PER_SOURCE_TIMEOUT, MOVIES_API_LINK_TIMEOUT) if fast else MOVIES_API_LINK_TIMEOUT
         workers = min(MOVIES_API_MAX_WORKERS, len(listings))
+        futures_map: dict[Future, str] = {}
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_aggregate_one_item, item, fast=fast)
-                for item in listings
-            ]
-            try:
-                for fut in as_completed(futures, timeout=MOVIES_API_LINK_TIMEOUT):
-                    results.append(fut.result())
-            except Exception as exc:
-                log.warning("movies_aggregate_links partial timeout: %s", exc)
-                seen_urls = {r.get("page_url") for r in results}
-                for fut in futures:
-                    if not fut.done() or fut.cancelled():
-                        continue
-                    try:
-                        row = fut.result()
-                        if row.get("page_url") not in seen_urls:
-                            results.append(row)
-                            seen_urls.add(row.get("page_url"))
-                    except Exception:
-                        pass
+            for item in listings:
+                fut = pool.submit(
+                    _call_timed,
+                    per_link,
+                    _aggregate_one_item,
+                    item,
+                    fast=fast,
+                )
+                futures_map[fut] = item.get("source_key", "?")
+            results = _parallel_collect_dicts(
+                futures_map,
+                total_timeout=MOVIES_API_LINK_TIMEOUT,
+                label="movies_aggregate_links",
+            )
 
     payload = {"query": q, "count": len(results), "results": results}
     _api_cache_set(cache_key, payload)
@@ -4753,11 +4878,15 @@ async def _process_site_health_rows(bot: Any, chat_id: int, rows: list[dict[str,
         key = row["key"]
         if row.get("ok"):
             _site_fail_streak[key] = 0
+            clear_site_api_skip(key)
             continue
 
         redirected = bool(row.get("redirected"))
         streak = _site_fail_streak.get(key, 0) + 1
         _site_fail_streak[key] = streak
+        # Don't let broken/stale domains slow the movies API
+        if streak >= 1:
+            mark_site_api_skip(key)
         # Redirects are definitive — alert on first detection; hard failures need 2 in a row
         if streak < (1 if redirected else 2):
             continue
@@ -4787,6 +4916,7 @@ async def _process_site_health_rows(bot: Any, chat_id: int, rows: list[dict[str,
                         auto_fixed.get("old_url"),
                         auto_fixed.get("url"),
                     )
+                    clear_site_api_skip(key)
             except Exception as exc:
                 log.error("Movie site auto-update failed for %s: %s", key, exc)
                 row = {**row, "error": f"auto-update failed: {exc}"}
