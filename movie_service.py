@@ -3275,6 +3275,63 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
+_ATOZ_FILES_BLOCK_RE = re.compile(
+    r'\\"files\\":\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*,\s*\\"kind\\":\s*\\"([^"\\]+)\\"'
+    r'\s*,\s*\\"baseUrl\\":\s*\\"([^"\\]+)\\"(.*?)(?:,\\"isPremium\\"|,\\"slug\\"|,\\"title\\")',
+    re.S,
+)
+_ATOZ_SERVER_RE = re.compile(r'\\"([a-zA-Z]+Server)\\":\\"([^"\\]+)\\"')
+
+
+def _atoz_clean_file_label(file_name: str, *, quality: str = "") -> str:
+    name = file_name or quality
+    name = re.sub(r"(?i)@AtoZ_Files", "", name)
+    name = re.sub(r"(?i)\.(mkv|mp4|avi)$", "", name)
+    return name.strip() or quality
+
+
+def _atoz_parse_embedded_files(html_text: str) -> dict[str, Any] | None:
+    """Parse escaped Next.js payload: files, kind, baseUrl, *Server fields."""
+    match = _ATOZ_FILES_BLOCK_RE.search(html_text)
+    if not match:
+        return None
+    try:
+        files_data = json.loads(match.group(1).replace('\\"', '"'))
+    except json.JSONDecodeError:
+        return None
+    servers = {
+        key: val.replace("\\/", "/")
+        for key, val in _ATOZ_SERVER_RE.findall(match.group(4))
+    }
+    return {
+        "files": files_data,
+        "kind": match.group(2),
+        "base_url": match.group(3).replace("\\/", "/"),
+        "nulldrop_server": servers.get("nulldropServer", ""),
+    }
+
+
+def _atoz_fetch_dl_watch_url(file_id: str) -> str:
+    """Direct DL from AtoZ API, else the /links watch page."""
+    if not file_id:
+        return ""
+    base = ATOZ_BASE.rstrip("/")
+    try:
+        resp = _get(f"{base}/api/generate_links?id={file_id}", timeout=25)
+        if resp.status_code == 200:
+            url = (resp.json().get("url") or "").strip()
+            if url:
+                return url
+    except Exception:
+        pass
+    return f"{base}/links/{file_id}"
+
+
+def _atoz_link_label(clean_name: str, size_str: str, server: str) -> str:
+    base = f"{clean_name} ({size_str})" if size_str else clean_name
+    return f"{base} [{server}]"
+
+
 def atoz_movie_links(movie_url: str) -> dict[str, Any]:
     """Fetch download links for an AtoZ movie page (Next.js React site)."""
     movie_url = _atoz_abs_url(movie_url)
@@ -3303,75 +3360,83 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
         if img:
             result["poster"] = img.get("src", "") or img.get("data-src", "") or ""
 
-    # Parse Next.js embedded data from script tags
-    # The data is double-escaped in the HTML: \\"files\\":{...}
     html_text = resp.text
-    
-    # Find the escaped JSON block containing files
-    # Pattern: \"files\":{...},\"kind\":\"...\",\"baseUrl\":\"...\"
-    files_pattern = re.search(
-        r'\\"files\\":\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*,\s*\\"kind\\":\s*\\"([^"\\]+)\\"\s*,\s*\\"baseUrl\\":\s*\\"([^"\\]+)\\"',
-        html_text
-    )
-    
-    if files_pattern:
-        try:
-            files_escaped = files_pattern.group(1)
-            kind = files_pattern.group(2)
-            base_url = files_pattern.group(3).replace('\\/', '/')
-            
-            if kind == "series":
-                result["is_series"] = True
-            
-            # Unescape the JSON: \\" -> "
-            files_json = files_escaped.replace('\\"', '"')
-            files_data = json.loads(files_json)
-            
-            for quality, file_info in files_data.items():
-                if isinstance(file_info, dict):
-                    file_name = file_info.get("file_name", quality)
-                    file_id = file_info.get("file_id", "")
-                    file_size = file_info.get("file_size", 0)
-                    
-                    if file_id:
-                        # Construct Telegram bot link
-                        final_url = f"{base_url}{file_id}"
-                        
-                        # Clean up file name
-                        clean_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
-                        clean_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', clean_name)
-                        clean_name = clean_name.strip()
-                        
-                        # Format size
-                        size_str = _format_size(file_size) if file_size else ""
-                        label = f"{clean_name} ({size_str})" if size_str else clean_name
-                        
-                        result["links"].append({"label": label, "url": final_url})
-        except json.JSONDecodeError as e:
-            log.warning("atoz_movie_links JSON parse failed: %s", e)
-        except Exception as e:
-            log.warning("atoz_movie_links parse error: %s", e)
-    
-    # Fallback: try old button method if no links found
+    embedded = _atoz_parse_embedded_files(html_text)
+    if embedded:
+        if embedded.get("kind") == "series":
+            result["is_series"] = True
+
+        nulldrop_server = (embedded.get("nulldrop_server") or "").rstrip("/")
+        base_url = embedded.get("base_url") or ""
+        pending_dl: list[tuple[str, str, str]] = []
+
+        for quality, file_info in (embedded.get("files") or {}).items():
+            if not isinstance(file_info, dict):
+                continue
+            file_name = file_info.get("file_name", quality)
+            file_id = (file_info.get("file_id") or "").strip()
+            nulldrop_id = (file_info.get("nulldrop_id") or "").strip()
+            file_size = file_info.get("file_size", 0)
+            if not file_id:
+                continue
+
+            clean_name = _atoz_clean_file_label(file_name, quality=quality)
+            size_str = _format_size(file_size) if file_size else ""
+
+            result["links"].append({
+                "label": _atoz_link_label(clean_name, size_str, "Telegram"),
+                "url": f"{base_url}{file_id}",
+            })
+            if nulldrop_server and nulldrop_id:
+                result["links"].append({
+                    "label": _atoz_link_label(clean_name, size_str, "NullDrop"),
+                    "url": f"{nulldrop_server}/file/{nulldrop_id}",
+                })
+            pending_dl.append((file_id, clean_name, size_str))
+
+        if pending_dl:
+            dl_urls: dict[str, str] = {}
+            workers = min(6, len(pending_dl))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_atoz_fetch_dl_watch_url, file_id): file_id
+                    for file_id, _, _ in pending_dl
+                }
+                for fut in as_completed(futures):
+                    fid = futures[fut]
+                    try:
+                        url = fut.result()
+                        if url:
+                            dl_urls[fid] = url
+                    except Exception:
+                        continue
+            for file_id, clean_name, size_str in pending_dl:
+                dl_url = dl_urls.get(file_id, "")
+                if dl_url:
+                    result["links"].append({
+                        "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
+                        "url": dl_url,
+                    })
+
+    # Fallback: legacy buttons → Telegram + DL/Watch
     if not result["links"]:
         buttons = soup.find_all("button", attrs={"data-id": True})
+        tg_base = "https://t.me/AtoZ_Files_Bot?start=file_"
         for btn in buttons:
             data_id = btn.get("data-id", "").strip()
             if not data_id:
                 continue
-            try:
-                gen_resp = _get(f"{ATOZ_BASE}/generate_links?id={data_id}", timeout=25)
-                data = gen_resp.json()
-                final_url = data.get("url", "")
-                if final_url:
-                    file_name = data.get("file_name", "") or _atoz_button_label(btn)
-                    file_name = re.sub(r'(?i)@AtoZ_Files', '', file_name)
-                    file_name = re.sub(r'(?i)\.(mkv|mp4|avi)$', '', file_name).strip()
-                    file_size = data.get("file_size", "")
-                    label = f"{file_name} ({file_size})" if file_size else file_name
-                    result["links"].append({"label": label, "url": final_url})
-            except Exception:
-                continue
+            file_name = _atoz_clean_file_label(_atoz_button_label(btn))
+            result["links"].append({
+                "label": _atoz_link_label(file_name, "", "Telegram"),
+                "url": f"{tg_base}{data_id}",
+            })
+            dl_url = _atoz_fetch_dl_watch_url(data_id)
+            if dl_url:
+                result["links"].append({
+                    "label": _atoz_link_label(file_name, "", "DL/Watch"),
+                    "url": dl_url,
+                })
 
     return result
 
