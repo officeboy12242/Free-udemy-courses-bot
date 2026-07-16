@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import warnings
@@ -3311,20 +3312,11 @@ def _atoz_parse_embedded_files(html_text: str) -> dict[str, Any] | None:
     }
 
 
-def _atoz_fetch_dl_watch_url(file_id: str) -> str:
-    """Direct DL from AtoZ API, else the /links watch page."""
+def _atoz_dl_watch_url(file_id: str) -> str:
+    """AtoZ site 'DL/Watch Online' page — no extra HTTP roundtrip."""
     if not file_id:
         return ""
-    base = ATOZ_BASE.rstrip("/")
-    try:
-        resp = _get(f"{base}/api/generate_links?id={file_id}", timeout=25)
-        if resp.status_code == 200:
-            url = (resp.json().get("url") or "").strip()
-            if url:
-                return url
-    except Exception:
-        pass
-    return f"{base}/links/{file_id}"
+    return f"{ATOZ_BASE.rstrip('/')}/links/{file_id}"
 
 
 def _atoz_link_label(clean_name: str, size_str: str, server: str) -> str:
@@ -3332,7 +3324,7 @@ def _atoz_link_label(clean_name: str, size_str: str, server: str) -> str:
     return f"{base} [{server}]"
 
 
-def atoz_movie_links(movie_url: str) -> dict[str, Any]:
+def atoz_movie_links(movie_url: str, *, fast: bool = True) -> dict[str, Any]:
     """Fetch download links for an AtoZ movie page (Next.js React site)."""
     movie_url = _atoz_abs_url(movie_url)
     result: dict[str, Any] = {
@@ -3342,8 +3334,9 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
         "episodes": [],
         "is_series": False,
     }
+    page_timeout = 12 if fast else 25
     try:
-        resp = _get(movie_url, timeout=25)
+        resp = _get(movie_url, timeout=page_timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
     except Exception as exc:
         log.error("atoz_movie_links %s failed: %s", movie_url, exc)
@@ -3368,7 +3361,6 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
 
         nulldrop_server = (embedded.get("nulldrop_server") or "").rstrip("/")
         base_url = embedded.get("base_url") or ""
-        pending: list[dict[str, str]] = []
 
         for quality, file_info in (embedded.get("files") or {}).items():
             if not isinstance(file_info, dict):
@@ -3382,51 +3374,18 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
 
             clean_name = _atoz_clean_file_label(file_name, quality=quality)
             size_str = _format_size(file_size) if file_size else ""
-            pending.append({
-                "file_id": file_id,
-                "clean_name": clean_name,
-                "size_str": size_str,
-                "nulldrop_url": (
-                    f"{nulldrop_server}/file/{nulldrop_id}"
-                    if nulldrop_server and nulldrop_id else ""
-                ),
-                "telegram_url": f"{base_url}{file_id}",
-            })
-
-        dl_urls: dict[str, str] = {}
-        if pending:
-            workers = min(6, len(pending))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_atoz_fetch_dl_watch_url, item["file_id"]): item["file_id"]
-                    for item in pending
-                }
-                for fut in as_completed(futures):
-                    fid = futures[fut]
-                    try:
-                        url = fut.result()
-                        if url:
-                            dl_urls[fid] = url
-                    except Exception:
-                        continue
-
-        for item in pending:
-            clean_name = item["clean_name"]
-            size_str = item["size_str"]
-            if item["nulldrop_url"]:
+            if nulldrop_server and nulldrop_id:
                 result["links"].append({
                     "label": _atoz_link_label(clean_name, size_str, "NullDrop"),
-                    "url": item["nulldrop_url"],
-                })
-            dl_url = dl_urls.get(item["file_id"], "")
-            if dl_url:
-                result["links"].append({
-                    "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
-                    "url": dl_url,
+                    "url": f"{nulldrop_server}/file/{nulldrop_id}",
                 })
             result["links"].append({
+                "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
+                "url": _atoz_dl_watch_url(file_id),
+            })
+            result["links"].append({
                 "label": _atoz_link_label(clean_name, size_str, "Telegram"),
-                "url": item["telegram_url"],
+                "url": f"{base_url}{file_id}",
             })
 
     # Fallback: legacy buttons → DL/Watch then Telegram
@@ -3438,12 +3397,10 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
             if not data_id:
                 continue
             file_name = _atoz_clean_file_label(_atoz_button_label(btn))
-            dl_url = _atoz_fetch_dl_watch_url(data_id)
-            if dl_url:
-                result["links"].append({
-                    "label": _atoz_link_label(file_name, "", "DL/Watch"),
-                    "url": dl_url,
-                })
+            result["links"].append({
+                "label": _atoz_link_label(file_name, "", "DL/Watch"),
+                "url": _atoz_dl_watch_url(data_id),
+            })
             result["links"].append({
                 "label": _atoz_link_label(file_name, "", "Telegram"),
                 "url": f"{tg_base}{data_id}",
@@ -3668,11 +3625,11 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
 
 # ─── REST API helpers (download links with size / audio metadata) ─────────────
 
-MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "10")))
-MOVIES_API_PER_SOURCE_TIMEOUT = max(3, int(os.getenv("MOVIES_API_PER_SOURCE_TIMEOUT", "8")))
-MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "14")))
-MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "120")))
-MOVIES_API_MAX_WORKERS = max(2, min(12, int(os.getenv("MOVIES_API_MAX_WORKERS", "9"))))
+MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "8")))
+MOVIES_API_PER_SOURCE_TIMEOUT = max(3, int(os.getenv("MOVIES_API_PER_SOURCE_TIMEOUT", "6")))
+MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "12")))
+MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "300")))
+MOVIES_API_MAX_WORKERS = max(2, min(16, int(os.getenv("MOVIES_API_MAX_WORKERS", "12"))))
 MOVIES_API_SKIP_UNHEALTHY_SECONDS = max(
     60, int(os.getenv("MOVIES_API_SKIP_UNHEALTHY_SECONDS", "1800")),
 )
@@ -3697,6 +3654,12 @@ def _api_cache_set(key: str, value: Any) -> None:
     if MOVIES_API_CACHE_TTL <= 0:
         return
     _api_cache[key] = (time.time(), value)
+    # ponytail: O(n) prune when cache grows; swap for Redis/TTL index if multi-instance
+    if len(_api_cache) > 500:
+        cutoff = time.time() - MOVIES_API_CACHE_TTL
+        for k, (ts, _) in list(_api_cache.items()):
+            if ts < cutoff:
+                _api_cache.pop(k, None)
 
 
 def mark_site_api_skip(source_key: str, *, seconds: int | None = None) -> None:
@@ -3728,13 +3691,25 @@ def _api_filter_sources(
 
 def _call_timed(timeout_sec: float, fn: Any, *args: Any, **kwargs: Any) -> Any:
     """Run fn with a hard wall-clock cap so one slow site cannot block the pool."""
-    with ThreadPoolExecutor(max_workers=1) as mini:
-        fut = mini.submit(fn, *args, **kwargs)
+    box: list[Any] = []
+    err: list[BaseException] = []
+
+    def _run() -> None:
         try:
-            return fut.result(timeout=timeout_sec)
-        except Exception as exc:
-            log.warning("API source hard-timeout after %.1fs: %s", timeout_sec, exc)
-            return []
+            box.append(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 — surface any worker failure
+            err.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        log.warning("API source hard-timeout after %.1fs", timeout_sec)
+        return []
+    if err:
+        log.warning("API source failed: %s", err[0])
+        return []
+    return box[0] if box else []
 
 
 def _parallel_collect_rows(
@@ -4210,7 +4185,7 @@ def movie_page_download_links(
         data = moviesmod_movie_links(page_url)
         links = _flat_links_from_moviesmod(data)
     elif key == "atoz":
-        data = atoz_movie_links(page_url)
+        data = atoz_movie_links(page_url, fast=fast)
         links = _flat_links_from_atoz(data)
     else:
         raise ValueError(f"unsupported source '{source}'")
