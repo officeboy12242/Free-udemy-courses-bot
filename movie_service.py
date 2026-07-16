@@ -3368,7 +3368,7 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
 
         nulldrop_server = (embedded.get("nulldrop_server") or "").rstrip("/")
         base_url = embedded.get("base_url") or ""
-        pending_dl: list[tuple[str, str, str]] = []
+        pending: list[dict[str, str]] = []
 
         for quality, file_info in (embedded.get("files") or {}).items():
             if not isinstance(file_info, dict):
@@ -3382,25 +3382,24 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
 
             clean_name = _atoz_clean_file_label(file_name, quality=quality)
             size_str = _format_size(file_size) if file_size else ""
-
-            result["links"].append({
-                "label": _atoz_link_label(clean_name, size_str, "Telegram"),
-                "url": f"{base_url}{file_id}",
+            pending.append({
+                "file_id": file_id,
+                "clean_name": clean_name,
+                "size_str": size_str,
+                "nulldrop_url": (
+                    f"{nulldrop_server}/file/{nulldrop_id}"
+                    if nulldrop_server and nulldrop_id else ""
+                ),
+                "telegram_url": f"{base_url}{file_id}",
             })
-            if nulldrop_server and nulldrop_id:
-                result["links"].append({
-                    "label": _atoz_link_label(clean_name, size_str, "NullDrop"),
-                    "url": f"{nulldrop_server}/file/{nulldrop_id}",
-                })
-            pending_dl.append((file_id, clean_name, size_str))
 
-        if pending_dl:
-            dl_urls: dict[str, str] = {}
-            workers = min(6, len(pending_dl))
+        dl_urls: dict[str, str] = {}
+        if pending:
+            workers = min(6, len(pending))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(_atoz_fetch_dl_watch_url, file_id): file_id
-                    for file_id, _, _ in pending_dl
+                    pool.submit(_atoz_fetch_dl_watch_url, item["file_id"]): item["file_id"]
+                    for item in pending
                 }
                 for fut in as_completed(futures):
                     fid = futures[fut]
@@ -3410,15 +3409,27 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
                             dl_urls[fid] = url
                     except Exception:
                         continue
-            for file_id, clean_name, size_str in pending_dl:
-                dl_url = dl_urls.get(file_id, "")
-                if dl_url:
-                    result["links"].append({
-                        "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
-                        "url": dl_url,
-                    })
 
-    # Fallback: legacy buttons → Telegram + DL/Watch
+        for item in pending:
+            clean_name = item["clean_name"]
+            size_str = item["size_str"]
+            if item["nulldrop_url"]:
+                result["links"].append({
+                    "label": _atoz_link_label(clean_name, size_str, "NullDrop"),
+                    "url": item["nulldrop_url"],
+                })
+            dl_url = dl_urls.get(item["file_id"], "")
+            if dl_url:
+                result["links"].append({
+                    "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
+                    "url": dl_url,
+                })
+            result["links"].append({
+                "label": _atoz_link_label(clean_name, size_str, "Telegram"),
+                "url": item["telegram_url"],
+            })
+
+    # Fallback: legacy buttons → DL/Watch then Telegram
     if not result["links"]:
         buttons = soup.find_all("button", attrs={"data-id": True})
         tg_base = "https://t.me/AtoZ_Files_Bot?start=file_"
@@ -3427,16 +3438,16 @@ def atoz_movie_links(movie_url: str) -> dict[str, Any]:
             if not data_id:
                 continue
             file_name = _atoz_clean_file_label(_atoz_button_label(btn))
-            result["links"].append({
-                "label": _atoz_link_label(file_name, "", "Telegram"),
-                "url": f"{tg_base}{data_id}",
-            })
             dl_url = _atoz_fetch_dl_watch_url(data_id)
             if dl_url:
                 result["links"].append({
                     "label": _atoz_link_label(file_name, "", "DL/Watch"),
                     "url": dl_url,
                 })
+            result["links"].append({
+                "label": _atoz_link_label(file_name, "", "Telegram"),
+                "url": f"{tg_base}{data_id}",
+            })
 
     return result
 
