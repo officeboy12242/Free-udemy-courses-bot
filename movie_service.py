@@ -3625,8 +3625,8 @@ def format_zeefliz_message(movie_title: str, data: dict, footer: bool = True) ->
 
 # ─── REST API helpers (download links with size / audio metadata) ─────────────
 
-MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "8")))
-MOVIES_API_PER_SOURCE_TIMEOUT = max(3, int(os.getenv("MOVIES_API_PER_SOURCE_TIMEOUT", "6")))
+MOVIES_API_SOURCE_TIMEOUT = max(4, int(os.getenv("MOVIES_API_SOURCE_TIMEOUT", "14")))
+MOVIES_API_PER_SOURCE_TIMEOUT = max(3, int(os.getenv("MOVIES_API_PER_SOURCE_TIMEOUT", "12")))
 MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "12")))
 MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "300")))
 MOVIES_API_MAX_WORKERS = max(2, min(16, int(os.getenv("MOVIES_API_MAX_WORKERS", "12"))))
@@ -3652,6 +3652,9 @@ def _api_cache_get(key: str) -> Any | None:
 
 def _api_cache_set(key: str, value: Any) -> None:
     if MOVIES_API_CACHE_TTL <= 0:
+        return
+    # Never cache empty search/latest payloads — a timeout miss would stick for TTL.
+    if value == [] or value == {}:
         return
     _api_cache[key] = (time.time(), value)
     # ponytail: O(n) prune when cache grows; swap for Redis/TTL index if multi-instance
@@ -4212,18 +4215,19 @@ def _movies_search_one_source(
         if search_fn is hdhub_search:
             movies = search_fn(query, limit, fast=fast)
         elif search_fn is md_search:
+            # Match Telegram reliability: MD JSON search is flaky under 6s/0-retry.
             movies = search_fn(
                 query,
                 limit,
-                timeout=6 if fast else 15,
-                retries=0 if fast else 2,
+                timeout=12 if fast else 15,
+                retries=1 if fast else 2,
             )
         elif search_fn is hdh_search:
             movies = search_fn(
                 query,
                 limit,
-                timeout=8 if fast else 20,
-                retries=0 if fast else 2,
+                timeout=12 if fast else 20,
+                retries=1 if fast else 2,
             )
         elif fast:
             movies = search_fn(query, min(limit, 5))
@@ -4258,7 +4262,7 @@ def movies_search_combined(
     if not q:
         return []
     limit = max(1, min(int(limit_per_source), 20))
-    cache_key = f"search:v3:{q}:{limit}:{'fast' if fast else 'full'}"
+    cache_key = f"search:v4:{q}:{limit}:{'fast' if fast else 'full'}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -4272,9 +4276,13 @@ def movies_search_combined(
     futures_map: dict[Future, str] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for source_label, search_fn, source_key in sources:
+            # MoviesDrive/4KHDHub need a bit more than the default fast budget.
+            src_budget = per_src
+            if fast and source_key in ("md", "hdh"):
+                src_budget = max(per_src, 14)
             fut = pool.submit(
                 _call_timed,
-                per_src,
+                src_budget,
                 _movies_search_one_source,
                 source_label,
                 search_fn,
@@ -4285,6 +4293,8 @@ def movies_search_combined(
             )
             futures_map[fut] = source_key
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
+        if fast:
+            timeout = max(timeout, 14)
         out = _parallel_collect_rows(
             futures_map, total_timeout=timeout, label="movies_search_combined",
         )
