@@ -3276,11 +3276,6 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
-_ATOZ_FILES_BLOCK_RE = re.compile(
-    r'\\"files\\":\s*(\{(?:[^{}]|\{[^{}]*\})*\})\s*,\s*\\"kind\\":\s*\\"([^"\\]+)\\"'
-    r'\s*,\s*\\"baseUrl\\":\s*\\"([^"\\]+)\\"(.*?)(?:,\\"isPremium\\"|,\\"slug\\"|,\\"title\\")',
-    re.S,
-)
 _ATOZ_SERVER_RE = re.compile(r'\\"([a-zA-Z]+Server)\\":\\"([^"\\]+)\\"')
 
 
@@ -3291,25 +3286,107 @@ def _atoz_clean_file_label(file_name: str, *, quality: str = "") -> str:
     return name.strip() or quality
 
 
+def _atoz_extract_brace_object(text: str, start: int) -> str | None:
+    """Return the `{...}` slice starting at start, with nested braces."""
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _atoz_parse_embedded_files(html_text: str) -> dict[str, Any] | None:
-    """Parse escaped Next.js payload: files, kind, baseUrl, *Server fields."""
-    match = _ATOZ_FILES_BLOCK_RE.search(html_text)
-    if not match:
+    """Parse escaped Next.js payload: files, kind, baseUrl, *Server fields.
+
+    Movies: files = {quality: {file_id, nulldrop_id, ...}}
+    Series: files = {single|pack: {quality: [{episode, file_id, nulldrop_id, ...}]}}
+    """
+    marker = '\\"files\\":'
+    pos = html_text.find(marker)
+    if pos < 0:
+        return None
+    brace_at = html_text.find("{", pos + len(marker))
+    files_esc = _atoz_extract_brace_object(html_text, brace_at)
+    if not files_esc:
         return None
     try:
-        files_data = json.loads(match.group(1).replace('\\"', '"'))
+        files_data = json.loads(files_esc.replace('\\"', '"'))
     except json.JSONDecodeError:
         return None
+
+    tail = html_text[brace_at + len(files_esc) : brace_at + len(files_esc) + 500]
+    kind_m = re.search(r'\\"kind\\":\\"([^"\\]+)\\"', tail)
+    base_m = re.search(r'\\"baseUrl\\":\\"([^"\\]+)\\"', tail)
     servers = {
         key: val.replace("\\/", "/")
-        for key, val in _ATOZ_SERVER_RE.findall(match.group(4))
+        for key, val in _ATOZ_SERVER_RE.findall(tail)
     }
     return {
         "files": files_data,
-        "kind": match.group(2),
-        "base_url": match.group(3).replace("\\/", "/"),
+        "kind": kind_m.group(1) if kind_m else "movie",
+        "base_url": (base_m.group(1).replace("\\/", "/") if base_m else ""),
         "nulldrop_server": servers.get("nulldropServer", ""),
     }
+
+
+def _atoz_iter_file_entries(files_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten movie or series files payload into linkable entries."""
+    entries: list[dict[str, Any]] = []
+
+    def _add(quality: str, info: dict[str, Any], *, pack: str = "") -> None:
+        if not isinstance(info, dict):
+            return
+        file_id = (info.get("file_id") or "").strip()
+        nulldrop_id = (info.get("nulldrop_id") or "").strip()
+        if not file_id and not nulldrop_id:
+            return
+        episode = str(info.get("episode") or "").strip()
+        label_bits = [quality]
+        if pack:
+            label_bits.insert(0, pack)
+        if episode and episode.lower() not in ("complete", "full"):
+            label_bits.append(episode)
+        quality_label = " ".join(x for x in label_bits if x)
+        entries.append({
+            "quality": quality_label or quality,
+            "file_name": info.get("file_name") or quality_label or quality,
+            "file_id": file_id,
+            "nulldrop_id": nulldrop_id,
+            "file_size": info.get("file_size") or 0,
+            "episode": episode,
+        })
+
+    if not isinstance(files_data, dict):
+        return entries
+
+    # Series layout: {single: {...}, pack: {...}}
+    if any(k in files_data for k in ("single", "pack", "season")):
+        for section, section_data in files_data.items():
+            if not isinstance(section_data, dict):
+                continue
+            pack_label = "" if section == "single" else section.capitalize()
+            for quality, payload in section_data.items():
+                if isinstance(payload, list):
+                    for item in payload:
+                        _add(str(quality), item, pack=pack_label)
+                elif isinstance(payload, dict):
+                    _add(str(quality), payload, pack=pack_label)
+        return entries
+
+    # Movie layout: {quality: {file_id, ...}}
+    for quality, payload in files_data.items():
+        if isinstance(payload, list):
+            for item in payload:
+                _add(str(quality), item)
+        elif isinstance(payload, dict):
+            _add(str(quality), payload)
+    return entries
 
 
 def _atoz_dl_watch_url(file_id: str) -> str:
@@ -3362,31 +3439,27 @@ def atoz_movie_links(movie_url: str, *, fast: bool = True) -> dict[str, Any]:
         nulldrop_server = (embedded.get("nulldrop_server") or "").rstrip("/")
         base_url = embedded.get("base_url") or ""
 
-        for quality, file_info in (embedded.get("files") or {}).items():
-            if not isinstance(file_info, dict):
-                continue
-            file_name = file_info.get("file_name", quality)
-            file_id = (file_info.get("file_id") or "").strip()
-            nulldrop_id = (file_info.get("nulldrop_id") or "").strip()
-            file_size = file_info.get("file_size", 0)
-            if not file_id:
-                continue
+        for entry in _atoz_iter_file_entries(embedded.get("files") or {}):
+            file_id = entry["file_id"]
+            nulldrop_id = entry["nulldrop_id"]
+            clean_name = _atoz_clean_file_label(entry["file_name"], quality=entry["quality"])
+            size_str = _format_size(entry["file_size"]) if entry["file_size"] else ""
 
-            clean_name = _atoz_clean_file_label(file_name, quality=quality)
-            size_str = _format_size(file_size) if file_size else ""
+            # Order: NullDrop → DL/Watch → Telegram (NullDrop even without file_id)
             if nulldrop_server and nulldrop_id:
                 result["links"].append({
                     "label": _atoz_link_label(clean_name, size_str, "NullDrop"),
                     "url": f"{nulldrop_server}/file/{nulldrop_id}",
                 })
-            result["links"].append({
-                "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
-                "url": _atoz_dl_watch_url(file_id),
-            })
-            result["links"].append({
-                "label": _atoz_link_label(clean_name, size_str, "Telegram"),
-                "url": f"{base_url}{file_id}",
-            })
+            if file_id:
+                result["links"].append({
+                    "label": _atoz_link_label(clean_name, size_str, "DL/Watch"),
+                    "url": _atoz_dl_watch_url(file_id),
+                })
+                result["links"].append({
+                    "label": _atoz_link_label(clean_name, size_str, "Telegram"),
+                    "url": f"{base_url}{file_id}",
+                })
 
     # Fallback: legacy buttons → DL/Watch then Telegram
     if not result["links"]:
