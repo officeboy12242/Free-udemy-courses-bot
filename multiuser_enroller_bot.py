@@ -45,6 +45,9 @@ from user_enroller import (
     is_owner, is_premium, grant_premium, revoke_premium, get_all_premium_users,
     can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
     get_all_daily_stats, get_daily_usage, get_user_total_enrollments,
+    # Telegram profiles / owner user mgmt
+    upsert_telegram_profile, format_user_label, resolve_user_ref,
+    get_all_enroller_users, get_enroller_user_detail,
     # Settings
     is_channel_posting_enabled, toggle_channel_posting,
 )
@@ -366,87 +369,335 @@ def split_list_into_batches(items, num_batches):
 
 # ─── Premium Management Commands (Owner Only) ─────────────────────────────────
 
+def _remember_telegram_user(user) -> None:
+    """Persist Telegram username/name whenever we see a user."""
+    if not user:
+        return
+    upsert_telegram_profile(
+        user.id,
+        username=getattr(user, "username", None) or "",
+        full_name=getattr(user, "full_name", None) or "",
+    )
+
+
+async def _resolve_target_user_id(bot, ref: str) -> int | None:
+    """Resolve @username / id using DB first, then Telegram get_chat."""
+    uid = resolve_user_ref(ref)
+    if uid:
+        return uid
+    raw = (ref or "").strip()
+    if not raw or raw.isdigit():
+        return int(raw) if raw.isdigit() else None
+    uname = raw if raw.startswith("@") else f"@{raw.lstrip('@')}"
+    try:
+        chat = await bot.get_chat(uname)
+        if chat and chat.id:
+            upsert_telegram_profile(
+                chat.id,
+                username=getattr(chat, "username", None) or raw.lstrip("@"),
+                full_name=getattr(chat, "full_name", None) or getattr(chat, "first_name", None) or "",
+            )
+            return int(chat.id)
+    except Exception:
+        return None
+    return None
+
+
+def _role_emoji(role: str) -> str:
+    return {"owner": "👑", "premium": "💎", "free": "👤"}.get(role, "👤")
+
+
 async def cmd_grant_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Grant premium access to a user (owner only)"""
+    """Grant premium access to a user (owner only). Accepts @username or user_id."""
     if not update.effective_user or not update.effective_message:
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only command.")
         return
-    
+
     if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: `/grant_premium <user_id>`\nExample: `/grant_premium 123456789`",
-            parse_mode="Markdown"
+        await update.effective_message.reply_html(
+            "Usage: <code>/grant_premium @username</code>\n"
+            "Or: <code>/grant_premium 123456789</code>"
         )
         return
-    
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("❌ Invalid user ID. Must be a number.")
-        return
-    
-    if grant_premium(target_id, update.effective_user.id):
+
+    target_id = await _resolve_target_user_id(context.bot, context.args[0])
+    if not target_id:
         await update.effective_message.reply_text(
-            f"✅ Premium access granted to user `{target_id}`",
-            parse_mode="Markdown"
+            "❌ User not found. They must /start the bot once, or use a numeric ID."
+        )
+        return
+
+    if grant_premium(target_id, update.effective_user.id):
+        await update.effective_message.reply_html(
+            f"✅ Premium granted to <b>{format_user_label(target_id)}</b>"
         )
     else:
         await update.effective_message.reply_text("❌ Failed to grant premium.")
 
 
 async def cmd_revoke_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Revoke premium access from a user (owner only)"""
+    """Revoke premium access (owner only). Accepts @username or user_id."""
     if not update.effective_user or not update.effective_message:
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only command.")
         return
-    
+
     if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: `/revoke_premium <user_id>`\nExample: `/revoke_premium 123456789`",
-            parse_mode="Markdown"
+        await update.effective_message.reply_html(
+            "Usage: <code>/revoke_premium @username</code>"
         )
         return
-    
-    try:
-        target_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("❌ Invalid user ID.")
+
+    target_id = await _resolve_target_user_id(context.bot, context.args[0])
+    if not target_id:
+        await update.effective_message.reply_text("❌ User not found.")
         return
-    
+
     if revoke_premium(target_id):
-        await update.effective_message.reply_text(
-            f"✅ Premium revoked from user `{target_id}`",
-            parse_mode="Markdown"
+        await update.effective_message.reply_html(
+            f"✅ Premium revoked from <b>{format_user_label(target_id)}</b>"
         )
     else:
         await update.effective_message.reply_text("❌ Failed to revoke premium.")
 
 
 async def cmd_list_premium(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all premium users (owner only)"""
+    """List all premium users with usernames (owner only)."""
     if not update.effective_user or not update.effective_message:
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("⛔ Owner only command.")
         return
-    
+
     users = get_all_premium_users()
     if not users:
         await update.effective_message.reply_text("No premium users.")
         return
-    
-    lines = ["👑 **Premium Users:**\n"]
+
+    lines = ["👑 <b>Premium Users</b>\n"]
     for u in users:
-        lines.append(f"• `{u['user_id']}` (granted: {u['granted_at'][:10]})")
-    
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"• {u['display']} <i>(since {u['granted_at']})</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show enrollment stats for all users (owner only) — usernames, not IDs."""
+    if not update.effective_user or not update.effective_message:
+        return
+    _remember_telegram_user(update.effective_user)
+
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+
+    stats = get_all_daily_stats()
+    all_users = get_all_enroller_users(limit=50)
+
+    lines = [
+        "📊 <b>Enrollment Statistics</b>\n",
+        f"📅 Date: {stats['date']}",
+        f"✅ Today Total: <b>{stats['today_total']}</b> courses",
+        f"📈 All-Time Total: <b>{stats['all_time_total']}</b> courses",
+        f"👥 Bot users: <b>{len(all_users)}</b>",
+        "",
+        "🔥 <b>Today by user:</b>",
+    ]
+
+    if stats["users"]:
+        for i, u in enumerate(stats["users"][:20], 1):
+            role = "👑" if is_owner(u["user_id"]) else ("💎" if is_premium(u["user_id"]) else "👤")
+            lines.append(f"{i}. {role} {u.get('display') or format_user_label(u['user_id'])}: <b>{u['count']}</b>")
+        if len(stats["users"]) > 20:
+            lines.append(f"... and {len(stats['users']) - 20} more")
+    else:
+        lines.append("No enrollments today yet.")
+
+    lines.append("\n📋 Use /users for full list + manage")
+    lines.append("<i>Legend: 👑 Owner · 💎 Premium · 👤 Free</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+def _users_list_text(page: int = 0, page_size: int = 15) -> tuple[str, InlineKeyboardMarkup | None]:
+    rows = get_all_enroller_users(limit=200)
+    total = len(rows)
+    if not rows:
+        return "No Udemy bot users yet.", None
+
+    start = page * page_size
+    chunk = rows[start : start + page_size]
+    lines = [
+        f"👥 <b>Udemy Bot Users</b> ({total})\n",
+        "<i>username · role · accounts · today / all-time</i>\n",
+    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i, u in enumerate(chunk, start=start + 1):
+        emoji = _role_emoji(u["role"])
+        lines.append(
+            f"{i}. {emoji} <b>{u['display']}</b>\n"
+            f"    🎓 {u['accounts']} acct ({u['auto_accounts']} auto) · "
+            f"today {u['today']} · total {u['all_time']}"
+        )
+        label = (u["username"] and f"@{u['username']}") or u["display"][:28]
+        buttons.append([InlineKeyboardButton(
+            f"⚙️ {label}",
+            callback_data=f"ouser_{u['user_id']}",
+        )])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"ousers_page_{page - 1}"))
+    if start + page_size < total:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"ousers_page_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def _user_detail_text_and_kb(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    detail = get_enroller_user_detail(user_id)
+    if not detail:
+        return "❌ User not found.", None
+
+    emoji = _role_emoji(detail["role"])
+    rem = detail["remaining"]
+    rem_txt = "∞" if rem < 0 else str(rem)
+    lines = [
+        f"{emoji} <b>{detail['display']}</b>",
+        f"Role: <b>{detail['role']}</b>",
+        f"Today: <b>{detail['today']}</b> · Remaining: <b>{rem_txt}</b>",
+        f"All-time enrollments: <b>{detail['all_time']}</b>",
+        f"Courses logged: <b>{detail['courses_logged']}</b>",
+        f"Udemy accounts: <b>{len(detail['accounts'])}</b>",
+    ]
+    for a in detail["accounts"]:
+        auto = "✅ auto" if a.get("auto_enroll") else "⭕ manual"
+        lines.append(f"  • {a.get('name', 'Account')} — {auto}")
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if detail["role"] != "owner":
+        if detail["role"] == "premium":
+            kb_rows.append([InlineKeyboardButton(
+                "🚫 Revoke Premium", callback_data=f"ouser_revprem_{user_id}",
+            )])
+        else:
+            kb_rows.append([InlineKeyboardButton(
+                "💎 Grant Premium", callback_data=f"ouser_grantprem_{user_id}",
+            )])
+        kb_rows.append([InlineKeyboardButton(
+            "🗑️ Delete user data", callback_data=f"ouser_delask_{user_id}",
+        )])
+    kb_rows.append([InlineKeyboardButton("⬅️ Back to /users", callback_data="ousers_page_0")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all Udemy bot users with usernames (owner only)."""
+    if not update.effective_user or not update.effective_message:
+        return
+    _remember_telegram_user(update.effective_user)
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+
+    text, kb = _users_list_text(0)
+    await update.effective_message.reply_html(text, reply_markup=kb)
+
+
+async def cmd_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show one user detail + manage actions (owner only)."""
+    if not update.effective_user or not update.effective_message:
+        return
+    _remember_telegram_user(update.effective_user)
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+    if not context.args:
+        await update.effective_message.reply_html(
+            "Usage: <code>/user @username</code>\nOr open someone from /users"
+        )
+        return
+
+    target_id = await _resolve_target_user_id(context.bot, context.args[0])
+    if not target_id:
+        await update.effective_message.reply_text("❌ User not found.")
+        return
+    text, kb = _user_detail_text_and_kb(target_id)
+    await update.effective_message.reply_html(text, reply_markup=kb)
+
+
+async def owner_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline manage callbacks for /users."""
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    await query.answer()
+    if not is_owner(update.effective_user.id):
+        await query.edit_message_text("⛔ Owner only.")
+        return
+
+    data = query.data or ""
+    if data.startswith("ousers_page_"):
+        try:
+            page = int(data.split("_")[-1])
+        except ValueError:
+            page = 0
+        text, kb = _users_list_text(page)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("ouser_grantprem_"):
+        uid = int(data.rsplit("_", 1)[-1])
+        grant_premium(uid, update.effective_user.id)
+        text, kb = _user_detail_text_and_kb(uid)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("ouser_revprem_"):
+        uid = int(data.rsplit("_", 1)[-1])
+        revoke_premium(uid)
+        text, kb = _user_detail_text_and_kb(uid)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("ouser_delask_"):
+        uid = int(data.rsplit("_", 1)[-1])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"ouser_delconfirm_{uid}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"ouser_{uid}"),
+        ]])
+        await query.edit_message_text(
+            f"🗑️ Delete all enroll data for <b>{format_user_label(uid)}</b>?\n"
+            "This removes accounts, enrollments, and premium flag.",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+
+    if data.startswith("ouser_delconfirm_"):
+        uid = int(data.rsplit("_", 1)[-1])
+        ok = delete_user_data(uid)
+        text, kb = _users_list_text(0)
+        prefix = f"{'✅ Deleted' if ok else '❌ Failed to delete'} {format_user_label(uid)}\n\n"
+        await query.edit_message_text(prefix + text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if data.startswith("ouser_"):
+        uid = int(data.split("_", 1)[1])
+        text, kb = _user_detail_text_and_kb(uid)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        return
 
 
 async def cmd_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2171,48 +2422,14 @@ async def _upload_file_to_chat(
     return False
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show enrollment stats for all users (owner only)"""
-    if not update.effective_user or not update.effective_message:
-        return
-    
-    if not is_owner(update.effective_user.id):
-        await update.effective_message.reply_text("⛔ Owner only command.")
-        return
-    
-    stats = get_all_daily_stats()
-    
-    lines = [
-        "📊 **Enrollment Statistics**\n",
-        f"📅 Date: {stats['date']}",
-        f"✅ Today Total: **{stats['today_total']}** courses",
-        f"📈 All-Time Total: **{stats['all_time_total']}** courses",
-        "",
-        "👥 **Today's Enrollments by User:**"
-    ]
-    
-    if stats['users']:
-        for i, u in enumerate(stats['users'][:20], 1):  # Top 20
-            user_type = "👑" if is_owner(u['user_id']) else ("💎" if is_premium(u['user_id']) else "👤")
-            lines.append(f"{i}. {user_type} `{u['user_id']}`: {u['count']} courses")
-        
-        if len(stats['users']) > 20:
-            lines.append(f"... and {len(stats['users']) - 20} more users")
-    else:
-        lines.append("No enrollments today yet.")
-    
-    lines.append("\n_Legend: 👑=Owner 💎=Premium 👤=Free_")
-    
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
 # ─── Setup Commands ──────────────────────────────────────────────────────────
 
 async def cmd_enroll_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start adding a new account"""
     if not update.effective_user or not update.effective_message:
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     user_id = update.effective_user.id
     accounts = get_user_accounts(user_id)
     
@@ -2248,7 +2465,8 @@ async def cmd_set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not update.effective_user or not update.effective_message or not context.args:
         await update.effective_message.reply_text("Usage: `/set_token <your_token>`", parse_mode="Markdown")
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     user_id = update.effective_user.id
     token = " ".join(context.args)
     
@@ -2311,7 +2529,8 @@ async def handle_setup_message(update: Update, context: ContextTypes.DEFAULT_TYP
     """Handle raw message input during setup"""
     if not update.effective_user or not update.effective_message:
         return
-    
+    _remember_telegram_user(update.effective_user)
+
     user_id = update.effective_user.id
     step, extra = get_user_setup_state(user_id)
     

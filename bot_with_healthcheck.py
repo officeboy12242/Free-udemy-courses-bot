@@ -89,13 +89,19 @@ from multiuser_enroller_bot import (
     cmd_revoke_premium,
     cmd_list_premium,
     cmd_stats,
+    cmd_users,
+    cmd_user,
+    owner_users_callback,
     cmd_channel_post,
     cmd_search_courses,
     cmd_download_queue,
     cmd_downloads,
     init_bot_pool,
 )
-from user_enroller import is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today
+from user_enroller import (
+    is_owner, is_premium, FREE_DAILY_LIMIT, get_remaining_today,
+    upsert_telegram_profile, format_user_label,
+)
 from movie_service import (
     hdhub_latest_movies, hdhub_movie_links, format_hdhub_message,
     hdh_latest_movies, hdh_movie_links, format_hdh_message,
@@ -322,10 +328,12 @@ WELCOME_OWNER_HTML = """<b>👑 Owner Dashboard</b>
 /downloads or /status — live download progress & system stats
 
 <b>👑 Owner Commands:</b>
-/grant_premium &lt;user_id&gt; — give premium access
-/revoke_premium &lt;user_id&gt; — remove premium
+/users — all bot users (usernames) + manage
+/user @username — one user detail / manage
+/grant_premium @username — give premium access
+/revoke_premium @username — remove premium
 /list_premium — show all premium users
-/stats — enrollment stats for all users
+/stats — enrollment stats (by username)
 /channel_post — toggle channel posting
 
 <b>🔧 Utility:</b>
@@ -343,6 +351,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user = update.effective_user
+
+    # Always keep Telegram username/name for owner /users management
+    upsert_telegram_profile(
+        user_id,
+        username=user.username or "",
+        full_name=user.full_name or "",
+    )
     
     # Check if new user (for notification)
     is_new_user = False
@@ -363,14 +378,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from user_enroller import OWNER_ID
         if OWNER_ID and OWNER_ID != 0:
             try:
-                username = f"@{user.username}" if user.username else "No username"
-                name = user.full_name or "No name"
+                label = format_user_label(user_id)
                 notify_msg = (
                     f"🆕 <b>New User Started Bot!</b>\n\n"
-                    f"👤 <b>Name:</b> {name}\n"
-                    f"🔗 <b>Username:</b> {username}\n"
-                    f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
-                    f"<i>Grant premium: /grant_premium {user_id}</i>"
+                    f"👤 <b>{label}</b>\n\n"
+                    f"<i>Manage: /user {('@' + user.username) if user.username else user_id}</i>\n"
+                    f"<i>Premium: /grant_premium {('@' + user.username) if user.username else user_id}</i>"
                 )
                 await context.bot.send_message(chat_id=OWNER_ID, text=notify_msg, parse_mode="HTML")
             except Exception as e:
@@ -455,18 +468,24 @@ Resets at midnight.
 
 <b>👑 OWNER COMMANDS</b>
 
-<b>/grant_premium &lt;user_id&gt;</b>
-Give a user unlimited enrollment access.
+<b>/users</b>
+List every Udemy-bot user with <b>@username</b>, role,
+accounts, today/all-time enrollments. Tap to manage.
 
-<b>/revoke_premium &lt;user_id&gt;</b>
-Remove premium access from a user.
+<b>/user @username</b>
+Open one user: grant/revoke premium, delete data.
+
+<b>/grant_premium @username</b>
+Give unlimited enrollment (also accepts user id).
+
+<b>/revoke_premium @username</b>
+Remove premium access.
 
 <b>/list_premium</b>
-Show all premium users.
+Show all premium users by username.
 
 <b>/stats</b>
-View enrollment stats: today's total, all-time total,
-and breakdown by user (owner/premium/free).
+Today + all-time enrollments by username.
 
 <b>/channel_post</b>
 Toggle automatic channel posting of enrolled courses.
@@ -1963,6 +1982,9 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("revoke_premium", cmd_revoke_premium))
     app.add_handler(CommandHandler("list_premium", cmd_list_premium))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("user", cmd_user))
+    app.add_handler(CallbackQueryHandler(owner_users_callback, pattern=r"^ouser"))
     app.add_handler(CommandHandler("channel_post", cmd_channel_post))
     app.add_handler(CommandHandler("search_courses", cmd_search_courses))
     app.add_handler(CommandHandler("download_queue", cmd_download_queue))

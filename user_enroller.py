@@ -101,6 +101,8 @@ def init_enroller_db():
         db.premium_users.create_index([("user_id", 1)], unique=True)
         db.user_setup_state.create_index([("user_id", 1)], unique=True)
         db.auto_enroll_state.create_index([("user_id", 1)], unique=True)
+        db.telegram_profiles.create_index([("user_id", 1)], unique=True)
+        db.telegram_profiles.create_index([("username_lower", 1)])
 
         # Owner course archive / download queue
         db.owner_download_queue.create_index([("owner_id", 1)])
@@ -534,17 +536,185 @@ def revoke_premium(user_id: int) -> bool:
 
 
 def get_all_premium_users() -> list:
-    """Get all premium users"""
+    """Get all premium users with Telegram usernames when known."""
     db = _get_db()
-    users = db.premium_users.find()
-    return [
-        {
-            "user_id": u["user_id"],
+    users = list(db.premium_users.find())
+    out = []
+    for u in users:
+        uid = u["user_id"]
+        profile = get_telegram_profile(uid)
+        out.append({
+            "user_id": uid,
+            "username": profile.get("username", ""),
+            "full_name": profile.get("full_name", ""),
+            "display": format_user_label(uid),
             "granted_by": u.get("granted_by"),
-            "granted_at": str(u.get("granted_at", ""))[:10]
+            "granted_at": str(u.get("granted_at", ""))[:10],
+        })
+    return out
+
+
+# ─── Telegram profiles (owner user management) ────────────────────────────────
+
+def upsert_telegram_profile(
+    user_id: int,
+    *,
+    username: str | None = None,
+    full_name: str | None = None,
+) -> None:
+    """Store/update Telegram username + display name for a bot user."""
+    if not user_id:
+        return
+    try:
+        db = _get_db()
+        update: dict = {"user_id": int(user_id), "updated_at": datetime.utcnow()}
+        if username is not None:
+            clean = (username or "").lstrip("@").strip()
+            update["username"] = clean
+            update["username_lower"] = clean.lower()
+        if full_name is not None:
+            update["full_name"] = (full_name or "").strip()
+        db.telegram_profiles.update_one(
+            {"user_id": int(user_id)},
+            {"$set": update},
+            upsert=True,
+        )
+    except Exception as e:
+        log.debug("upsert_telegram_profile failed: %s", e)
+
+
+def get_telegram_profile(user_id: int) -> dict:
+    """Return stored Telegram profile fields for a user_id."""
+    try:
+        db = _get_db()
+        doc = db.telegram_profiles.find_one({"user_id": int(user_id)}) or {}
+        return {
+            "user_id": int(user_id),
+            "username": doc.get("username") or "",
+            "full_name": doc.get("full_name") or "",
         }
-        for u in users
-    ]
+    except Exception:
+        return {"user_id": int(user_id), "username": "", "full_name": ""}
+
+
+def format_user_label(user_id: int) -> str:
+    """Human label: @username (Name) — never bare ID as primary."""
+    p = get_telegram_profile(user_id)
+    username = p.get("username") or ""
+    name = p.get("full_name") or ""
+    if username and name:
+        return f"@{username} ({name})"
+    if username:
+        return f"@{username}"
+    if name:
+        return name
+    return f"user_{user_id}"
+
+
+def resolve_user_ref(ref: str) -> int | None:
+    """Resolve @username / username / numeric id to Telegram user_id."""
+    raw = (ref or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    uname = raw.lstrip("@").strip()
+    if not uname:
+        return None
+    try:
+        db = _get_db()
+        doc = db.telegram_profiles.find_one({"username_lower": uname.lower()})
+        if doc and doc.get("user_id"):
+            return int(doc["user_id"])
+    except Exception:
+        pass
+    return None
+
+
+def get_all_enroller_users(*, limit: int = 100) -> list[dict]:
+    """All Udemy-bot users with accounts/stats for owner management."""
+    db = _get_db()
+    ids: set[int] = set()
+    for doc in db.user_accounts.find({}, {"user_id": 1}):
+        if doc.get("user_id"):
+            ids.add(int(doc["user_id"]))
+    for doc in db.premium_users.find({}, {"user_id": 1}):
+        if doc.get("user_id"):
+            ids.add(int(doc["user_id"]))
+    for doc in db.enrolled_courses.find({}, {"user_id": 1}):
+        if doc.get("user_id"):
+            ids.add(int(doc["user_id"]))
+    for doc in db.telegram_profiles.find({}, {"user_id": 1}):
+        if doc.get("user_id"):
+            ids.add(int(doc["user_id"]))
+
+    today = get_today_str()
+    rows: list[dict] = []
+    for uid in ids:
+        if is_owner(uid):
+            role = "owner"
+        elif is_premium(uid):
+            role = "premium"
+        else:
+            role = "free"
+        accounts = get_user_accounts(uid)
+        auto_on = sum(1 for a in accounts if a.get("auto_enroll"))
+        profile = get_telegram_profile(uid)
+        rows.append({
+            "user_id": uid,
+            "username": profile.get("username", ""),
+            "full_name": profile.get("full_name", ""),
+            "display": format_user_label(uid),
+            "role": role,
+            "accounts": len(accounts),
+            "auto_accounts": auto_on,
+            "today": get_daily_usage(uid),
+            "all_time": get_user_total_enrollments(uid),
+            "courses_logged": db.enrolled_courses.count_documents({"user_id": uid}),
+        })
+
+    rows.sort(key=lambda r: (-r["all_time"], -r["today"], r["display"].lower()))
+    return rows[: max(1, min(int(limit), 500))]
+
+
+def get_enroller_user_detail(user_id: int) -> dict | None:
+    """One user detail payload for owner /user command."""
+    uid = int(user_id)
+    if not db_user_exists(uid):
+        return None
+    accounts = get_user_accounts(uid)
+    profile = get_telegram_profile(uid)
+    if is_owner(uid):
+        role = "owner"
+    elif is_premium(uid):
+        role = "premium"
+    else:
+        role = "free"
+    return {
+        "user_id": uid,
+        "username": profile.get("username", ""),
+        "full_name": profile.get("full_name", ""),
+        "display": format_user_label(uid),
+        "role": role,
+        "accounts": accounts,
+        "today": get_daily_usage(uid),
+        "remaining": get_remaining_today(uid),
+        "all_time": get_user_total_enrollments(uid),
+        "courses_logged": _get_db().enrolled_courses.count_documents({"user_id": uid}),
+        "auto_state": get_auto_enroll_state(uid),
+    }
+
+
+def db_user_exists(user_id: int) -> bool:
+    db = _get_db()
+    uid = int(user_id)
+    return bool(
+        db.user_accounts.find_one({"user_id": uid})
+        or db.premium_users.find_one({"user_id": uid})
+        or db.telegram_profiles.find_one({"user_id": uid})
+        or db.enrolled_courses.find_one({"user_id": uid})
+        or db.daily_usage.find_one({"user_id": uid})
+    )
 
 
 # ─── Daily Usage Limits ───────────────────────────────────────────────────────
@@ -626,7 +796,15 @@ def get_all_daily_stats() -> dict:
     return {
         "today_total": total_today,
         "all_time_total": all_time,
-        "users": [{"user_id": u["user_id"], "count": u["enroll_count"]} for u in users],
+        "users": [
+            {
+                "user_id": u["user_id"],
+                "count": u["enroll_count"],
+                "display": format_user_label(u["user_id"]),
+                "username": get_telegram_profile(u["user_id"]).get("username", ""),
+            }
+            for u in users
+        ],
         "date": today
     }
 
