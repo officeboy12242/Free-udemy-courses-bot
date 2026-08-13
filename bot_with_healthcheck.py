@@ -514,6 +514,9 @@ Reuses the same live message (no spam):
 /setsite &lt;key&gt; &lt;url&gt; — manual update (when auto-detect fails)
 /movietest — connectivity check (auto-fixes redirects)
 
+<b>📥 TWITTER</b>
+/tw &lt;link&gt; — download a Twitter/X video (x.com or twitter.com, up to 50 MB)
+
 <b>📰 NEWS</b>
 /news — preview &amp; post tech news
 
@@ -816,6 +819,97 @@ async def cmd_updateapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"<code>{html.escape(str(e))}</code>"
         )
         log.error(f"Failed to update API key: {e}")
+
+
+async def cmd_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Download a Twitter/X video. Owner only.
+
+    Usage: /twitter https://x.com/user/status/123456789  (or /tw <link>)
+    """
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only feature.")
+        return
+
+    url = " ".join(context.args or []).strip()
+    if not url:
+        await update.effective_message.reply_html(
+            "📥 <b>Twitter/X Video Downloader</b>\n\n"
+            "Send the post link:\n"
+            "<code>/twitter https://x.com/user/status/123456789</code>\n"
+            "or <code>/tw &lt;link&gt;</code>\n\n"
+            "Works with <code>twitter.com</code> and <code>x.com</code> post links.\n"
+            "Videos up to 50 MB are uploaded back here.",
+            disable_web_page_preview=True,
+        )
+        return
+
+    from twitter_service import is_twitter_url
+    if not is_twitter_url(url):
+        await update.effective_message.reply_html(
+            "❌ That doesn't look like a Twitter/X post link.\n"
+            "Example: <code>https://x.com/elonmusk/status/123456789</code>"
+        )
+        return
+
+    await update.effective_message.reply_text("⏳ Downloading video…")
+    asyncio.create_task(_do_twitter_download(update, context, url))
+
+
+async def _do_twitter_download(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
+) -> None:
+    """Background Twitter/X download + upload. Sends the video or a friendly error."""
+    import shutil
+
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+
+    from twitter_service import TwitterDownloadError, download_twitter_video, resolve_direct_url
+
+    result = None
+    out_dir = None
+    try:
+        result = await asyncio.to_thread(download_twitter_video, url, None)
+        out_dir = result["path"].parent
+
+        caption_bits = []
+        if result.get("title"):
+            caption_bits.append(html.escape(str(result["title"])[:120]))
+        if result.get("uploader"):
+            caption_bits.append(f"\U0001f426 {html.escape(str(result['uploader'])[:40])}")
+        caption = "\n".join(caption_bits) if caption_bits else "\U0001f426"
+
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=result["path"],
+            caption=caption,
+            supports_streaming=True,
+            parse_mode="HTML",
+            filename=f"twitter_{Path(result['path']).stem}.mp4",
+        )
+    except TwitterDownloadError as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ {html.escape(str(e))}")
+    except TelegramError as e:
+        # Usually FILE_TOO_LARGE or a slow-upload timeout — fall back to a direct link.
+        direct = None
+        try:
+            direct = await asyncio.to_thread(resolve_direct_url, url)
+        except Exception:
+            direct = None
+        msg = f"⚠️ Could not upload the video to Telegram ({html.escape(str(e))})."
+        if direct:
+            msg += f"\n\n\U0001f517 Direct video link (open in browser):\n{direct}"
+        await context.bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"❌ Download failed: {html.escape(str(e))[:300]}",
+        )
+    finally:
+        if out_dir is not None:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 
 async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1959,6 +2053,8 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("sites", cmd_sites))
     app.add_handler(CommandHandler("setsite", cmd_setsite))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("twitter", cmd_twitter))
+    app.add_handler(CommandHandler("tw", cmd_twitter))
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CallbackQueryHandler(news_callback, pattern=r"^news_"))
     app.add_handler(CallbackQueryHandler(movie_callback, pattern=r"^m(site|back|pick|page)_|^mnoop$"))
