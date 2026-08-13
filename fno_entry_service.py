@@ -30,6 +30,7 @@ Data: Yahoo Finance 15m candles  +  NSE option chain (jugaad-data)
 from __future__ import annotations
 
 import asyncio
+import gc
 import html
 import logging
 import math
@@ -124,6 +125,70 @@ _macd_1h_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 # SL wick tracking per open alert id (exit monitor, resets on restart).
 _sl_breach_count: dict[int, int] = {}
 _last_status_ts: dict[int, float] = {}
+
+# ════════════════════ Memory hygiene: network clients must be closed ════════════════════
+# yfinance 1.x creates a curl_cffi session (C-level libcurl handles + connection
+# pool) per yf.Ticker — those leak if never closed. NSELive wraps a requests
+# Session at `.s`. Long-running Render instances creep to OOM otherwise, so
+# every fetch site below closes what it opens, and caches are size-capped.
+
+_MAX_CACHE_KEYS = 32
+
+
+def _close_yf_ticker(t) -> None:
+    """Close a yf.Ticker's curl_cffi session (no-op for None / already closed)."""
+    if t is None:
+        return
+    try:
+        session = getattr(t, "session", None)
+        if session is not None:
+            session.close()
+    except Exception:
+        pass
+
+
+def _ytf(symbol: str, **kwargs) -> pd.DataFrame:
+    """One-shot yfinance history fetch that always closes its session."""
+    t = yf.Ticker(symbol)
+    try:
+        return _yf_history(t, **kwargs)
+    finally:
+        _close_yf_ticker(t)
+
+
+def _close_nse(client) -> None:
+    """Close an NSELive client (internal requests.Session at `.s`); no-op if unsupported."""
+    if client is None:
+        return
+    try:
+        inner = getattr(client, "s", None)
+        close = getattr(inner, "close", None)
+        if close:
+            close()
+    except Exception:
+        pass
+
+
+def _cache_put(cache: dict, key, value, max_keys: int = _MAX_CACHE_KEYS) -> None:
+    """Insert into an in-memory cache, evicting the oldest entry past the cap."""
+    cache[key] = value
+    if len(cache) > max_keys:
+        try:
+            cache.pop(next(iter(cache)), None)
+        except Exception:
+            pass
+
+
+def _gc_and_log_rss(logger, label: str) -> None:
+    """Periodic GC sweep + RSS log so memory creep is visible in the logs."""
+    try:
+        gc.collect()
+        import psutil
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        logger.info("Memory: %s — RSS %.1f MB after gc", label, rss_mb)
+    except Exception:
+        pass
+
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
@@ -378,9 +443,9 @@ def _fetch_1h_closes(yahoo_symbol: str) -> pd.Series | None:
         close = cached[1]
         return close if close is not None and len(close) >= 35 else None
     try:
-        df = _yf_history(yf.Ticker(yahoo_symbol), period="60d", interval="1h")
+        df = _ytf(yahoo_symbol, period="60d", interval="1h")
         close = df["Close"].dropna() if not df.empty else pd.Series(dtype=float)
-        _macd_1h_cache[yahoo_symbol] = (now, close)
+        _cache_put(_macd_1h_cache, yahoo_symbol, (now, close))
         return close if len(close) >= 35 else None
     except Exception as e:
         log.debug("1H MACD fetch failed for %s: %s", yahoo_symbol, e)
@@ -418,7 +483,7 @@ def _build_mtf_macd(yahoo_symbol: str, df_15m: pd.DataFrame) -> dict[str, Any]:
     m5: dict[str, Any] | None = None
     if FNO_MACD_REQUIRE_5M:
         try:
-            df_5 = _yf_history(yf.Ticker(yahoo_symbol), period="5d", interval="5m")
+            df_5 = _ytf(yahoo_symbol, period="5d", interval="5m")
             if not df_5.empty and len(df_5) >= 35:
                 m5 = _macd_bar_state(
                     df_5["Close"].dropna(), cross_lookback=FNO_MACD_CROSS_LOOKBACK,
@@ -470,7 +535,7 @@ def _get_india_vix() -> float | None:
     if _vix_cache and now - _vix_cache[0] < FNO_YAHOO_CACHE_TTL:
         return _vix_cache[1]
     try:
-        df = _yf_history(yf.Ticker("^INDIAVIX"), period="5d", interval="15m")
+        df = _ytf("^INDIAVIX", period="5d", interval="15m")
         if df.empty:
             return None
         val = float(df["Close"].iloc[-1])
@@ -579,6 +644,7 @@ def _fetch_intraday(
         return tech
 
     out: dict[str, Any] = {"yahoo": yahoo_symbol}
+    t = None
     try:
         t = yf.Ticker(yahoo_symbol)
         df = _yf_history(t, period="5d", interval="15m")
@@ -588,7 +654,7 @@ def _fetch_intraday(
         if df.empty or len(df) < 10:
             if nse_spot is not None:
                 out = _minimal_tech(nse_spot)
-                _intraday_cache[cache_key] = (now, dict(out))
+                _cache_put(_intraday_cache, cache_key, (now, dict(out)))
                 return out
             return out
 
@@ -652,7 +718,7 @@ def _fetch_intraday(
             "bb_lower": round(bb_lower, 2) if bb_lower is not None else None,
             "timeframe": "15m" if use_intraday else "1d",
         })
-        _intraday_cache[cache_key] = (now, dict(out))
+        _cache_put(_intraday_cache, cache_key, (now, dict(out)))
     except Exception as e:
         err = str(e).lower()
         if cached:
@@ -667,9 +733,11 @@ def _fetch_intraday(
                 yahoo_symbol, e,
             )
             out = _minimal_tech(nse_spot)
-            _intraday_cache[cache_key] = (now, dict(out))
+            _cache_put(_intraday_cache, cache_key, (now, dict(out)))
             return out
         log.warning("Intraday fetch failed for %s: %s", yahoo_symbol, e)
+    finally:
+        _close_yf_ticker(t)
     return out
 
 
@@ -689,6 +757,9 @@ def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str
     except Exception as e:
         log.warning("Option chain failed for %s: %s", nse_symbol, e)
         return None
+    finally:
+        if nse is None:
+            _close_nse(client)
 
 
 def _parse_chain_for_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, Any] | None:
@@ -1812,16 +1883,19 @@ def scan_all_indices() -> list[dict[str, Any]]:
     all_signals: list[dict[str, Any]] = []
     cycle_stats = _empty_scan_stats()
     nse = NSELive()
-    for i, cfg in enumerate(FNO_INDICES):
-        try:
-            if i > 0:
-                time.sleep(0.5)
-            sigs, st = scan_index(cfg, nse)
-            all_signals.extend(sigs)
-            for k in cycle_stats:
-                cycle_stats[k] += st[k]
-        except Exception as e:
-            log.exception("Scan failed for %s: %s", cfg["name"], e)
+    try:
+        for i, cfg in enumerate(FNO_INDICES):
+            try:
+                if i > 0:
+                    time.sleep(0.5)
+                sigs, st = scan_index(cfg, nse)
+                all_signals.extend(sigs)
+                for k in cycle_stats:
+                    cycle_stats[k] += st[k]
+            except Exception as e:
+                log.exception("Scan failed for %s: %s", cfg["name"], e)
+    finally:
+        _close_nse(nse)
     _record_scan_stats(cycle_stats)
     return all_signals
 
@@ -2013,14 +2087,17 @@ def filter_entry_payload_for_user(payload: dict[str, Any], chat_id: int) -> dict
 def build_all_entries() -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     nse = NSELive()
-    for i, cfg in enumerate(FNO_INDICES):
-        try:
-            if i > 0:
-                time.sleep(0.5)
-            results.append(analyze_index(cfg, nse))
-        except Exception as e:
-            log.exception("Entry analysis failed for %s: %s", cfg["name"], e)
-            results.append({"name": cfg["name"], "nse": cfg["nse"], "error": str(e)})
+    try:
+        for i, cfg in enumerate(FNO_INDICES):
+            try:
+                if i > 0:
+                    time.sleep(0.5)
+                results.append(analyze_index(cfg, nse))
+            except Exception as e:
+                log.exception("Entry analysis failed for %s: %s", cfg["name"], e)
+                results.append({"name": cfg["name"], "nse": cfg["nse"], "error": str(e)})
+    finally:
+        _close_nse(nse)
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     return {
         "as_of_ist": now.strftime("%Y-%m-%d %H:%M IST"),
@@ -2356,25 +2433,28 @@ def build_eod_summary() -> dict[str, Any] | None:
 
     if pending:
         nse = NSELive()
-        chain_cache: dict[str, dict] = {}
-        for alert in pending:
-            sym = alert["nse_symbol"]
-            if sym not in chain_cache:
-                chain_cache[sym] = _parse_option_chain(sym, nse) or {}
-            rows = chain_cache[sym].get("rows") or []
+        try:
+            chain_cache: dict[str, dict] = {}
+            for alert in pending:
+                sym = alert["nse_symbol"]
+                if sym not in chain_cache:
+                    chain_cache[sym] = _parse_option_chain(sym, nse) or {}
+                rows = chain_cache[sym].get("rows") or []
 
-            close_ltp = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
-            entry = float(alert["entry_premium"] or 0)
-            sl = float(alert["sl_premium"] or entry * SL_MULT)
-            t1 = float(alert["t1_premium"] or entry * T1_MULT)
-            t2 = float(alert["t2_premium"] or entry * T2_MULT)
+                close_ltp = _strike_close_ltp(rows, int(alert["strike"]), alert["side"])
+                entry = float(alert["entry_premium"] or 0)
+                sl = float(alert["sl_premium"] or entry * SL_MULT)
+                t1 = float(alert["t1_premium"] or entry * T1_MULT)
+                t2 = float(alert["t2_premium"] or entry * T2_MULT)
 
-            if close_ltp is None or close_ltp <= 0:
-                outcome, pnl = "NO DATA", 0.0
-                close_ltp = 0.0
-            else:
-                outcome, pnl = _classify_outcome(entry, sl, t1, t2, close_ltp)
-            _update_alert_result(alert["id"], close_ltp, outcome, pnl)
+                if close_ltp is None or close_ltp <= 0:
+                    outcome, pnl = "NO DATA", 0.0
+                    close_ltp = 0.0
+                else:
+                    outcome, pnl = _classify_outcome(entry, sl, t1, t2, close_ltp)
+                _update_alert_result(alert["id"], close_ltp, outcome, pnl)
+        finally:
+            _close_nse(nse)
 
     all_trades = _get_today_alerts(unsummarized_only=False)
     summary = _summary_stats(all_trades)
@@ -3129,7 +3209,11 @@ def format_status_update_html(alert: dict[str, Any], live_prem: float) -> str:
 
 def _fetch_chain_for_sym(sym: str) -> tuple[str, dict[str, Any]]:
     """Fetch option chain for a single symbol (used in parallel threads)."""
-    return sym, _parse_option_chain(sym, NSELive()) or {}
+    client = NSELive()
+    try:
+        return sym, _parse_option_chain(sym, client) or {}
+    finally:
+        _close_nse(client)
 
 
 def check_active_exits() -> list[dict[str, Any]]:
@@ -3371,57 +3455,60 @@ def check_setup_invalidations() -> list[dict[str, Any]]:
     tech_cache: dict[str, dict] = {}
     oi_cache: dict[str, dict] = {}
 
-    for alert in active:
-        sym = alert["nse_symbol"]
+    try:
+        for alert in active:
+            sym = alert["nse_symbol"]
 
-        if sym not in tech_cache:
-            yahoo = _YAHOO_BY_NSE.get(sym)
-            if not yahoo:
+            if sym not in tech_cache:
+                yahoo = _YAHOO_BY_NSE.get(sym)
+                if not yahoo:
+                    continue
+                tech_cache[sym] = _fetch_intraday(
+                    yahoo, nse_only_fallback=_NSE_ONLY_FALLBACK.get(sym, False),
+                )
+
+            if sym not in oi_cache:
+                chain = _parse_option_chain(sym, nse_client)
+                if chain:
+                    cfg = next((c for c in FNO_INDICES if c["nse"] == sym), None)
+                    step = cfg["step"] if cfg else 50
+                    oi_cache[sym] = _oi_analysis(chain["rows"], float(chain["spot"]), step)
+                else:
+                    oi_cache[sym] = {}
+
+            tech = tech_cache[sym]
+            oi = oi_cache[sym]
+
+            reasons = _check_setup_invalidation(alert, tech, oi)
+            if not reasons:
                 continue
-            tech_cache[sym] = _fetch_intraday(
-                yahoo, nse_only_fallback=_NSE_ONLY_FALLBACK.get(sym, False),
-            )
 
-        if sym not in oi_cache:
             chain = _parse_option_chain(sym, nse_client)
+            live_prem = 0.0
             if chain:
-                cfg = next((c for c in FNO_INDICES if c["nse"] == sym), None)
-                step = cfg["step"] if cfg else 50
-                oi_cache[sym] = _oi_analysis(chain["rows"], float(chain["spot"]), step)
-            else:
-                oi_cache[sym] = {}
+                lp = _strike_close_ltp(chain["rows"], int(alert["strike"]), alert["side"])
+                if lp and lp > 0:
+                    live_prem = lp
 
-        tech = tech_cache[sym]
-        oi = oi_cache[sym]
+            _update_exit_status(alert["id"], "INVALIDATED", live_prem)
+            entry = float(alert.get("entry_premium") or 0)
+            pnl = round(live_prem - entry, 2) if live_prem > 0 else 0.0
+            _update_alert_result(alert["id"], live_prem, "SETUP BROKE", pnl)
 
-        reasons = _check_setup_invalidation(alert, tech, oi)
-        if not reasons:
-            continue
-
-        chain = _parse_option_chain(sym, nse_client)
-        live_prem = 0.0
-        if chain:
-            lp = _strike_close_ltp(chain["rows"], int(alert["strike"]), alert["side"])
-            if lp and lp > 0:
-                live_prem = lp
-
-        _update_exit_status(alert["id"], "INVALIDATED", live_prem)
-        entry = float(alert.get("entry_premium") or 0)
-        pnl = round(live_prem - entry, 2) if live_prem > 0 else 0.0
-        _update_alert_result(alert["id"], live_prem, "SETUP BROKE", pnl)
-
-        signals.append({
-            "alert": alert,
-            "level": "INVALIDATED",
-            "reasons": reasons,
-            "live_premium": live_prem,
-            "html": format_invalidation_alert_html(alert, reasons, live_prem),
-        })
-        log.info(
-            "SETUP INVALIDATED: %s %s %s — %s",
-            alert["index_name"], alert["strike"], alert["side"],
-            "; ".join(reasons),
-        )
+            signals.append({
+                "alert": alert,
+                "level": "INVALIDATED",
+                "reasons": reasons,
+                "live_premium": live_prem,
+                "html": format_invalidation_alert_html(alert, reasons, live_prem),
+            })
+            log.info(
+                "SETUP INVALIDATED: %s %s %s — %s",
+                alert["index_name"], alert["strike"], alert["side"],
+                "; ".join(reasons),
+            )
+    finally:
+        _close_nse(nse_client)
 
     return signals
 
@@ -3557,6 +3644,8 @@ async def run_fno_exit_monitor(bot):
                 await _send_trade_update(bot, alert, html_text)
 
             cycle += 1
+            if cycle % 60 == 0:
+                _gc_and_log_rss(log, "fno exit monitor")
             if cycle % 6 == 0:
                 inv_signals = await check_setup_invalidations_async()
                 for inv in inv_signals:
@@ -3582,8 +3671,13 @@ async def run_fno_monitor(bot):
 
     from telegram.error import TelegramError
 
+    cycle = 0
     while True:
         try:
+            cycle += 1
+            if cycle % 6 == 0:
+                _gc_and_log_rss(log, "fno entry scanner")
+
             now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
 
             if not is_market_hours(now_ist):

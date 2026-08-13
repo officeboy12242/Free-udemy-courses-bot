@@ -217,6 +217,7 @@ def _closes_from_history(t: yf.Ticker) -> tuple[float, float] | None:
 
 def _try_snapshot_one_yahoo(yahoo_symbol: str) -> tuple[float, float, float] | None:
     """Return (last, prev_close, pct) or None."""
+    t = None
     try:
         t = yf.Ticker(yahoo_symbol)
         fi = getattr(t, "fast_info", {}) or {}
@@ -248,6 +249,14 @@ def _try_snapshot_one_yahoo(yahoo_symbol: str) -> tuple[float, float, float] | N
     except Exception as e:
         log.debug("Snapshot attempt failed for %s: %s", yahoo_symbol, e)
         return None
+    finally:
+        # yfinance Tickers own a curl_cffi session (libcurl handles + pool)
+        # that must be closed or memory creeps until Render OOM-kills us.
+        if t is not None:
+            try:
+                t.session.close()
+            except Exception:
+                pass
 
 
 def fetch_snapshot(canonical_symbol: str, display_name: str) -> dict[str, Any] | None:
