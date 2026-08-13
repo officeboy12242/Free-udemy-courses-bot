@@ -75,6 +75,8 @@ from market_calendar import (
     market_gate_sleep_seconds,
 )
 
+import fno_ai
+
 load_dotenv()
 
 log = logging.getLogger(__name__)
@@ -101,10 +103,27 @@ FNO_MACD_REQUIRE_5M = os.getenv("FNO_MACD_REQUIRE_5M", "0").strip().lower() in (
 FNO_MACD_CROSS_LOOKBACK = max(1, int(os.getenv("FNO_MACD_CROSS_LOOKBACK", "3")))
 FNO_PAPER_CAPITAL = float(os.getenv("FNO_PAPER_CAPITAL", "50000"))
 
+# Daily capital: you trade from this amount all day — losses carry forward,
+# wins add back. You never reset to the full amount after a loss.
+FNO_DAILY_CAPITAL = float(os.getenv("FNO_DAILY_CAPITAL", "30000"))
+# Profit target band in rupees per trade.
+FNO_PROFIT_TARGET_MIN = float(os.getenv("FNO_PROFIT_TARGET_MIN", "500"))
+FNO_PROFIT_TARGET_MAX = float(os.getenv("FNO_PROFIT_TARGET_MAX", "1000"))
+# SL tolerance: a single tick below SL within this % is treated as a wick (hold),
+# a deeper breach or a second consecutive check below SL confirms the exit.
+FNO_SL_BREACH_TOLERANCE_PCT = float(os.getenv("FNO_SL_BREACH_TOLERANCE_PCT", "4"))
+# Periodic "trade update — hold / book" heartbeat for open trades (minutes).
+FNO_STATUS_UPDATE_MINUTES = int(os.getenv("FNO_STATUS_UPDATE_MINUTES", "15"))
+# AI hold/exit commentary on trade messages (Gemini + Groq fallback).
+FNO_AI_COMMENTARY = os.getenv("FNO_AI_COMMENTARY", "1").strip().lower() in ("1", "true", "yes")
+
 # In-memory cache: yahoo_symbol -> (timestamp, tech dict)
 _intraday_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _vix_cache: tuple[float, float] | None = None
 _macd_1h_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+# SL wick tracking per open alert id (exit monitor, resets on restart).
+_sl_breach_count: dict[int, int] = {}
+_last_status_ts: dict[int, float] = {}
 
 FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "NIFTY", "yahoo": "^NSEI", "name": "Nifty 50",
@@ -116,6 +135,15 @@ FNO_INDICES: list[dict[str, Any]] = [
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
      "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
 ]
+
+# Optional: restrict trading to a subset of indices, e.g. FNO_INDEX_FOCUS=NIFTY.
+# Comma-separated NSE symbols; empty = all indices. Everything downstream
+# (auto-alerts, /entry, /alert prefs, summaries) derives from FNO_INDICES.
+FNO_INDEX_FOCUS: set[str] = {
+    s.strip().upper() for s in os.getenv("FNO_INDEX_FOCUS", "").split(",") if s.strip()
+}
+if FNO_INDEX_FOCUS:
+    FNO_INDICES = [cfg for cfg in FNO_INDICES if cfg["nse"] in FNO_INDEX_FOCUS]
 
 FNO_SL_PCT = float(os.getenv("FNO_SL_PCT", "14"))
 SL_MULT = 1.0 - FNO_SL_PCT / 100.0
@@ -849,6 +877,116 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     return d
 
 
+# ─── Daily capital / profit targets / confidence ─────────────────────────────
+# You trade from FNO_DAILY_CAPITAL all day. Losses carry forward (30k -> 28k),
+# wins add back. Sizing (lots) follows the leftover, so a loss means a smaller
+# next trade instead of a fresh 30k bet.
+
+_CLOSED_OUTCOMES = ("SL LOSS", "SCALP 3%", "SCALP 5%", "SCALP 10%", "T1 WIN", "T2 WIN", "SETUP BROKE")
+
+
+def _daily_capital_state() -> dict[str, Any]:
+    """Day capital ledger: start / realized P&L / remaining after today's closed safe picks.
+
+    ponytail: the sqlite fallback cannot distinguish safe vs aggressive picks, so
+    both count there; MongoDB (production) counts safe picks only, since the
+    aggressive pick is an alternative strike for the same trade, not a second
+    position.
+    """
+    alerts = _get_today_alerts(unsummarized_only=False)
+    alerts = [
+        a for a in alerts
+        if (a.get("outcome") or "") in _CLOSED_OUTCOMES
+        and a.get("pnl_pts") is not None
+        and (a.get("pick_type", "safe") == "safe")
+    ]
+    pnl_rs = 0.0
+    for a in sorted(alerts, key=lambda x: int(x.get("id") or 0)):
+        entry = float(a.get("entry_premium") or 0)
+        lot = _lot_size(a.get("nse_symbol") or "")
+        lots = _recommended_lots(entry, lot, FNO_DAILY_CAPITAL) if entry > 0 else 0
+        pnl_rs += float(a["pnl_pts"]) * lot * lots
+    return {
+        "start": FNO_DAILY_CAPITAL,
+        "pnl_rs": round(pnl_rs, 2),
+        "remaining": round(max(FNO_DAILY_CAPITAL + pnl_rs, 0.0), 2),
+    }
+
+
+def _capital_line_html(cap: dict[str, Any] | None = None) -> str:
+    cap = cap or _daily_capital_state()
+    return (
+        f"\U0001f4b0 <b>Day capital:</b> \u20b9{cap['start']:,.0f} "
+        f"\u2192 <b>\u20b9{cap['remaining']:,.0f} left</b> "
+        f"<i>(closed P&L {cap['pnl_rs']:+,.0f} \u20b9)</i>"
+    )
+
+
+def _recommended_lots(entry_premium: float, lot_size: int, remaining_capital: float | None = None) -> int:
+    """Smallest lot count that reaches the \u20b9 profit band, capped by capital left.
+
+    Keeps per-trade profit in the FNO_PROFIT_TARGET_MIN..MAX band instead of
+    maxing out every rupee of the day pool.
+    """
+    if entry_premium <= 0 or lot_size <= 0:
+        return 0
+    cap = remaining_capital if remaining_capital is not None else _daily_capital_state()["remaining"]
+    ex = _scalp_exits(entry_premium, lot_size)
+    t2_per_lot = ex["t2_rs"]
+    lots = 1
+    if t2_per_lot > 0 and t2_per_lot < FNO_PROFIT_TARGET_MIN:
+        lots = max(1, math.ceil(FNO_PROFIT_TARGET_MIN / t2_per_lot))
+    afford = max(1, _lots_for_capital(max(cap, 0), entry_premium, lot_size))
+    return min(lots, afford)
+
+
+_STRATEGY_BASE_WIN: dict[str, float] = {
+    STRATEGY_CONFLUENCE: 66,
+    STRATEGY_MACD_MTF: 69,
+    STRATEGY_ORB: 62,
+    STRATEGY_PCR_REVERSAL: 61,
+    STRATEGY_MEAN_REV: 58,
+}
+
+
+def _confidence_pct(strategy: str, quality_score: float | None = None, alert_ready: bool | None = None) -> int:
+    """Win-probability estimate from the strategy's edge + this setup's quality score."""
+    base = _STRATEGY_BASE_WIN.get(strategy, 60)
+    adj = 0.0
+    if quality_score is not None:
+        adj += (float(quality_score) - 55) * 0.4
+    if alert_ready is True:
+        adj += 3
+    elif alert_ready is False:
+        adj -= 3
+    return int(max(40, min(92, round(base + adj))))
+
+
+def _confidence_html(strategy: str, quality_score: float | None = None, alert_ready: bool | None = None) -> str:
+    p = _confidence_pct(strategy, quality_score, alert_ready)
+    label = "HIGH" if p >= 75 else ("MEDIUM" if p >= 62 else "LOW")
+    return (
+        f"\U0001f4ca Win confidence: <b>{p}%</b> \u00b7 Loss risk: <b>{100 - p}%</b> "
+        f"<i>({label})</i>"
+    )
+
+
+def _profit_target_line(entry_premium: float, lot_size: int, remaining_capital: float | None = None) -> str:
+    """Target line in \u20b9 sized to the day capital left, aiming at the profit band."""
+    if entry_premium <= 0 or lot_size <= 0:
+        return ""
+    cap = remaining_capital if remaining_capital is not None else _daily_capital_state()["remaining"]
+    lots = _recommended_lots(entry_premium, lot_size, cap)
+    ex = _scalp_exits(entry_premium, lot_size)
+    t1_rs = ex["t1_rs"] * lots
+    t2_rs = ex["t2_rs"] * lots
+    return (
+        f"\U0001f3af Profit target \u20b9{FNO_PROFIT_TARGET_MIN:,.0f}\u2013\u20b9{FNO_PROFIT_TARGET_MAX:,.0f}: "
+        f"T1 <b>\u20b9{t1_rs:,.0f}</b> \u00b7 T2 <b>\u20b9{t2_rs:,.0f}</b> "
+        f"<i>({lots} lot{'s' if lots != 1 else ''})</i>"
+    )
+
+
 def _exit_targets_html(ex: dict[str, float], *, book_hints: bool = True) -> str:
     """Quick 3-5-10% scalp levels + T1/T2/SL block for alerts and /entry."""
     p3 = ex.get("s3_pct", FNO_SCALP_T3_PCT)
@@ -1516,6 +1654,7 @@ def _skip_reason_label(reason: str | None) -> str:
         "ema_data_missing": "EMA data missing (can't confirm trend)",
         "weak_confluence": f"Fewer than {FNO_CONFLUENCE_MIN_LAYERS}/4 confluence layers",
         "already_alerted": "Index+side already alerted today",
+        "all_alerted": "All setups already alerted today — no fresh entry",
         "no_setup": "No strategy triggered",
         "daily_cap_winning": f"Win rate >{FNO_WIN_RATE_CAP_PCT:.0f}% with {FNO_MAX_DAILY_ALERTS}+ trades -- capped",
         "low_quality_score": f"Quality score below {FNO_MIN_QUALITY_SCORE}",
@@ -1798,13 +1937,42 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
         }))
 
     if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best = candidates[0][1]
+        # /entry should give a NEW suggestion — never echo back a setup that was
+        # already alerted today. Prefer the best fresh candidate; if every
+        # triggered setup is stale, say so instead of re-offering it.
+        fresh = [c for c in candidates if c[1].get("skip_reason") != "already_alerted"]
+        if fresh:
+            fresh.sort(key=lambda x: x[0], reverse=True)
+            best = fresh[0][1]
+            return {
+                "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
+                "spot": round(spot, 2), "tech": tech, "oi": oi,
+                **best,
+                "all_triggered": all_triggered,
+            }
+
+        day_pct = float(tech.get("pct_change") or 0)
+        stale_side = "CE" if day_pct >= 0 else "PE"
+        stale_strike, stale_leg = _pick_scalp_strike(
+            rows, spot, cfg["step"], stale_side, cfg["prem_min"], cfg["prem_max"],
+        )
+        stale_prem = float(stale_leg.get("ltp") or 0)
         return {
             "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
             "spot": round(spot, 2), "tech": tech, "oi": oi,
-            **best,
+            "strategy": "No fresh setup", "side": stale_side, "strength": "STALE",
+            "layers": "0/4",
+            "reasons": ["All setups already alerted today — wait for a fresh setup"],
+            "win_rate": "N/A",
             "all_triggered": all_triggered,
+            "strike": stale_strike, "premium": round(stale_prem, 2),
+            "leg_oi": stale_leg.get("oi", 0), "leg_chg_oi": stale_leg.get("chg_oi", 0),
+            "leg_volume": stale_leg.get("volume", 0),
+            "exits": _scalp_exits(stale_prem, cfg.get("lot", 0)),
+            "aggressive": None,
+            "alert_ready": False,
+            "skip_reason": "all_alerted",
+            "skip_label": _skip_reason_label("all_alerted"),
         }
 
     day_pct = float(tech.get("pct_change") or 0)
@@ -1854,7 +2022,11 @@ def build_all_entries() -> dict[str, Any]:
             log.exception("Entry analysis failed for %s: %s", cfg["name"], e)
             results.append({"name": cfg["name"], "nse": cfg["nse"], "error": str(e)})
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    return {"as_of_ist": now.strftime("%Y-%m-%d %H:%M IST"), "indices": results}
+    return {
+        "as_of_ist": now.strftime("%Y-%m-%d %H:%M IST"),
+        "indices": results,
+        "capital": _daily_capital_state(),
+    }
 
 
 async def build_all_entries_async() -> dict[str, Any]:
@@ -1941,6 +2113,11 @@ def format_alert_html(signal: dict[str, Any], refs: list[dict[str, Any]] | None 
     is_sideways = bool(signal.get("sideways"))
     alert_tag = "\u2194\ufe0f <b>SIDEWAYS MARKET ALERT</b> \u2194\ufe0f" if is_sideways else f"{strat_emoji} <b>TRADE ALERT</b> {strat_emoji}"
 
+    cap = _daily_capital_state()
+    conf_line = _confidence_html(signal.get("strategy", ""), signal.get("quality_score"), signal.get("alert_ready", True))
+    tgt_line = _profit_target_line(float(ex["entry"]), _lot_size(signal.get("nse", "")), cap["remaining"])
+    cap_line = _capital_line_html(cap)
+
     return (
         f"{alert_tag}\n"
         f"\n"
@@ -1966,6 +2143,10 @@ def format_alert_html(signal: dict[str, Any], refs: list[dict[str, Any]] | None 
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
+        f"{conf_line}\n"
+        f"{tgt_line}\n"
+        f"{cap_line}\n"
+        f"\n"
         f"<b>Why this setup:</b>\n"
         f"{reasons_html}\n"
         f"{_format_aggressive_html(signal, side)}"
@@ -1975,7 +2156,7 @@ def format_alert_html(signal: dict[str, Any], refs: list[dict[str, Any]] | None 
     )
 
 
-def _format_one_index_html(r: dict[str, Any]) -> str:
+def _format_one_index_html(r: dict[str, Any], capital: dict[str, Any] | None = None) -> str:
     """Format one index block for the /entry sheet."""
     name = html.escape(r["name"])
     nse = html.escape(r["nse"])
@@ -1991,6 +2172,9 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
     tech = r["tech"]
     oi_data = r["oi"]
     ex = r["exits"]
+    cap = capital or _daily_capital_state()
+    conf_line = _confidence_html(r.get("strategy", ""), r.get("quality_score"), r.get("alert_ready"))
+    tgt_line = _profit_target_line(float(ex["entry"]), _lot_size(r.get("nse", "")), cap["remaining"])
     vwap = tech.get("vwap")
     vwap_str = f"<code>{vwap}</code>" if vwap else "N/A"
     adx = tech.get("adx")
@@ -2043,6 +2227,9 @@ def _format_one_index_html(r: dict[str, Any]) -> str:
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
+        f"{conf_line}\n"
+        f"{tgt_line}\n"
+        f"\n"
         f"{reasons_html}\n"
         f"{_format_aggressive_html(r, side)}"
     )
@@ -2056,16 +2243,18 @@ def format_entry_telegram(payload: dict[str, Any]) -> str:
 
 
 def format_entry_telegram_html(payload: dict[str, Any]) -> str:
+    cap = payload.get("capital") or _daily_capital_state()
     parts = [
         "<b>\u26a1 INDEX OPTIONS \u2014 SCALP SHEET</b>",
         "<b>Strategies:</b> Confluence + ORB + PCR + MACD MTF",
         f"<i>Updated {html.escape(payload['as_of_ist'])}</i>",
+        _capital_line_html(cap),
         "",
         "Quick book +5% / +10% \u00b7 then 50% at T1 (+20%) \u00b7 trail rest to T2 (+35%) \u00b7 hard SL",
         "",
     ]
     for r in payload["indices"]:
-        parts.append(_format_one_index_html(r))
+        parts.append(_format_one_index_html(r, capital=cap))
     parts.append(
         "<i>\u26a0\ufe0f Scalping only \u00b7 Not advice \u00b7 "
         "\u2705 setups pass same filters as auto-alerts</i>"
@@ -2724,6 +2913,7 @@ def format_trade_list_html(
     lines = [
         f"<b>\U0001f4ca TODAY'S TRADES</b>",
         f"<i>{len(alerts)} total  \u00b7  {open_n} open</i>",
+        _capital_line_html(),
         "",
     ]
     for a in alerts:
@@ -2806,10 +2996,14 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
     strategy = html.escape(alert.get("strategy") or "")
     strike = alert.get("strike") or ""
     lot = _lot_size(alert.get("nse_symbol") or "")
-    lots = _lots_for_capital(FNO_PAPER_CAPITAL, entry, lot) if entry > 0 else 0
+    lots = _recommended_lots(entry, lot) if entry > 0 else 0
     pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
     pnl_sign = "+" if pnl >= 0 else ""
     rs_str = f"  (\u20b9{pnl_rs:+,.0f})" if lots > 0 else ""
+    cap = _daily_capital_state()
+    conf_line = _confidence_html(alert.get("strategy", ""))
+    tgt_line = _profit_target_line(entry, lot, cap["remaining"])
+    cap_line = _capital_line_html(cap)
 
     if level == "SL":
         emoji = "\U0001f6a8"
@@ -2855,9 +3049,81 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
         f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
         f"\n"
+        f"{conf_line}\n"
+        f"{tgt_line}\n"
+        f"{cap_line}\n"
+        f"\n"
         f"\U0001f4a1 <b>{action}</b>\n"
         f"\n"
         f"<i>\u26a0\ufe0f Paper trade \u00b7 Not financial advice</i>"
+    )
+
+
+def format_sl_touch_html(alert: dict[str, Any], live_prem: float, breaches: int) -> str:
+    """SL got ticked but within tolerance — HOLD guidance instead of panic exit."""
+    entry = float(alert.get("entry_premium") or 0)
+    sl = float(alert.get("sl_premium") or entry * SL_MULT)
+    lot = _lot_size(alert.get("nse_symbol") or "")
+    cap = _daily_capital_state()
+    lots = _recommended_lots(entry, lot)
+    pnl = round(live_prem - entry, 2)
+    pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
+    pnl_sign = "+" if pnl_rs >= 0 else ""
+    return (
+        f"\u26a0\ufe0f <b>SL TOUCHED \u2014 HOLD CHECK</b> \u26a0\ufe0f\n"
+        f"{_format_exit_trace_html(alert)}"
+        f"\n"
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+        f"\u2502  Entry:   <b>{_ru(entry)}</b>\n"
+        f"\u2502  Now:     <b>{_ru(live_prem)}</b>\n"
+        f"\u2502  SL:      <b>{_ru(sl)}</b>\n"
+        f"\u2502  P&amp;L:    <b>{pnl_sign}{pnl:.2f} pts</b> (\u20b9{pnl_rs:+,.0f})\n"
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
+        f"\n"
+        f"\U0001f4a1 <b>Don't panic-close.</b> A single tick below SL is often a wick.\n"
+        f"<b>HOLD.</b> Exit only if it stays below <b>{_ru(sl)}</b> on the next check "
+        f"or drops {FNO_SL_BREACH_TOLERANCE_PCT:.0f}%+ below it. "
+        f"Recovery above SL = keep holding.\n"
+        f"\n"
+        f"{_capital_line_html(cap)}\n"
+        f"<i>\u26a0\ufe0f Scalping only \u00b7 Not advice</i>"
+    )
+
+
+def format_status_update_html(alert: dict[str, Any], live_prem: float) -> str:
+    """Periodic hold/book status for an open trade."""
+    entry = float(alert.get("entry_premium") or 0)
+    sl = float(alert.get("sl_premium") or entry * SL_MULT)
+    t1 = float(alert.get("t1_premium") or entry * T1_MULT)
+    lot = _lot_size(alert.get("nse_symbol") or "")
+    cap = _daily_capital_state()
+    lots = _recommended_lots(entry, lot)
+    pnl = round(live_prem - entry, 2)
+    pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
+    pnl_sign = "+" if pnl_rs >= 0 else ""
+    to_sl = round(live_prem - sl, 2)
+    to_t1 = round(t1 - live_prem, 2)
+    return (
+        f"\U0001f7e2 <b>TRADE UPDATE \u2014 HOLDING</b>\n"
+        f"{_format_exit_trace_html(alert)}"
+        f"\n"
+        f"\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n"
+        f"\u2502  Entry:   <b>{_ru(entry)}</b>\n"
+        f"\u2502  Now:     <b>{_ru(live_prem)}</b>\n"
+        f"\u2502  P&amp;L:    <b>{pnl_sign}{pnl:.2f} pts</b> (\u20b9{pnl_rs:+,.0f})\n"
+        f"\u2502  To SL:   {to_sl:+.2f} pts  \u00b7  To T1: {to_t1:+.2f} pts\n"
+        f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n"
+        f"\n"
+        f"\U0001f4a1 <b>Plan:</b> hold while above SL {_ru(sl)}. "
+        f"Book 30% at +5%, 50% at T1, trail the rest to T2. "
+        f"If SL gets ticked, I'll warn you \u2014 don't exit on the first tick.\n"
+        f"\n"
+        f"{_capital_line_html(cap)}\n"
+        f"<i>\u26a0\ufe0f Scalping only \u00b7 Not advice</i>"
     )
 
 
@@ -2899,6 +3165,8 @@ def check_active_exits() -> list[dict[str, Any]]:
             continue
 
         entry = float(alert.get("entry_premium") or 0)
+        aid = int(alert["id"])
+        sl = float(alert.get("sl_premium") or entry * SL_MULT)
         s5 = float(alert.get("s5_premium") or entry * 1.05)
         log.info(
             "Exit monitor: %s %s%s entry=%.2f live=%.2f s5=%.2f (%.1f%%)",
@@ -2906,11 +3174,54 @@ def check_active_exits() -> list[dict[str, Any]]:
             ((live - entry) / entry * 100) if entry > 0 else 0,
         )
 
-        hit = _check_exit_level(alert, live)
-        if hit is None:
-            continue
+        # SL handling: a single tick below SL within tolerance is a wick — warn
+        # and HOLD. Exit only on a deeper breach or a 2nd consecutive check below
+        # SL. Recovery above SL resets the counter.
+        if live <= sl:
+            tolerance_low = sl * (1.0 - FNO_SL_BREACH_TOLERANCE_PCT / 100.0)
+            breaches = _sl_breach_count.get(aid, 0)
+            if live >= tolerance_low and breaches < 1:
+                # First wick below SL - warn and HOLD; exit on the next check
+                # if it is still below SL (or on a deeper breach).
+                _sl_breach_count[aid] = 1
+                _last_status_ts[aid] = time.time()
+                exit_signals.append({
+                    "alert": alert,
+                    "level": "SL_TOUCH",
+                    "outcome": None,
+                    "live_premium": live,
+                    "pnl": round(live - entry, 2),
+                    "breaches": 1,
+                    "html": format_sl_touch_html(alert, live, 1),
+                })
+                log.info(
+                    "SL TOUCHED (wick, hold): %s %s %s live=%.2f sl=%.2f",
+                    sym, alert["strike"], alert["side"], live, sl,
+                )
+                continue
+            # Confirmed: still below SL on the next check, or a deep breach.
+            _sl_breach_count.pop(aid, None)
+            hit = ("SL", "SL LOSS", round(live - entry, 2))
+        else:
+            if _sl_breach_count.pop(aid, None):
+                log.info("SL wick recovered for alert %s — continuing to hold", aid)
+            hit = _check_exit_level(alert, live)
+            if hit is None:
+                now = time.time()
+                if now - _last_status_ts.get(aid, 0) >= FNO_STATUS_UPDATE_MINUTES * 60:
+                    _last_status_ts[aid] = now
+                    exit_signals.append({
+                        "alert": alert,
+                        "level": "STATUS",
+                        "outcome": None,
+                        "live_premium": live,
+                        "pnl": round(live - entry, 2),
+                        "html": format_status_update_html(alert, live),
+                    })
+                continue
 
         level, outcome, pnl = hit
+        _last_status_ts.pop(aid, None)
         _update_exit_status(alert["id"], level, live)
         _update_alert_result(alert["id"], live, outcome, pnl)
 
@@ -3021,7 +3332,7 @@ def format_invalidation_alert_html(
     pnl = round(live_prem - entry, 2)
     pnl_sign = "+" if pnl >= 0 else ""
     lot = _lot_size(alert.get("nse_symbol") or "")
-    lots = _lots_for_capital(FNO_PAPER_CAPITAL, entry, lot) if entry > 0 else 0
+    lots = _recommended_lots(entry, lot) if entry > 0 else 0
     pnl_rs = round(pnl * lot * lots, 0) if lots > 0 else 0
     rs_str = f"  (\u20b9{pnl_rs:+,.0f})" if lots > 0 else ""
 
@@ -3187,6 +3498,31 @@ async def _send_trade_update(bot, alert: dict[str, Any], html_text: str) -> None
                 remove_subscriber(cid)
 
 
+async def _ai_commentary_line(
+    alert: dict[str, Any], level: str, live_premium: float | None, breaches: int = 0,
+) -> str:
+    """Best-effort AI hold/exit insight appended to a trade update message."""
+    try:
+        entry = float(alert.get("entry_premium") or 0)
+        cap = _daily_capital_state()
+        lot = _lot_size(alert.get("nse_symbol") or "")
+        lots = _recommended_lots(entry, lot)
+        pnl_rs = round((float(live_premium or 0) - entry) * lot * lots, 0) if entry > 0 else 0
+        kind = "sl_touch" if level == "SL_TOUCH" else ("status" if level == "STATUS" else "exit")
+        txt = await fno_ai.ai_trade_commentary(
+            kind,
+            name=alert.get("index_name"), side=alert.get("side"),
+            strike=alert.get("strike"), strategy=alert.get("strategy"),
+            spot=alert.get("spot_at_entry"),
+            entry=entry, live=live_premium, sl=alert.get("sl_premium"),
+            pnl_rs=pnl_rs, capital=cap["remaining"], breaches=breaches,
+        )
+        return f"\n\n\U0001f916 {html.escape(txt)}" if txt else ""
+    except Exception as e:
+        log.debug("AI commentary skipped: %s", e)
+        return ""
+
+
 async def run_fno_exit_monitor(bot):
     """Fast loop: check exit levels every ~10s for active alerts (SL/targets/scalps).
 
@@ -3210,14 +3546,27 @@ async def run_fno_exit_monitor(bot):
             exit_signals = await check_active_exits_async()
             for ex_sig in exit_signals:
                 alert = ex_sig["alert"]
-                await _send_trade_update(bot, alert, ex_sig["html"])
+                html_text = ex_sig["html"]
+                if FNO_AI_COMMENTARY:
+                    ai = await _ai_commentary_line(
+                        alert, ex_sig.get("level") or "",
+                        ex_sig.get("live_premium"), ex_sig.get("breaches", 0),
+                    )
+                    if ai:
+                        html_text += ai
+                await _send_trade_update(bot, alert, html_text)
 
             cycle += 1
             if cycle % 6 == 0:
                 inv_signals = await check_setup_invalidations_async()
                 for inv in inv_signals:
                     alert = inv["alert"]
-                    await _send_trade_update(bot, alert, inv["html"])
+                    html_text = inv["html"]
+                    if FNO_AI_COMMENTARY:
+                        ai = await _ai_commentary_line(alert, "exit", inv.get("live_premium"), 0)
+                        if ai:
+                            html_text += ai
+                    await _send_trade_update(bot, alert, html_text)
 
         except Exception as e:
             log.exception("FnO exit monitor error: %s", e)
@@ -3247,6 +3596,15 @@ async def run_fno_monitor(bot):
                 for sig in signals:
                     refs = _record_alerts_for_signal(sig)
                     text = format_alert_html(sig, refs=refs)
+                    if FNO_AI_COMMENTARY:
+                        ai = await fno_ai.ai_trade_commentary(
+                            "entry",
+                            name=sig.get("name"), side=sig.get("side"),
+                            strike=sig.get("strike"), strategy=sig.get("strategy"),
+                            spot=sig.get("spot"), entry=sig.get("premium"),
+                        )
+                        if ai:
+                            text += f"\n\n\U0001f916 {html.escape(ai)}"
                     await _send_entry_alerts(bot, sig["nse"], text, refs)
                     agg = sig.get("aggressive")
                     ref_str = ", ".join(_trade_ref(r["id"]) for r in refs)
