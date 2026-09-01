@@ -195,6 +195,10 @@ def _get(url: str, retries: int = 2, **kwargs) -> requests.Response:
         except Exception as exc:
             last_exc = exc
             log.warning("_get %s → %s: %s (attempt %d)", url, type(exc).__name__, exc, attempt + 1)
+            # Reset session on connection errors (DNS, reset, timeout) so
+            # a stale socket doesn't poison every retry attempt.
+            _sessions.pop(host, None)
+            session = _session_for(host)
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
 
@@ -2350,16 +2354,26 @@ def _title_matches_query(title: str, query: str) -> bool:
     title_words = re.findall(r"[a-z0-9]+", title_l)
 
     def _token_matches(tok: str) -> bool:
+        # Exact substring match (most reliable)
         if tok in title_l:
             return True
-        if len(tok) < 4:
-            return False
+        # Substring match against individual title words
         for word in title_words:
-            if len(word) < 3:
-                continue
-            if SequenceMatcher(None, tok, word).ratio() >= 0.85:
+            if tok in word or word in tok:
                 return True
+        # Fuzzy match with lowered threshold (0.75) for typo tolerance
+        if len(tok) >= 3:
+            for word in title_words:
+                if len(word) < 3:
+                    continue
+                if SequenceMatcher(None, tok, word).ratio() >= 0.75:
+                    return True
         return False
+
+    # Lenient mode: if the full query (lowered) appears in the title, accept
+    query_full = " ".join(tokens)
+    if query_full in title_l:
+        return True
 
     return all(_token_matches(tok) for tok in tokens)
 
@@ -2566,8 +2580,35 @@ def hdhub_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
     return movies
 
 
+def _hdhub_search_wp(query: str, limit: int = 10) -> list[dict]:
+    """Fallback: WordPress ?s= search on HDHub4u site."""
+    try:
+        url = f"{HDHUB_BASE}/?s={urllib.parse.quote_plus(query)}"
+        resp = _get(url, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        movies: list[dict] = []
+        for li in soup.select("ul.recent-movies li.thumb"):
+            if len(movies) >= limit:
+                break
+            img = li.find("img", src=True)
+            fig = li.find("figcaption")
+            a   = li.find("a", href=True)
+            if not (a and fig):
+                continue
+            title  = fig.get_text(strip=True)
+            href   = a["href"]
+            poster = _hdhub_clean_poster(img.get("src", "")) if img else ""
+            if title and href and _title_matches_query(title, query):
+                movies.append({"title": title, "url": href, "poster": poster})
+        return movies
+    except Exception as exc:
+        log.warning("hdhub_search wp ?s= fallback failed for '%s': %s", query, exc)
+        return []
+
+
 def hdhub_search(query: str, limit: int = 10, *, fast: bool = False) -> list[dict]:
-    """Search HDHub4u via Typesense proxy, then recent-page scan fallback."""
+    """Search HDHub4u via Typesense proxy, then WP ?s=, then recent-page scan."""
     q = (query or "").strip()
     if not q:
         return []
@@ -2577,6 +2618,18 @@ def hdhub_search(query: str, limit: int = 10, *, fast: bool = False) -> list[dic
     if movies:
         return movies
 
+    # Fallback 1: WordPress ?s= search (full archive, not just recent)
+    wp_movies = _hdhub_search_wp(q, limit)
+    if wp_movies:
+        if ts_error:
+            _notify_hdhub_search_broken(
+                q,
+                f"Typesense failed ({ts_error}); using WP ?s= fallback",
+                severity="warn",
+            )
+        return wp_movies
+
+    # Fallback 2: scan recent listing pages (older titles may not appear)
     scan_pages = 2 if fast else 8
     fallback = _hdhub_search_latest_scan(q, limit, max_pages=scan_pages)
     if fallback:
@@ -2589,9 +2642,9 @@ def hdhub_search(query: str, limit: int = 10, *, fast: bool = False) -> list[dic
         return fallback
 
     if ts_error:
-        reason = f"Typesense failed ({ts_error}) and latest-page scan found nothing"
+        reason = f"Typesense failed ({ts_error}), WP ?s= and latest-page scan found nothing"
     else:
-        reason = "Typesense returned no hits and latest-page scan found nothing"
+        reason = "Typesense returned no hits, WP ?s= and latest-page scan found nothing"
     _notify_hdhub_search_broken(q, reason)
     return []
 
@@ -3704,7 +3757,7 @@ MOVIES_API_LINK_TIMEOUT = max(5, int(os.getenv("MOVIES_API_LINK_TIMEOUT", "12"))
 MOVIES_API_CACHE_TTL = max(0, int(os.getenv("MOVIES_API_CACHE_TTL", "300")))
 MOVIES_API_MAX_WORKERS = max(2, min(16, int(os.getenv("MOVIES_API_MAX_WORKERS", "12"))))
 MOVIES_API_SKIP_UNHEALTHY_SECONDS = max(
-    60, int(os.getenv("MOVIES_API_SKIP_UNHEALTHY_SECONDS", "1800")),
+    60, int(os.getenv("MOVIES_API_SKIP_UNHEALTHY_SECONDS", "300")),  # 5 min default (was 30 min)
 )
 _api_cache: dict[str, tuple[float, Any]] = {}
 _site_api_skip_until: dict[str, float] = {}
@@ -5018,8 +5071,9 @@ async def _process_site_health_rows(bot: Any, chat_id: int, rows: list[dict[str,
         redirected = bool(row.get("redirected"))
         streak = _site_fail_streak.get(key, 0) + 1
         _site_fail_streak[key] = streak
-        # Don't let broken/stale domains slow the movies API
-        if streak >= 1:
+        # Only skip sources after 3+ consecutive health-check failures
+        # (avoids blocking sources due to transient DNS/outage blips)
+        if streak >= 3:
             mark_site_api_skip(key)
         # Redirects are definitive — alert on first detection; hard failures need 2 in a row
         if streak < (1 if redirected else 2):
