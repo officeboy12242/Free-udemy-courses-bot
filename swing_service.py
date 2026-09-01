@@ -199,17 +199,22 @@ def get_sizing_summary() -> dict:
 
 
 def _get_db():
-    """Lazy MongoDB connection (same pattern as user_enroller)."""
+    """Get MongoDB database connection (lazy, same pattern as user_enroller)."""
     global _client, _db
     if not MONGODB_URI:
         raise ValueError("MONGODB_URI not set")
+
+    # Check if connection is healthy
     if _client is not None:
         try:
             _client.admin.command("ping")
             return _db
         except Exception:
+            log.warning("Swing: MongoDB connection lost, reconnecting...")
             _client = None
             _db = None
+
+    # Try with certifi
     try:
         import certifi
         from pymongo import MongoClient
@@ -219,12 +224,32 @@ def _get_db():
             serverSelectionTimeoutMS=10000,
             connectTimeoutMS=10000,
             socketTimeoutMS=10000,
+            retryWrites=True, retryReads=True,
         )
-        _db = _client.get_default_database()
-        log.info("Swing: MongoDB connected")
+        _client.admin.command("ping")
+        _db = _client.udemy_enroller
+        log.info("Swing: MongoDB connected (certifi)")
         return _db
-    except Exception as e:
-        log.error("Swing MongoDB error: %s", e)
+    except Exception as e1:
+        log.warning("Swing: certifi connection failed: %s", e1)
+
+    # Fallback: tlsAllowInvalidCertificates
+    try:
+        from pymongo import MongoClient
+        _client = MongoClient(
+            MONGODB_URI,
+            tls=True, tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+            retryWrites=True, retryReads=True,
+        )
+        _client.admin.command("ping")
+        _db = _client.udemy_enroller
+        log.info("Swing: MongoDB connected (insecure TLS)")
+        return _db
+    except Exception as e2:
+        log.error("Swing: all MongoDB connection attempts failed: %s", e2)
         raise
 
 
@@ -908,6 +933,8 @@ def run_paper_scan() -> dict:
     4. Return summary of actions taken.
     """
     db = _get_db()
+    if db is None:
+        return {"closed": [], "opened": [], "already_open": [], "scan_failed": True}
     _ensure_indexes()
     actions = {
         "closed": [],
@@ -981,6 +1008,10 @@ def run_paper_scan() -> dict:
 def get_paper_portfolio() -> dict:
     """Get current paper portfolio with unrealized P&L."""
     db = _get_db()
+    if db is None:
+        return {"open": [], "total_unrealized": 0, "total_invested": 0,
+                "closed_count": 0, "closed_wins": 0, "closed_losses": 0,
+                "total_realized": 0, "recent_closed": []}
     open_trades = list(db.swing_trades.find({"status": "open"}).sort("entered_at", -1))
     closed_trades = list(db.swing_trades.find({"status": "closed"}).sort("exited_at", -1).limit(50))
 
