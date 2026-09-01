@@ -56,11 +56,11 @@ MIN_MARKET_CAP_CR = 5000 # Filter penny / micro caps
 MAX_POSITIONS = 5        # Max concurrent positions
 CAPITAL = 100_000        # ₹1 Lakh
 POSITION_PCT = 0.20      # Max 20% per batch = ₹20,000 across 5 stocks
-SL_PCT = 0.03            # 3% stop-loss (wider for 15-20 day holds)
-TARGET_PRIMARY = 0.04    # 4% primary target
-TARGET_SECONDARY = 0.07  # 7% secondary target
+SL_PCT = 0.035           # 3.5% stop-loss (optimized)
+TARGET_PRIMARY = 0.06    # 6% primary target (optimized)
+TARGET_SECONDARY = 0.08  # 8% secondary target (optimized)
 TIME_STOP_DAYS = 20      # Exit if no target hit in 20 days
-TRAILING_STOP_PCT = 0.02 # Trail at 2% below peak after T1
+TRAILING_STOP_PCT = 0.015 # 1.5% trailing stop after T1 (tighter = locks profits)
 
 # Position sizing ranges based on win rate
 # (min_alloc_pct, max_alloc_pct) of capital per stock
