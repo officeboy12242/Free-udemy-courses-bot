@@ -56,10 +56,11 @@ MIN_MARKET_CAP_CR = 5000 # Filter penny / micro caps
 MAX_POSITIONS = 5        # Max concurrent positions
 CAPITAL = 100_000        # ₹1 Lakh
 POSITION_PCT = 0.20      # Max 20% per batch = ₹20,000 across 5 stocks
-SL_PCT = 0.02            # 2% stop-loss
-TARGET_PRIMARY = 0.03    # 3% primary target
-TARGET_SECONDARY = 0.05  # 5% secondary target
-TIME_STOP_DAYS = 10      # Exit if no target hit in 10 days
+SL_PCT = 0.03            # 3% stop-loss (wider for 15-20 day holds)
+TARGET_PRIMARY = 0.04    # 4% primary target
+TARGET_SECONDARY = 0.07  # 7% secondary target
+TIME_STOP_DAYS = 20      # Exit if no target hit in 20 days
+TRAILING_STOP_PCT = 0.02 # Trail at 2% below peak after T1
 
 # Position sizing ranges based on win rate
 # (min_alloc_pct, max_alloc_pct) of capital per stock
@@ -373,77 +374,71 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     score = 0.0
     reasons = []
 
-    # ── RSI oversold bounce (max 25 pts) ──
-    if rsi < RSI_OVERSOLD:
-        score += 25
-        reasons.append(f"RSI oversold ({rsi:.0f})")
-    elif rsi < 40:
-        score += 15
-        reasons.append(f"RSI low ({rsi:.0f})")
-    elif rsi < 45:
-        score += 8
-        reasons.append(f"RSI neutral-low ({rsi:.0f})")
+    # ── RULE: Must be in uptrend (above 200 EMA) — MANDATORY ──
+    if price < ema200:
+        return None
 
-    # RSI turning up from oversold = bonus
+    # ── RULE: Not in a crash (no >5% drop in 3 days) ──
+    if len(df) >= 4:
+        recent_3d_return = (price - float(df.iloc[-4]["Close"])) / float(df.iloc[-4]["Close"])
+        if recent_3d_return < -0.05:
+            return None
+
+    # ── RSI reversal confirmation (max 30 pts) ──
+    # RSI was below 42 within last 5 days AND is now turning up
+    rsi_was_low_recent = any(
+        float(df.iloc[-j].get("RSI", 50)) < 42
+        for j in range(2, min(7, len(df)))
+    )
     prev_rsi = float(prev.get("RSI", 50)) if "RSI" in prev.index else 50
-    if rsi > prev_rsi and rsi < 45:
-        score += 5
-        reasons.append("RSI turning up")
+    rsi_turning_up = rsi > prev_rsi and rsi < 55
+
+    if rsi_was_low_recent and rsi_turning_up:
+        score += 30
+        reasons.append(f"RSI reversal ({rsi:.0f}, was <42, now rising)")
+    elif rsi < RSI_OVERSOLD and rsi_turning_up:
+        score += 25
+        reasons.append(f"RSI oversold + turning up ({rsi:.0f})")
+    elif rsi < 42 and rsi_turning_up:
+        score += 15
+        reasons.append(f"RSI low + rising ({rsi:.0f})")
 
     # ── Bollinger Band near lower (max 20 pts) ──
-    if bb_pct < 0.1:
+    if bb_pct < 0.15:
         score += 20
         reasons.append(f"Near lower BB ({bb_pct:.2f})")
-    elif bb_pct < 0.25:
+    elif bb_pct < 0.40:
         score += 12
         reasons.append(f"Lower BB zone ({bb_pct:.2f})")
-    elif bb_pct < 0.35:
-        score += 5
 
     # ── Volume spike (max 15 pts) ──
     if vol_ratio > 2.5:
         score += 15
         reasons.append(f"Volume spike ({vol_ratio:.1f}x)")
-    elif vol_ratio > VOLUME_SPIKE_RATIO:
+    elif vol_ratio > 1.0:
         score += 10
         reasons.append(f"Above-avg volume ({vol_ratio:.1f}x)")
 
-    # ── Trend filter: above 200 EMA (max 15 pts) ──
-    ema_trend = "ABOVE" if price > ema200 else "BELOW"
-    if price > ema200:
-        score += 10
-        reasons.append("Above 200 EMA (uptrend)")
-    # EMA 9 > 21 = short-term bullish
+    # ── Trend: above 200 EMA (already passed filter, give points) ──
+    score += 10
+    reasons.append("Above 200 EMA (uptrend)")
     if ema9 > ema21:
         score += 5
         reasons.append("EMA9 > EMA21 (bullish cross)")
 
-    # ── Price near support / mean reversion (max 10 pts) ──
-    # Check if price bounced from recent low
-    recent_low = float(df["Low"].tail(10).min())
-    dist_from_low = (price - recent_low) / price
-    if dist_from_low < 0.02:
-        score += 10
-        reasons.append("Near 10-day low (bounce setup)")
-    elif dist_from_low < 0.04:
-        score += 5
-
     # ── Volatility sweet spot (max 10 pts) ──
-    # ATR 1-3% = good swing range
     if 0.01 < atr_pct < 0.03:
         score += 10
         reasons.append(f"Good volatility ({atr_pct*100:.1f}% ATR)")
     elif 0.005 < atr_pct < 0.04:
         score += 5
 
-    # ── Penalty: don't buy into a falling knife ──
-    # If today's drop > 5% AND RSI < 25, likely fundamental issue
-    if change < -5 and rsi < 25:
-        score -= 15
-        reasons.append("⚠ Sharp drop — possible fundamental issue")
+    # ── Penalty: high volatility = riskier ──
+    if atr_pct >= 0.04:
+        score -= 10
+        reasons.append(f"⚠ High volatility ({atr_pct*100:.1f}% ATR)")
 
-    # ── Bonus: positive breadth ──
-    # Price above EMA21 and EMA21 above EMA200 = aligned trend
+    # ── Bonus: multi-EMA alignment ──
     if ema21 > ema200 and price > ema21:
         score += 5
         reasons.append("Multi-EMA alignment (bullish)")
@@ -554,7 +549,11 @@ class BacktestResult:
 
 
 def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = None) -> list[BacktestTrade]:
-    """Backtest swing strategy on a single stock over historical data."""
+    """Backtest swing strategy on a single stock over historical data.
+
+    Improved entry: requires uptrend + RSI reversal confirmation + volume.
+    Improved exit: trailing stop after T1, wider SL for 15-20 day holds.
+    """
     df = fetch_history(symbol, period="1y", interval="1d")
     if df is None or len(df) < 60:
         return []
@@ -572,39 +571,68 @@ def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = Non
     entry_price = 0.0
     entry_date = ""
     entry_idx = 0
+    t1_hit = False       # Track if T1 was hit for trailing
+    peak_price = 0.0     # Track peak after entry for trailing
 
     for i in range(EMA_TREND + 1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
+        prev2_row = df.iloc[i - 2] if i >= 2 else prev_row
 
         if not in_trade:
-            # ── Entry logic: same scoring as live ──
+            # ── Entry logic: stricter — uptrend + reversal + volume ──
             rsi = float(row.get("RSI", 50))
+            prev_rsi = float(prev_row.get("RSI", 50))
+            prev2_rsi = float(prev2_row.get("RSI", 50))
             bb_pct = float(row.get("BB_PCT", 0.5))
             vol_ratio = float(row.get("VOL_RATIO", 1))
             price = float(row["Close"])
+            prev_close = float(prev_row["Close"])
             ema200 = float(row.get("EMA200", price))
             ema9 = float(row.get("EMA9", price))
             ema21 = float(row.get("EMA21", price))
-            prev_rsi = float(prev_row.get("RSI", 50))
+            atr_pct = float(row.get("ATR_PCT", 0.02))
 
-            # Simplified entry conditions
-            entry_signal = False
-            if rsi < 40 and bb_pct < 0.3 and vol_ratio > 1.3 and price > ema200:
-                entry_signal = True
-            if rsi < RSI_OVERSOLD and bb_pct < 0.2:
-                entry_signal = True
-            # RSI turning up from oversold
-            if rsi > prev_rsi and rsi < 42 and bb_pct < 0.35 and price > ema200:
-                entry_signal = True
+            # ── RULE 1: Must be in uptrend (above 200 EMA) ──
+            if price < ema200:
+                continue
+
+            # ── RULE 2: Not in a crash (no >5% drop in 3 days) ──
+            recent_3d_return = (price - float(df.iloc[i-3]["Close"])) / float(df.iloc[i-3]["Close"]) if i >= 3 else 0
+            if recent_3d_return < -0.05:
+                continue
+
+            # ── RULE 3: RSI reversal — was oversold, now turning UP ──
+            # RSI was below 42 within last 5 days AND is now rising
+            rsi_was_low = any(
+                float(df.iloc[i-j].get("RSI", 50)) < 42
+                for j in range(1, min(6, i))
+            )
+            rsi_turning_up = rsi > prev_rsi and rsi < 55
+
+            # ── RULE 4: Bollinger Band near lower band ──
+            bb_near_lower = bb_pct < 0.40
+
+            # ── RULE 5: Volume confirmation ──
+            vol_ok = vol_ratio > 1.0  # at least average volume
+
+            # ── RULE 6: Not too volatile (ATR < 5%) ──
+            vol_stable = atr_pct < 0.05
+
+            # Need uptrend + RSI signal + at least 2 of remaining 4
+            rsi_signal = rsi_was_low and rsi_turning_up
+            secondary = sum([bb_near_lower, vol_ok, vol_stable])
+            entry_signal = rsi_signal and secondary >= 2
 
             if entry_signal:
                 entry_price = float(row["Open"])  # Buy at next day open
                 entry_date = str(df.index[i].date())
                 entry_idx = i
+                t1_hit = False
+                peak_price = entry_price
                 in_trade = True
         else:
-            # ── Exit logic: check SL, targets, time stop ──
+            # ── Exit logic: SL → T1 → trailing stop → T2 → time ──
             high = float(row["High"])
             low = float(row["Low"])
             close = float(row["Close"])
@@ -614,34 +642,38 @@ def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = Non
             t1_price = entry_price * (1 + TARGET_PRIMARY)
             t2_price = entry_price * (1 + TARGET_SECONDARY)
 
+            # Track peak for trailing stop
+            peak_price = max(peak_price, high)
+
             exit_price = None
             exit_reason = None
 
-            # Stop-loss hit
-            if low <= sl_price:
-                exit_price = sl_price
-                exit_reason = "SL"
+            if t1_hit:
+                # ── After T1: trailing stop at 2% below peak ──
+                trail_stop = peak_price * (1 - TRAILING_STOP_PCT)
+                # But never below breakeven
+                trail_stop = max(trail_stop, entry_price)
 
-            # Primary target hit
-            elif high >= t1_price and exit_price is None:
-                # 50% booked at T1, trail rest to T2
-                if high >= t2_price:
+                if low <= trail_stop:
+                    exit_price = trail_stop
+                    exit_reason = "TRAIL_STOP"
+                elif high >= t2_price:
                     exit_price = t2_price
                     exit_reason = "T2"
-                else:
-                    # After T1 hit, use trailing SL at breakeven
-                    trail_sl = max(sl_price, entry_price)  # move SL to breakeven
-                    if low <= trail_sl:
-                        exit_price = entry_price
-                        exit_reason = "T1_TRAIL_BE"
-                    elif days_held >= TIME_STOP_DAYS:
-                        exit_price = close
-                        exit_reason = "TIME"
-
-            # Time stop
-            elif days_held >= TIME_STOP_DAYS:
-                exit_price = close
-                exit_reason = "TIME"
+                elif days_held >= TIME_STOP_DAYS:
+                    exit_price = close
+                    exit_reason = "TIME"
+            else:
+                # ── Before T1: standard SL and target checks ──
+                if low <= sl_price:
+                    exit_price = sl_price
+                    exit_reason = "SL"
+                elif high >= t1_price:
+                    t1_hit = True
+                    # Don't exit yet — trail to T2
+                elif days_held >= TIME_STOP_DAYS:
+                    exit_price = close
+                    exit_reason = "TIME"
 
             if exit_price is not None:
                 pnl_pct = ((exit_price - entry_price) / entry_price) * 100
