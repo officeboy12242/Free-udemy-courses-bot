@@ -125,6 +125,7 @@ from movie_service import (
 from swing_service import (
     scan_nse50, run_backtest as swing_run_backtest,
     log_swing_trade, close_swing_trade, get_open_trades, get_trade_summary,
+    run_paper_scan, get_paper_portfolio,
     CAPITAL, POSITION_PCT, MAX_POSITIONS,
 )
 
@@ -2162,6 +2163,129 @@ async def cmd_swing_journal(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.effective_message.reply_html("\n".join(lines))
 
 
+async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current paper portfolio with unrealized P&L."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    await update.effective_message.reply_text("📊 Loading portfolio...")
+    try:
+        portfolio = await asyncio.to_thread(get_paper_portfolio)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Failed: {e}")
+        return
+
+    _SEP = "━" * 32
+    lines = [
+        f"💼 <b>Paper Portfolio</b>",
+        _SEP,
+    ]
+
+    if portfolio["open"]:
+        lines.append(f"📦 Open positions: {len(portfolio['open'])}  |  Invested: <b>₹{portfolio['total_invested']:,.0f}</b>")
+        lines.append(f"📈 Unrealized P&L: <b>{'+' if portfolio['total_unrealized'] >= 0 else ''}₹{portfolio['total_unrealized']:,.0f}</b>")
+        lines.append("")
+        for p in portfolio["open"]:
+            emoji = "🟢" if p["unrealized_pct"] >= 0 else "🔴"
+            lines.append(
+                f"{emoji} <b>{p['symbol'].replace('.NS','')}</b>  "
+                f"Entry: ₹{p['entry']:.2f}  →  Now: ₹{p['current']:.2f}  "
+                f"{p['unrealized_pct']:+.2f}%  ({p['unrealized_inr']:+,.0f} INR)  "
+                f"{p['days_held']}d held"
+            )
+        lines.append("")
+    else:
+        lines.append("📦 No open positions")
+        lines.append("")
+
+    lines.append(_SEP)
+    lines.append(f"✅ Closed: {portfolio['closed_count']}  |  Wins: {portfolio['closed_wins']}  |  Losses: {portfolio['closed_losses']}")
+    lines.append(f"💰 Realized P&L: <b>{'+' if portfolio['total_realized'] >= 0 else ''}₹{portfolio['total_realized']:,.0f}</b>")
+
+    if portfolio["recent_closed"]:
+        lines.append("")
+        lines.append("<b>Recent closed:</b>")
+        for t in portfolio["recent_closed"][:5]:
+            emoji = "✅" if t.get("pnl_pct", 0) > 0 else "❌"
+            exit_date = t.get("exited_at")
+            date_str = exit_date.strftime("%d %b") if isinstance(exit_date, datetime) else "?"
+            lines.append(
+                f"  {emoji} {t['symbol'].replace('.NS','')}  "
+                f"{t.get('pnl_pct', 0):+.2f}%  ₹{t.get('pnl_inr', 0):+,.0f}  "
+                f"({t.get('exit_reason', '?')})  {date_str}"
+            )
+
+    lines.append(_SEP)
+    lines.append("<i>Paper trade — not real money. Use /swing to scan for new setups.</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_swing_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run full paper trade cycle: check exits + scan new + open paper trades."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    await update.effective_message.reply_text("🔄 Running paper trade scan...")
+    try:
+        actions = await asyncio.to_thread(run_paper_scan)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Scan failed: {e}")
+        return
+
+    _SEP = "━" * 32
+    lines = [
+        f"🔄 <b>Paper Trade Scan Complete</b>",
+        _SEP,
+    ]
+
+    if actions["closed"]:
+        total_closed_pnl = sum(c["pnl_inr"] for c in actions["closed"])
+        lines.append(f"📤 <b>Closed {len(actions['closed'])} trades:</b>")
+        for c in actions["closed"]:
+            emoji = "✅" if c["pnl_pct"] > 0 else "❌"
+            lines.append(
+                f"  {emoji} {c['symbol'].replace('.NS','')}  "
+                f"₹{c['entry']:.2f}→₹{c['exit']:.2f}  "
+                f"{c['pnl_pct']:+.2f}%  ({c['reason']})  {c['days_held']}d"
+            )
+        lines.append(f"  💰 Closed P&L: <b>{'+' if total_closed_pnl >= 0 else ''}₹{total_closed_pnl:,.0f}</b>")
+        lines.append("")
+    else:
+        lines.append("📤 No trades closed today")
+        lines.append("")
+
+    if actions["opened"]:
+        lines.append(f"📥 <b>Opened {len(actions['opened'])} paper trades:</b>")
+        for o in actions["opened"]:
+            lines.append(
+                f"  🟢 {o['symbol'].replace('.NS','')}  "
+                f"Entry: ₹{o['entry']:.2f}  Qty: {o['qty']}  "
+                f"Score: {o['score']:.0f}"
+            )
+            lines.append(
+                f"     SL: ₹{o['sl']:.2f}  T1: ₹{o['t1']:.2f}  T2: ₹{o['t2']:.2f}"
+            )
+        lines.append("")
+    else:
+        if actions["already_open"]:
+            lines.append(f"📥 No new trades — already open: {', '.join(s.replace('.NS','') for s in actions['already_open'])}")
+        else:
+            lines.append("📥 No qualifying setups found")
+        lines.append("")
+
+    lines.append(_SEP)
+    lines.append("<i>Use /swing_status to see full portfolio.</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
 def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
@@ -2222,6 +2346,8 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("swing", cmd_swing))
     app.add_handler(CommandHandler("swing_bt", cmd_swing_bt))
     app.add_handler(CommandHandler("swing_journal", cmd_swing_journal))
+    app.add_handler(CommandHandler("swing_status", cmd_swing_status))
+    app.add_handler(CommandHandler("swing_scan", cmd_swing_scan))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
@@ -2958,6 +3084,78 @@ async def run_course_loop(bot: Bot):
         await asyncio.sleep(CHECK_EVERY)
 
 
+async def _run_paper_trade_daily(bot: Bot) -> None:
+    """Run swing paper trade scan daily at ~9:30 AM IST (market open).
+
+    Checks existing trades for exits, scans NSE-50 for new setups,
+    opens paper trades, and sends summary to owner.
+    """
+    import pytz
+    ist = pytz.timezone("Asia/Kolkata")
+    chat_id = MARKET_ALERT_CHAT_ID
+
+    while True:
+        try:
+            now_ist = datetime.now(ist)
+            # Target 9:35 AM IST (5 min after market open, let data settle)
+            target = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+            if now_ist >= target:
+                target += timedelta(days=1)
+            # Skip weekends
+            while target.weekday() >= 5:  # Saturday=5, Sunday=6
+                target += timedelta(days=1)
+            wait_secs = (target - now_ist).total_seconds()
+            log.info("Swing paper scan scheduled in %.0f mins (at %s)", wait_secs / 60, target.strftime("%H:%M %Z"))
+            await asyncio.sleep(wait_secs)
+
+            # Run the scan
+            actions = await asyncio.to_thread(run_paper_scan)
+
+            # Build summary message
+            _SEP = "━" * 28
+            lines = [
+                f"🔄 <b>Daily Paper Trade Scan</b>",
+                _SEP,
+            ]
+
+            if actions["closed"]:
+                total = sum(c["pnl_inr"] for c in actions["closed"])
+                lines.append(f"📤 Closed {len(actions['closed'])} trades (P&L: {'+' if total >= 0 else ''}₹{total:,.0f})")
+                for c in actions["closed"]:
+                    e = "✅" if c["pnl_pct"] > 0 else "❌"
+                    lines.append(f"  {e} {c['symbol'].replace('.NS','')} {c['pnl_pct']:+.1f}% ({c['reason']})")
+                lines.append("")
+
+            if actions["opened"]:
+                lines.append(f"📥 Opened {len(actions['opened'])} paper trades:")
+                for o in actions["opened"]:
+                    lines.append(
+                        f"  🟢 {o['symbol'].replace('.NS','')}  "
+                        f"₹{o['entry']:.2f}  Qty {o['qty']}"
+                    )
+                lines.append("")
+            elif actions["already_open"]:
+                lines.append(f"📥 Already open: {', '.join(s.replace('.NS','') for s in actions['already_open'])}")
+                lines.append("")
+            else:
+                lines.append("📥 No new setups found today")
+                lines.append("")
+
+            lines.append("<i>Use /swing_status for full portfolio view</i>")
+
+            if chat_id:
+                try:
+                    await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+                except Exception as e:
+                    log.warning("Swing daily report send failed: %s", e)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("Swing daily scan error: %s", e)
+            await asyncio.sleep(300)  # Retry in 5 min on error
+
+
 async def main():
     """HTTP server + course bot + optional market dip alerts + /start welcome."""
     if not BOT_TOKEN:
@@ -3029,15 +3227,11 @@ async def main():
         from fno_storage import storage_backend_label
         log.info("📊 F&O scalp monitor enabled (Confluence + ORB + PCR + MACD MTF + EOD summary)")
         log.info("📊 F&O trade history storage: %s", storage_backend_label())
-        tasks.append(
-            asyncio.create_task(run_fno_monitor(bot))
-        )
-        tasks.append(
-            asyncio.create_task(run_fno_exit_monitor(bot))
-        )
-        tasks.append(
-            asyncio.create_task(run_fno_eod_summary(bot))
-        )
+        tasks.append(asyncio.create_task(run_fno_monitor(bot)))
+        tasks.append(asyncio.create_task(run_fno_exit_monitor(bot)))
+        tasks.append(asyncio.create_task(run_fno_eod_summary(bot)))
+        # Paper trade scan — run daily at market open
+        tasks.append(asyncio.create_task(_run_paper_trade_daily(bot)))
     else:
         log.info("Market features off (MARKET_FEATURES_ENABLED).")
 

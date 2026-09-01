@@ -644,3 +644,242 @@ def get_trade_summary(user_id: int, days: int = 30) -> dict:
         ) if closed else 0,
         "trades": trades,
     }
+
+
+# ── Auto Paper Trading ───────────────────────────────────────────────────────
+
+def check_open_trades_for_exits() -> list[dict]:
+    """Check all open paper trades against current prices.
+
+    Closes trades that hit SL, T1+trail, T2, or time stop.
+    Returns list of closed trade summaries.
+    """
+    db = _get_db()
+    _ensure_indexes()
+    open_trades = list(db.swing_trades.find({"status": "open"}))
+    if not open_trades:
+        return []
+
+    # Group by symbol to avoid duplicate fetches
+    symbols = list({t["symbol"] for t in open_trades})
+    price_cache: dict[str, dict] = {}
+    for sym in symbols:
+        df = fetch_history(sym, period="5d", interval="1d")
+        if df is not None and not df.empty:
+            latest = df.iloc[-1]
+            price_cache[sym] = {
+                "close": float(latest["Close"]),
+                "high": float(latest["High"]),
+                "low": float(latest["Low"]),
+            }
+
+    closed_trades = []
+    for trade in open_trades:
+        sym = trade["symbol"]
+        prices = price_cache.get(sym)
+        if not prices:
+            continue
+
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        high = prices["high"]
+        low = prices["low"]
+        close = prices["close"]
+
+        sl = entry * (1 - SL_PCT)
+        t1 = entry * (1 + TARGET_PRIMARY)
+        t2 = entry * (1 + TARGET_SECONDARY)
+
+        # Calculate holding days
+        entered = trade["entered_at"]
+        if isinstance(entered, datetime):
+            days_held = (datetime.utcnow() - entered).days
+        else:
+            days_held = 0
+
+        exit_price = None
+        exit_reason = None
+
+        # Stop-loss hit
+        if low <= sl:
+            exit_price = sl
+            exit_reason = "SL"
+
+        # T2 hit
+        elif high >= t2:
+            exit_price = t2
+            exit_reason = "T2"
+
+        # T1 hit — trail to breakeven
+        elif high >= t1:
+            if low <= entry:  # Trailing SL at breakeven hit
+                exit_price = entry
+                exit_reason = "T1_TRAIL_BE"
+            elif days_held >= TIME_STOP_DAYS:
+                exit_price = close
+                exit_reason = "TIME"
+
+        # Time stop
+        elif days_held >= TIME_STOP_DAYS:
+            exit_price = close
+            exit_reason = "TIME"
+
+        if exit_price is not None:
+            pnl_pct = ((exit_price - entry) / entry) * 100
+            pnl_inr = (exit_price - entry) * qty
+            from bson import ObjectId
+            db.swing_trades.update_one(
+                {"_id": ObjectId(trade["_id"])},
+                {"$set": {
+                    "status": "closed",
+                    "exit_price": round(exit_price, 2),
+                    "exit_reason": exit_reason,
+                    "pnl_pct": round(pnl_pct, 2),
+                    "pnl_inr": round(pnl_inr, 0),
+                    "exited_at": datetime.utcnow(),
+                }},
+            )
+            closed_trades.append({
+                "symbol": sym,
+                "entry": entry,
+                "exit": round(exit_price, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_inr": round(pnl_inr, 0),
+                "reason": exit_reason,
+                "days_held": days_held,
+            })
+
+    return closed_trades
+
+
+def run_paper_scan() -> dict:
+    """Full paper trade cycle:
+    1. Close trades that hit SL/T1/T2/time-stop
+    2. Scan NSE-50 for new setups
+    3. Open paper trades for top setups (if not already open)
+    4. Return summary of actions taken.
+    """
+    db = _get_db()
+    _ensure_indexes()
+    actions = {
+        "closed": [],
+        "opened": [],
+        "already_open": [],
+        "scan_failed": False,
+    }
+
+    # Step 1: Check existing open trades for exits
+    try:
+        actions["closed"] = check_open_trades_for_exits()
+    except Exception as e:
+        log.warning("Paper trade exit check failed: %s", e)
+
+    # Step 2: Get currently open symbols so we don't double-enter
+    open_trades = list(db.swing_trades.find({"status": "open"}))
+    open_symbols = {t["symbol"] for t in open_trades}
+
+    # Step 3: Count how many slots are free
+    open_count = len(open_trades)
+    slots_free = MAX_POSITIONS - open_count
+
+    if slots_free <= 0:
+        return actions  # All slots filled
+
+    # Step 4: Scan for new setups
+    try:
+        setups = scan_nse50(slots_free + 2)  # fetch extra in case some are already open
+    except Exception as e:
+        log.warning("Paper scan NSE50 failed: %s", e)
+        actions["scan_failed"] = True
+        return actions
+
+    per_stock = (CAPITAL * POSITION_PCT) / MAX_POSITIONS
+
+    for setup in setups:
+        if len(actions["opened"]) >= slots_free:
+            break
+        if setup.symbol in open_symbols:
+            actions["already_open"].append(setup.symbol)
+            continue
+
+        # Open paper trade
+        qty = max(1, int(per_stock / setup.entry))
+        invest = qty * setup.entry
+        try:
+            log_swing_trade(
+                user_id=0,  # paper trade (owner)
+                symbol=setup.symbol,
+                entry_price=setup.entry,
+                qty=qty,
+                status="open",
+                notes=f"score={setup.score} reasons={','.join(setup.reasons[:3])}",
+            )
+            actions["opened"].append({
+                "symbol": setup.symbol,
+                "entry": setup.entry,
+                "qty": qty,
+                "invest": round(invest, 0),
+                "score": setup.score,
+                "sl": setup.stop_loss,
+                "t1": setup.target_1,
+                "t2": setup.target_2,
+            })
+        except Exception as e:
+            log.warning("Paper trade open failed %s: %s", setup.symbol, e)
+
+    return actions
+
+
+def get_paper_portfolio() -> dict:
+    """Get current paper portfolio with unrealized P&L."""
+    db = _get_db()
+    open_trades = list(db.swing_trades.find({"status": "open"}).sort("entered_at", -1))
+    closed_trades = list(db.swing_trades.find({"status": "closed"}).sort("exited_at", -1).limit(50))
+
+    # Fetch live prices for open trades
+    symbols = list({t["symbol"] for t in open_trades})
+    prices: dict[str, float] = {}
+    for sym in symbols:
+        df = fetch_history(sym, period="5d", interval="1d")
+        if df is not None and not df.empty:
+            prices[sym] = float(df.iloc[-1]["Close"])
+
+    portfolio = []
+    total_unrealized = 0.0
+    total_invested = 0.0
+    for t in open_trades:
+        current = prices.get(t["symbol"], t["entry_price"])
+        unrealized_pct = ((current - t["entry_price"]) / t["entry_price"]) * 100
+        unrealized_inr = (current - t["entry_price"]) * t["qty"]
+        total_unrealized += unrealized_inr
+        total_invested += t["entry_price"] * t["qty"]
+
+        entered = t["entered_at"]
+        days_held = (datetime.utcnow() - entered).days if isinstance(entered, datetime) else 0
+
+        portfolio.append({
+            "symbol": t["symbol"],
+            "entry": t["entry_price"],
+            "current": round(current, 2),
+            "qty": t["qty"],
+            "unrealized_pct": round(unrealized_pct, 2),
+            "unrealized_inr": round(unrealized_inr, 0),
+            "days_held": days_held,
+            "notes": t.get("notes", ""),
+        })
+
+    # Closed trade stats
+    closed_wins = [t for t in closed_trades if t.get("pnl_pct", 0) > 0]
+    closed_losses = [t for t in closed_trades if t.get("pnl_pct", 0) <= 0]
+    total_realized = sum(t.get("pnl_inr", 0) for t in closed_trades)
+
+    return {
+        "open": portfolio,
+        "total_unrealized": round(total_unrealized, 0),
+        "total_invested": round(total_invested, 0),
+        "closed_count": len(closed_trades),
+        "closed_wins": len(closed_wins),
+        "closed_losses": len(closed_losses),
+        "total_realized": round(total_realized, 0),
+        "recent_closed": closed_trades[:10],
+    }
