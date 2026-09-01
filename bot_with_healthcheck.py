@@ -122,6 +122,11 @@ from movie_service import (
     check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
     init_movie_site_urls, run_startup_site_health,
 )
+from swing_service import (
+    scan_nse50, run_backtest as swing_run_backtest,
+    log_swing_trade, close_swing_trade, get_open_trades, get_trade_summary,
+    CAPITAL, POSITION_PCT, MAX_POSITIONS,
+)
 
 # ─── Load env ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -2032,6 +2037,131 @@ async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.user_data.pop("pending_news_articles", None)
 
 
+# ─── Swing Trading Alerts ─────────────────────────────────────────────────────
+
+async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scan NSE-50 for swing trade setups. Top 5 with entry/SL/target."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    await update.effective_message.reply_text("⏳ Scanning NSE-50 for swing setups...")
+    try:
+        setups = await asyncio.to_thread(scan_nse50, 5)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Scan failed: {e}")
+        return
+
+    if not setups:
+        await update.effective_message.reply_text("No qualifying setups found today.")
+        return
+
+    _SEP = "━" * 32
+    per_stock = (CAPITAL * POSITION_PCT) / MAX_POSITIONS
+
+    lines = [
+        f"📈 <b>Swing Trade Alerts</b>",
+        _SEP,
+        f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>  |  Max per stock: <b>₹{per_stock:,.0f}</b>",
+        f"🎯 Targets: +{int(3)}% / +{int(5)}%  |  🛑 SL: -{int(2)}%  |  ⏰ Time stop: {10}d",
+        "",
+    ]
+
+    for i, s in enumerate(setups, 1):
+        lines.append(f"<b>{i}. {s.name}</b>  <i>(Score: {s.score:.0f}/100)</i>")
+        lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>")
+        lines.append(f"   ▸ SL: <code>₹{s.stop_loss:.2f}</code>  |  T1: <code>₹{s.target_1:.2f}</code>  |  T2: <code>₹{s.target_2:.2f}</code>")
+        lines.append(f"   ▸ RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x  |  ATR: {s.atr_pct}%")
+        lines.append(f"   ▸ Trend: {s.ema_trend} 200EMA  |  Today: {s.change_today:+.2f}%")
+        reasons_str = " · ".join(s.reasons[:4])
+        lines.append(f"   📋 {reasons_str}")
+        lines.append("")
+
+    total_invest = sum(s.suggested_invest for s in setups)
+    lines.append(_SEP)
+    lines.append(f"💼 Total deployment: <b>₹{total_invest:,.0f}</b> / ₹{CAPITAL:,.0f} ({total_invest/CAPITAL*100:.0f}%)")
+    lines.append("<i>⚠ Not financial advice. Do your own research.</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_swing_bt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run backtest on swing strategy. /swing_bt [start_date]"""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    start = "2025-01-01"
+    if context.args:
+        start = context.args[0]
+
+    await update.effective_message.reply_text(f"⏳ Running backtest from {start}...")
+    result = await asyncio.to_thread(swing_run_backtest, None, start)
+
+    lines = [result.summary(), ""]
+    # Show last 10 trades
+    if result.trades:
+        lines.append("<b>Recent trades:</b>")
+        for t in result.trades[-10:]:
+            emoji = "✅" if t.pnl_pct > 0 else "❌"
+            lines.append(
+                f"  {emoji} {t.symbol.replace('.NS','')}  "
+                f"₹{t.entry_price}→₹{t.exit_price}  "
+                f"{t.pnl_pct:+.2f}%  ({t.exit_reason})  "
+                f"{t.holding_days}d"
+            )
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_swing_journal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show swing trading P&L journal. /swing_journal [days]"""
+    if not update.effective_message or not update.effective_user:
+        return
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    days = 30
+    if context.args:
+        try:
+            days = max(1, min(365, int(context.args[0])))
+        except ValueError:
+            pass
+
+    summary = get_trade_summary(uid, days)
+    _SEP = "━" * 32
+
+    lines = [
+        f"📒 <b>Swing Trade Journal</b> (last {days} days)",
+        _SEP,
+        f"📊 Trades: {summary['total_trades']}  |  Open: {summary['open']}  |  Closed: {summary['closed']}",
+        f"✅ Winners: {summary['winners']}  |  ❌ Losers: {summary['losers']}",
+        f"📈 Win rate: {summary['win_rate']:.0f}%  |  Avg P&L: {summary['avg_pnl_pct']:+.2f}%",
+        f"💰 Total P&L: <b>₹{summary['total_pnl_inr']:+,.0f}</b>",
+        _SEP,
+    ]
+
+    if summary["trades"]:
+        for t in summary["trades"][:15]:
+            status_emoji = "🟢" if t["status"] == "closed" else "🔵"
+            pnl = t.get("pnl_pct", 0)
+            pnl_str = f"{pnl:+.2f}%" if pnl else "—"
+            lines.append(
+                f"{status_emoji} {t['symbol'].replace('.NS','')}  "
+                f"₹{t['entry_price']}  {pnl_str}  "
+                f"{t['status']}"
+            )
+    else:
+        lines.append("No trades logged yet. Use /swing_trade to log.")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
 def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
@@ -2088,6 +2218,10 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("download_queue", cmd_download_queue))
     app.add_handler(CommandHandler("downloads", cmd_downloads))
     app.add_handler(CommandHandler("status", cmd_downloads))
+    # Swing trading alerts
+    app.add_handler(CommandHandler("swing", cmd_swing))
+    app.add_handler(CommandHandler("swing_bt", cmd_swing_bt))
+    app.add_handler(CommandHandler("swing_journal", cmd_swing_journal))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
