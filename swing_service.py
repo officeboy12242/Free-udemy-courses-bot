@@ -95,11 +95,11 @@ MIN_MARKET_CAP_CR = 5000 # Filter penny / micro caps
 MAX_POSITIONS = 5        # Max concurrent positions
 CAPITAL = 100_000        # ₹1 Lakh
 POSITION_PCT = 0.20      # Max 20% per batch = ₹20,000 across 5 stocks
-SL_PCT = 0.045           # 4.5% stop-loss (v4 optimized — wider for 20d holds)
-TARGET_PRIMARY = 0.08    # 8% primary target (v4 optimized)
-TARGET_SECONDARY = 0.12  # 12% secondary target (v4 optimized)
+SL_PCT = 0.05             # 5% stop-loss (strategy lab optimized) (v4 optimized — wider for 20d holds)
+TARGET_PRIMARY = 0.08    # 8% primary target (optimized) (v4 optimized)
+TARGET_SECONDARY = 0.12  # 12% secondary target (optimized) (v4 optimized)
 TIME_STOP_DAYS = 25      # Exit if no target hit in 25 days
-TRAILING_STOP_PCT = 0.01 # 1.0% trailing stop after T1 (tighter = locks profits faster)
+TRAILING_STOP_PCT = 0.01 # 1.0% trailing stop (locks profits fast) after T1 (tighter = locks profits faster)
 
 # ── Entry Strategy Weights ───────────────────────────────────────────────
 # Three entry types tested in backtest:
@@ -376,6 +376,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["RET_3D"] = df["Close"].pct_change(3)
     df["MOM_10"] = df["Close"].pct_change(10)
     df["MOM_20"] = df["Close"].pct_change(20)
+    # 52-week high/low
+    df["HIGH_252"] = df["High"].rolling(252).max()
+    df["LOW_252"] = df["Low"].rolling(252).min()
+    df["DIST_FROM_HIGH"] = (df["HIGH_252"] - df["Close"]) / df["HIGH_252"]
+    # VWAP (rolling 20-day)
+    df["VWAP"] = (df["Close"] * df["Volume"]).rolling(20).sum() / df["Volume"].rolling(20).sum()
+    df["VWAP_DIST"] = (df["Close"] - df["VWAP"]) / df["VWAP"]
 
     # Daily change %
     df["CHANGE_PCT"] = df["Close"].pct_change() * 100
@@ -479,6 +486,40 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
             f"Volume spike {vol_ratio:.1f}x",
         ]
 
+    # == STRATEGY 4: 52-WEEK BREAKOUT (60.9% WR, +4.11% avg) ==
+    dist_from_high = float(latest.get("DIST_FROM_HIGH", 1))
+    high_252 = float(latest.get("HIGH_252", price))
+
+    wk52_score = 0
+    wk52_reasons = []
+    if (dist_from_high < 0.02 and vol_ratio > 1.3 and rsi < 80 and mom20 > 0.01):
+        wk52_score = 75
+        wk52_reasons = [
+            "📈 52WK BREAKOUT",
+            f"Within {dist_from_high*100:.1f}% of 52-week high",
+            f"RSI {rsi:.0f} | MOM20 +{mom20*100:.1f}%",
+            f"Volume {vol_ratio:.1f}x",
+        ]
+        if dist_from_high < 0.005:
+            wk52_score += 15
+            wk52_reasons.insert(1, "NEW 52-WEEK HIGH!")
+
+    # == STRATEGY 5: MULTI-TIMEFRAME CONFLUENCE (64.7% WR, +4.21% avg) ==
+    signals = 0
+    mt_reasons = ["📊 MULTI-TF CONFLUENCE"]
+    if price >= ema50: signals += 1; mt_reasons.append("Above EMA50")
+    if ema9 > ema21 > float(latest.get("EMA50", price)): signals += 1; mt_reasons.append("EMA aligned")
+    if 45 < rsi < 65: signals += 1
+    if rsi > prev_rsi: signals += 1
+    if bb_pct < 0.5: signals += 1
+    if vol_ratio > 1.0: signals += 1
+    if mom10 > 0: signals += 1
+    if 0.01 < atr_pct < 0.03: signals += 1
+
+    mt_score = 60 + (signals - 6) * 8 if signals >= 6 else 0
+    if mt_score > 0:
+        mt_reasons.append(f"{signals}/8 signals confirming")
+
     # == STRATEGY 2: MEAN-REVERSION (57.9% WR, +4.00% avg) ==
     rsi_was_low_recent = any(
         float(df.iloc[-j].get("RSI", 50)) < 42
@@ -515,11 +556,13 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
             f"RSI {rsi:.0f}, Vol {vol_ratio:.1f}x",
         ]
 
-    # Pick the best strategy for this stock
+    # Pick the best strategy for this stock (5 strategies now)
     strategies = [
         ("MOMENTUM", momentum_score, momentum_reasons),
         ("MEAN_REV", mean_rev_score, mean_rev_reasons),
         ("EMA_CROSS", ema_cross_score, ema_cross_reasons),
+        ("52WK_BREAK", wk52_score, wk52_reasons),
+        ("MULTI_TF", mt_score, mt_reasons),
     ]
     strategies.sort(key=lambda x: x[1], reverse=True)
     entry_type, best_score, best_reasons = strategies[0]

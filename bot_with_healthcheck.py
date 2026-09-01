@@ -2105,15 +2105,19 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     for i, s in enumerate(setups, 1):
-        # Detect entry type from reasons
+        # Detect entry type from reasons (5 strategy types)
         badge = "🔄"
         for r in s.reasons:
             if "MOMENTUM" in r:
-                badge = "🚀"
-                break
+                badge = "🚀"; break
+            elif "52WK" in r:
+                badge = "📈"; break
+            elif "MULTI-TF" in r or "CONFLUENCE" in r:
+                badge = "📊"; break
+            elif "MEAN" in r or "REVERSION" in r:
+                badge = "🔄"; break
             elif "EMA CROSSOVER" in r:
-                badge = "📈"
-                break
+                badge = "📈"; break
         lines.append(f"<b>{i}. {s.name}</b>  {badge}  <i>(Score: {s.score:.0f}/100)</i>")
         lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>  |  Invest: <b>₹{s.suggested_invest:,.0f}</b>")
         lines.append(f"   ▸ SL: <code>₹{s.stop_loss:.2f}</code>  |  T1: <code>₹{s.target_1:.2f}</code>  |  T2: <code>₹{s.target_2:.2f}</code>")
