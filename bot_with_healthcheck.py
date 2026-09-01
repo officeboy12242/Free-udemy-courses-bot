@@ -128,6 +128,15 @@ from swing_service import (
     run_paper_scan, get_paper_portfolio, get_sizing_summary,
     CAPITAL, POSITION_PCT, MAX_POSITIONS,
 )
+from trader_journal import (
+    get_capital_status, get_trader_stats, get_recent_trades,
+    get_pending_tickets, approve_ticket, reject_ticket, get_improvement_history,
+)
+from ai_analyzer import (
+    analyze_trade, generate_improvement_suggestions, search_strategy_improvements,
+    daily_market_analysis, analyze_win_loss_pattern,
+)
+from market_regime import detect_regime, get_regime_emoji, get_strategy_description
 
 # ─── Load env ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -550,7 +559,16 @@ Reuses the same live message (no spam):
 /swing_bt &lt;date&gt; — backtest strategy from date
 /swing_journal — trade history with win rate
 
-_Locations auto-scaled based on win rate. Paper trades run daily at 9:35 AM._
+<b>🤖 SELF-IMPROVING TRADER</b>
+/survival — capital status, drawdown, survival mode
+/strategy — current market regime &amp; recommended strategy
+/analyze — AI trade analysis + improvement suggestions
+/improve — show pending improvement tickets
+/approve &lt;id&gt; — approve an improvement suggestion
+/reject &lt;id&gt; — reject an improvement suggestion
+/journal — trade journal with P&amp;L history
+
+_Locations auto-scaled. AI learns from every trade. You approve improvements._
 """
         base_help += owner_help
     
@@ -2360,6 +2378,236 @@ async def cmd_swing_sizing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.effective_message.reply_html("\n".join(lines))
 
 
+# ─── Self-Improving Trader Commands ─────────────────────────────────────────
+
+async def cmd_survival(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show capital status, drawdown, and survival mode."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    try:
+        cap = await asyncio.to_thread(get_capital_status)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    _SEP = "━" * 32
+    lines = [
+        f"🛡️ <b>Survival Dashboard</b>", _SEP,
+        f"💰 Capital: <b>₹{cap['capital']:,.0f}</b>  (started ₹1,00,000)",
+        f"📊 Total Return: <b>{cap['total_return']:+.1f}%</b>",
+        f"📈 Peak: ₹{cap['peak']:,.0f}  |  Drawdown: {cap['drawdown']:.1f}%", _SEP,
+        f"📅 Today: {cap['daily_pnl']:+,.0f}  |  Week: {cap['weekly_pnl']:+,.0f}  |  Month: {cap['monthly_pnl']:+,.0f}", _SEP,
+        f"{cap['status']}",
+        f"📌 Deploy: {cap['deploy_pct']*100:.0f}% of capital",
+    ]
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """AI analysis of recent trades + improvement suggestions."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    await update.effective_message.reply_text("🤖 AI analyzing your trades...")
+    try:
+        stats = await asyncio.to_thread(get_trader_stats, 30)
+        trades = await asyncio.to_thread(get_recent_trades, 20)
+        regime = await asyncio.to_thread(detect_regime)
+        suggestions = await asyncio.to_thread(generate_improvement_suggestions, trades, stats)
+        patterns = await asyncio.to_thread(analyze_win_loss_pattern, trades)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    _SEP = "━" * 32
+    lines = [
+        f"🤖 <b>AI Trade Analysis</b>", _SEP,
+        f"📊 Win Rate: {stats['wr']}%  |  Streak: {stats['streak']}",
+        f"📈 Avg: {stats['avg_pnl']:+.2f}%  |  Total: {stats['total_pnl']:+.2f}%",
+        f"🏆 Best: +{stats['best']}%  |  Worst: {stats['worst']}%", _SEP,
+    ]
+
+    # Market regime
+    emoji = get_regime_emoji(regime.get('regime', 'unknown'))
+    lines.append(f"{emoji} <b>Market:</b> {regime.get('regime', '?').replace('_', ' ').title()}")
+    lines.append(f"   {regime.get('details', '')}")
+    lines.append(f"   Strategy: {get_strategy_description(regime.get('strategy', '?'))}")
+    lines.append(_SEP)
+
+    # Patterns
+    if patterns.get('insights'):
+        lines.append("🔍 <b>Patterns Found:</b>")
+        for insight in patterns['insights']:
+            lines.append(f"   • {insight}")
+        lines.append("")
+
+    # Suggestions
+    if suggestions:
+        lines.append(f"💡 <b>{len(suggestions)} Improvement Suggestions:</b>")
+        for i, s in enumerate(suggestions, 1):
+            lines.append(f"\n{i}. <b>{s.get('title', '?')}</b> [{s.get('category', '?')}]")
+            lines.append(f"   Priority: {s.get('priority', '?').upper()}")
+            lines.append(f"   Before: {s.get('before', '?')}")
+            lines.append(f"   After: {s.get('after', '?')}")
+            lines.append(f"   Why: {s.get('rationale', '?')}")
+        lines.append(f"\n<i>Use /approve to approve, /reject to reject.</i>")
+    else:
+        lines.append("💡 No improvement suggestions yet (need 5+ trades)")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_improve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show pending improvement tickets."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    try:
+        tickets = await asyncio.to_thread(get_pending_tickets)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    _SEP = "━" * 32
+    lines = [f"📋 <b>Improvement Tickets</b> ({len(tickets)} pending)", _SEP]
+
+    if not tickets:
+        lines.append("No pending tickets. Run /analyze to generate suggestions.")
+    else:
+        for i, t in enumerate(tickets, 1):
+            lines.append(f"\n{i}. <b>{t.get('title', '?')}</b>")
+            lines.append(f"   Category: {t.get('category', '?')}  |  Priority: {t.get('priority', '?').upper()}")
+            lines.append(f"   Before: {t.get('before', '?')}")
+            lines.append(f"   After: {t.get('after', '?')}")
+            lines.append(f"   Why: {t.get('rationale', '?')}")
+            lines.append(f"   <code>/approve {str(t['_id'])[:8]}</code>  <code>/reject {str(t['_id'])[:8]}</code>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve an improvement ticket."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    args = context.args
+    if not args:
+        await update.effective_message.reply_text("Usage: /approve <ticket_id_prefix>"); return
+
+    prefix = args[0]
+    try:
+        tickets = await asyncio.to_thread(get_pending_tickets)
+        matching = [t for t in tickets if str(t['_id']).startswith(prefix)]
+        if not matching:
+            await update.effective_message.reply_text(f"No ticket found with prefix: {prefix}"); return
+        result = await asyncio.to_thread(approve_ticket, str(matching[0]['_id']))
+        if result.get('ok'):
+            await update.effective_message.reply_text(f"✅ Approved: {matching[0].get('title', '?')}\n\nThe change will be applied in the next cycle.")
+        else:
+            await update.effective_message.reply_text("Failed to approve.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}")
+
+
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reject an improvement ticket."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    args = context.args
+    if not args:
+        await update.effective_message.reply_text("Usage: /reject <ticket_id_prefix>"); return
+
+    prefix = args[0]
+    try:
+        tickets = await asyncio.to_thread(get_pending_tickets)
+        matching = [t for t in tickets if str(t['_id']).startswith(prefix)]
+        if not matching:
+            await update.effective_message.reply_text(f"No ticket found with prefix: {prefix}"); return
+        result = await asyncio.to_thread(reject_ticket, str(matching[0]['_id']))
+        if result.get('ok'):
+            await update.effective_message.reply_text(f"❌ Rejected: {matching[0].get('title', '?')}")
+        else:
+            await update.effective_message.reply_text("Failed to reject.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}")
+
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show trade journal with recent trades and improvement history."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    try:
+        stats = await asyncio.to_thread(get_trader_stats, 30)
+        trades = await asyncio.to_thread(get_recent_trades, 10)
+        history = await asyncio.to_thread(get_improvement_history)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    _SEP = "━" * 32
+    lines = [
+        f"📒 <b>Trade Journal</b> (30 days)", _SEP,
+        f"📊 {stats['total']} trades  |  {stats['wins']}W {stats['losses']}L  |  WR {stats['wr']}%",
+        f"📈 Avg: {stats['avg_pnl']:+.2f}%  |  Total: {stats['total_pnl']:+.2f}%",
+        f"⏱ Avg Hold: {stats['avg_hold']:.1f}d  |  Streak: {stats['streak']}", _SEP,
+    ]
+
+    # Recent trades
+    if trades:
+        lines.append("<b>Recent Trades:</b>")
+        for t in trades[:8]:
+            emoji = "✅" if t.get('pnl_pct', 0) > 0 else "❌"
+            sym = t.get('symbol', '?').replace('.NS', '')
+            lines.append(f"  {emoji} {sym}  {t.get('pnl_pct', 0):+.2f}%  ({t.get('exit_reason', '?')})  {t.get('holding_days', 0)}d")
+    else:
+        lines.append("No trades logged yet.")
+
+    # Improvement history
+    if history:
+        lines.append(_SEP)
+        lines.append("<b>Improvement Log:</b>")
+        for h in history[:5]:
+            status_emoji = {"pending": "⏳", "approved": "✅", "rejected": "❌", "applied": "🔧"}.get(h.get('status', ''), "?")
+            lines.append(f"  {status_emoji} {h.get('title', '?')[:50]}  [{h.get('status', '?')}]")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current market regime and recommended strategy."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    await update.effective_message.reply_text("📊 Detecting market regime...")
+    try:
+        regime = await asyncio.to_thread(detect_regime)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    emoji = get_regime_emoji(regime.get('regime', 'unknown'))
+    strat = get_strategy_description(regime.get('strategy', '?'))
+
+    _SEP = "━" * 32
+    lines = [
+        f"{emoji} <b>Market Regime</b>", _SEP,
+        f"📊 Regime: <b>{regime.get('regime', '?').replace('_', ' ').title()}</b>",
+        f"🎯 Strategy: {strat}",
+        f"📈 Nifty: ₹{regime.get('price', '?')}  |  200 EMA: ₹{regime.get('ema200', '?')}",
+        f"📉 RSI: {regime.get('rsi', '?')}  |  ATR: {regime.get('atr_pct', '?')}%",
+        f"🔥 VIX: {regime.get('vix', '?')}  |  20d Mom: {regime.get('momentum_20d', '?')}%",
+        f"🛡️ Confidence: {regime.get('confidence', 0)}%",
+        _SEP,
+        f"<i>{regime.get('details', '')}</i>",
+    ]
+    await update.effective_message.reply_html("\n".join(lines))
+
+
 def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
@@ -2423,6 +2671,13 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("swing_status", cmd_swing_status))
     app.add_handler(CommandHandler("swing_scan", cmd_swing_scan))
     app.add_handler(CommandHandler("swing_sizing", cmd_swing_sizing))
+    app.add_handler(CommandHandler("survival", cmd_survival))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("improve", cmd_improve))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject", cmd_reject))
+    app.add_handler(CommandHandler("journal", cmd_journal))
+    app.add_handler(CommandHandler("strategy", cmd_strategy))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
