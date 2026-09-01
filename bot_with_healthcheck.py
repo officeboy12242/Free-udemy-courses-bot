@@ -89,6 +89,7 @@ from multiuser_enroller_bot import (
     cmd_revoke_premium,
     cmd_list_premium,
     cmd_stats,
+    cmd_today,
     cmd_users,
     cmd_user,
     owner_users_callback,
@@ -2078,6 +2079,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("revoke_premium", cmd_revoke_premium))
     app.add_handler(CommandHandler("list_premium", cmd_list_premium))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("user", cmd_user))
     app.add_handler(CallbackQueryHandler(owner_users_callback, pattern=r"^ouser"))

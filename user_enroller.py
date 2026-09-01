@@ -820,6 +820,71 @@ def get_user_total_enrollments(user_id: int) -> int:
     return result[0]["total"] if result else 0
 
 
+def get_today_enrollments_detailed() -> list[dict]:
+    """Return today's enrolled courses grouped by user and account.
+
+    Each entry::
+        {
+            "user_id": int,
+            "display": str,
+            "accounts": [
+                {
+                    "account_name": str,
+                    "courses": [{"title": str, "enrolled_at": datetime}],
+                },
+            ],
+        }
+    """
+    db = _get_db()
+    today = get_today_str()
+    start = datetime.strptime(today, "%Y-%m-%d")
+    end = start + timedelta(days=1)
+
+    # Fetch all enrolled_courses logged today
+    docs = list(
+        db.enrolled_courses.find(
+            {"enrolled_at": {"$gte": start, "$lt": end}},
+            {"user_id": 1, "account_id": 1, "course_title": 1, "enrolled_at": 1},
+        ).sort("enrolled_at", -1)
+    )
+    if not docs:
+        return []
+
+    # Collect unique account IDs so we can resolve names in one query
+    acc_ids = {d.get("account_id") for d in docs if d.get("account_id")}
+    acc_names: dict[int, str] = {}
+    if acc_ids:
+        for a in db.user_accounts.find({"_id": {"$in": list(acc_ids)}}, {"account_name": 1}):
+            acc_names[a["_id"]] = a.get("account_name", f"Account {a['_id']}")
+
+    # Group by user → account
+    grouped: dict[int, dict[int, list]] = {}  # user_id → {account_id → [courses]}
+    for d in docs:
+        uid = d.get("user_id")
+        aid = d.get("account_id") or 0
+        grouped.setdefault(uid, {}).setdefault(aid, []).append({
+            "title": d.get("course_title", "Unknown"),
+            "enrolled_at": d.get("enrolled_at"),
+        })
+
+    # Build output
+    result: list[dict] = []
+    for uid in sorted(grouped.keys()):
+        accounts_out: list[dict] = []
+        for aid in sorted(grouped[uid].keys()):
+            acc_label = acc_names.get(aid, f"Account {aid}" if aid else "Unknown")
+            accounts_out.append({
+                "account_name": acc_label,
+                "courses": grouped[uid][aid],
+            })
+        result.append({
+            "user_id": uid,
+            "display": format_user_label(uid),
+            "accounts": accounts_out,
+        })
+    return result
+
+
 # ─── Bot Settings (Owner) ─────────────────────────────────────────────────────
 
 def get_setting(key: str, default=None):

@@ -45,6 +45,7 @@ from user_enroller import (
     is_owner, is_premium, grant_premium, revoke_premium, get_all_premium_users,
     can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
     get_all_daily_stats, get_daily_usage, get_user_total_enrollments,
+    get_today_enrollments_detailed,
     # Telegram profiles / owner user mgmt
     upsert_telegram_profile, format_user_label, resolve_user_ref,
     get_all_enroller_users, get_enroller_user_detail,
@@ -524,6 +525,73 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines.append("\n📋 Use /users for full list + manage")
     lines.append("<i>Legend: 👑 Owner · 💎 Premium · 👤 Free</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show today's enrolled courses grouped by user and account (owner only)."""
+    if not update.effective_user or not update.effective_message:
+        return
+    _remember_telegram_user(update.effective_user)
+
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Owner only command.")
+        return
+
+    details = get_today_enrollments_detailed()
+    _SEP = "━" * 32
+
+    lines = [
+        "📅 <b>Today's Enrollments</b>",
+        _SEP,
+    ]
+
+    if not details:
+        lines.append("No courses enrolled today yet.")
+        await update.effective_message.reply_html("\n".join(lines))
+        return
+
+    total_courses = sum(
+        len(c) for e in details for a in e["accounts"] for c in [a["courses"]]
+    )
+    total_users = len(details)
+    date_str = datetime.utcnow().strftime("%d %b %Y")
+    lines.append(f"📊 <b>{total_courses}</b> courses  ·  <b>{total_users}</b> users  ·  {date_str}")
+    lines.append("")
+
+    ROLE_EMOJI = {"owner": "👑", "premium": "💎", "free": "👤"}
+    ROLE_TAG = {"owner": "OWNER", "premium": "PREMIUM", "free": ""}
+
+    for entry in details:
+        uid = entry["user_id"]
+        role = "owner" if is_owner(uid) else ("premium" if is_premium(uid) else "free")
+        emoji = ROLE_EMOJI[role]
+        tag = ROLE_TAG[role]
+        tag_str = f"  <i>[{tag}]</i>" if tag else ""
+        user_total = sum(len(a["courses"]) for a in entry["accounts"])
+        acct_count = len(entry["accounts"])
+
+        lines.append(f"{emoji} <b>{entry['display']}</b>{tag_str}")
+        lines.append(f"   {user_total} course{'s' if user_total != 1 else ''} via {acct_count} account{'s' if acct_count != 1 else ''}")
+        lines.append(_SEP)
+
+        for acc in entry["accounts"]:
+            acc_total = len(acc["courses"])
+            lines.append(f"📁 <b>{acc['account_name']}</b>  ·  {acc_total} course{'s' if acc_total != 1 else ''}")
+            for i, c in enumerate(acc["courses"][:8]):
+                ts = c["enrolled_at"]
+                time_str = ts.strftime("%H:%M") if ts else "?:??"
+                lines.append(f"   ▸ <code>{time_str}</code>  {c['title'][:72]}")
+            remaining = acc_total - 8
+            if remaining > 0:
+                lines.append(f"   … +{remaining} more")
+            lines.append("")
+
+        lines.append("")
+
+    lines.append(_SEP)
+    lines.append("<i>👑 Owner · 💎 Premium · 👤 Free</i>")
 
     await update.effective_message.reply_html("\n".join(lines))
 
