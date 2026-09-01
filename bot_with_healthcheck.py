@@ -551,13 +551,14 @@ Reuses the same live message (no spam):
 /testdip — sample dip alert
 /testalert — test alert delivery
 
-<b>💹 SWING TRADING</b>
-/swing — scan NSE-50 for top 5 swing setups (entry/SL/target)
+<b>💹 SWING TRADING (NSE-200)</b>
+/swing — scan NSE-200 for top 8 setups (3 strategies: momentum/mean-rev/EMA cross)
 /swing_status — live paper portfolio with unrealized P&amp;L
 /swing_scan — run full paper trade cycle (close exits + open new)
 /swing_sizing — show allocation tiers &amp; expected profit
 /swing_bt &lt;date&gt; — backtest strategy from date
 /swing_journal — trade history with win rate
+/post_market — post-market analysis: NSE-200 scan + AI insights
 
 <b>🤖 SELF-IMPROVING TRADER</b>
 /survival — capital status, drawdown, survival mode
@@ -2104,12 +2105,21 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     for i, s in enumerate(setups, 1):
-        lines.append(f"<b>{i}. {s.name}</b>  <i>(Score: {s.score:.0f}/100)</i>")
+        # Detect entry type from reasons
+        badge = "🔄"
+        for r in s.reasons:
+            if "MOMENTUM" in r:
+                badge = "🚀"
+                break
+            elif "EMA CROSSOVER" in r:
+                badge = "📈"
+                break
+        lines.append(f"<b>{i}. {s.name}</b>  {badge}  <i>(Score: {s.score:.0f}/100)</i>")
         lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>  |  Invest: <b>₹{s.suggested_invest:,.0f}</b>")
         lines.append(f"   ▸ SL: <code>₹{s.stop_loss:.2f}</code>  |  T1: <code>₹{s.target_1:.2f}</code>  |  T2: <code>₹{s.target_2:.2f}</code>")
-        lines.append(f"   💵 If T1 hits: <b>+₹{s.expected_profit_t1:,.0f}</b>  |  If T2: <b>+₹{s.expected_profit_t2:,.0f}</b>  |  If SL: <b>-₹{s.expected_loss_sl:,.0f}</b>")
-        lines.append(f"   ⚖️ Risk:Reward = {s.risk_reward}  |  RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x")
-        reasons_str = " · ".join(s.reasons[:3])
+        lines.append(f"   💵 If T1: <b>+₹{s.expected_profit_t1:,.0f}</b>  |  T2: <b>+₹{s.expected_profit_t2:,.0f}</b>  |  SL: <b>-₹{s.expected_loss_sl:,.0f}</b>")
+        lines.append(f"   ⚖️ R:R {s.risk_reward}  |  RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x  |  ATR: {s.atr_pct}%")
+        reasons_str = " \u00b7 ".join(s.reasons[:4])
         lines.append(f"   📋 {reasons_str}")
         lines.append(f"   <i>📐 {s.sizing_tier}</i>")
         lines.append("")
@@ -2578,13 +2588,77 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_html("\n".join(lines))
 
 
+async def cmd_post_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post-market analysis: scan NSE-200, analyze day trades, AI insights."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    await update.effective_message.reply_text("📊 Running post-market analysis on NSE-200...")
+    try:
+        # 1. Scan NSE-200 for tomorrow's setups
+        setups = await asyncio.to_thread(scan_nse50, 10)
+        # 2. Get today's trades
+        stats = await asyncio.to_thread(get_trader_stats, 1)
+        # 3. Get portfolio status
+        portfolio = await asyncio.to_thread(get_paper_portfolio)
+        # 4. Get regime
+        regime = await asyncio.to_thread(detect_regime)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}"); return
+
+    _SEP = "\u2501" * 32
+    lines = [
+        f"📊 <b>POST-MARKET ANALYSIS</b>", _SEP,
+    ]
+
+    # Market regime
+    emoji = get_regime_emoji(regime.get('regime', 'unknown'))
+    lines.append(f"{emoji} Regime: <b>{regime.get('regime', '?')}</b>")
+    lines.append(f"   Nifty: {regime.get('nifty', '?')}  |  RSI: {regime.get('rsi', '?')}  |  VIX: {regime.get('vix', '?')}")
+    lines.append(f"   Strategy: {regime.get('strategy', '?')}")
+    lines.append(_SEP)
+
+    # Today's performance
+    lines.append(f"📈 <b>Today's Performance:</b>")
+    lines.append(f"   Trades: {stats['total']}  |  {stats['wins']}W {stats['losses']}L  |  WR: {stats['wr']}%")
+    lines.append(f"   P&L: {stats['total_pnl']:+.2f}%  |  Avg: {stats['avg_pnl']:+.2f}%")
+    lines.append(_SEP)
+
+    # Open positions
+    open_trades = [t for t in portfolio if t.get('status') == 'open']
+    closed_today = [t for t in portfolio if t.get('status') == 'closed']
+    lines.append(f"💼 <b>Portfolio:</b> {len(open_trades)} open  |  {len(closed_today)} closed today")
+    if open_trades:
+        total_unrealized = sum(t.get('pnl_pct', 0) for t in open_trades)
+        lines.append(f"   Unrealized P&L: {total_unrealized:+.2f}%")
+    lines.append(_SEP)
+
+    # Tomorrow's top setups (NSE-200)
+    lines.append(f"🎯 <b>Tomorrow's Top Setups (NSE-200):</b>")
+    if setups:
+        for i, s in enumerate(setups[:8], 1):
+            badge = "🔄"
+            for r in s.reasons:
+                if "MOMENTUM" in r: badge = "🚀"; break
+                elif "EMA CROSSOVER" in r: badge = "📈"; break
+            lines.append(f"   {i}. {s.name} {badge}  Score: {s.score:.0f}  |  Entry: ₹{s.entry:.2f}  |  RSI: {s.rsi}")
+    else:
+        lines.append("   No qualifying setups tomorrow.")
+
+    lines.append(_SEP)
+    lines.append("<i>\u26a0 Post-market scan complete. Setups refresh at 9:35 AM.</i>")
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
 async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current market regime and recommended strategy."""
     if not update.effective_message or not update.effective_user: return
     if not is_owner(update.effective_user.id):
         await update.effective_message.reply_text("Owner only."); return
 
-    await update.effective_message.reply_text("📊 Detecting market regime...")
+    await update.effective_message.reply_text("\U0001f4ca Detecting market regime...")
     try:
         regime = await asyncio.to_thread(detect_regime)
     except Exception as e:
@@ -2593,7 +2667,7 @@ async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     emoji = get_regime_emoji(regime.get('regime', 'unknown'))
     strat = get_strategy_description(regime.get('strategy', '?'))
 
-    _SEP = "━" * 32
+    _SEP = "\u2501" * 32
     lines = [
         f"{emoji} <b>Market Regime</b>", _SEP,
         f"📊 Regime: <b>{regime.get('regime', '?').replace('_', ' ').title()}</b>",
@@ -2671,6 +2745,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("swing_status", cmd_swing_status))
     app.add_handler(CommandHandler("swing_scan", cmd_swing_scan))
     app.add_handler(CommandHandler("swing_sizing", cmd_swing_sizing))
+    app.add_handler(CommandHandler("post_market", cmd_post_market))
     app.add_handler(CommandHandler("survival", cmd_survival))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("improve", cmd_improve))

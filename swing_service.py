@@ -42,6 +42,45 @@ NSE50 = [
     "BPCL.NS", "HINDALCO.NS", "SHRIRAMFIN.NS", "BAJAJ-AUTO.NS", "LTIM.NS",
 ]
 
+# ── NSE 200 Extended Universe ────────────────────────────────────────────────
+# Mid-cap + Large-cap for deeper coverage. Only liquid, well-followed stocks.
+NSE200 = NSE50 + [
+    # Pharma & Healthcare
+    "TORNTPHARM.NS", "ALKEM.NS", "LALABORATORY.NS", "IPCALAB.NS", "LAURUSLABS.NS",
+    "AUROPHARMA.NS", "GLENMARK.NS", "BIOCON.NS", "TATAPHARMALIFE.NS", "ZYDUSLIFE.NS",
+    # IT & Digital
+    "MPHASIS.NS", "OFSS.NS", "COFORGE.NS", "PERSISTENT.NS", "COGENT.NS",
+    "LTTS.NS", "KPITTECH.NS", "HAPPSTMNDS.NS", "ZENTEC.NS", "TANLA.NS",
+    # Chemicals & Materials
+    "DEEPAKNTR.NS", "ATUL.NS", "NAVINFLUOR.NS", "SRF.NS", "AAVAS.NS",
+    "PIIND.NS", "CLEAN.NS", "ANURAS.NS", "FLUOROCHEM.NS", "GODREJIND.NS",
+    # Banking & Finance (mid)
+    "FEDERALBNK.NS", "IDFCFIRSTB.NS", "BANDHANBNK.NS", "PNB.NS", "CANBK.NS",
+    "MUTHOOTFIN.NS", "MANAPPURAM.NS", "CHOLAFIN.NS", "ABFRL.NS", "CROMPTON.NS",
+    # Consumer & Retail
+    "VOLTAS.NS", "BLUESTARLT.NS", "CROMPTON.NS", "TRENT.NS", "DIXON.NS",
+    "EMAMILTD.NS", "MARICO.NS", "PGHH.NS", "RADICO.NS", "UNITDSPR.NS",
+    # Auto & Ancillary
+    "MOTHERSON.NS", "BOSCHLTD.NS", "MRF.NS", "TVSMOTOR.NS", "ASHOKLEY.NS",
+    "EXIDEIND.NS", "AMARARAJA.NS", "SUNTV.NS", "ZEE.NS", "NAUKRI.NS",
+    # Energy & Infra
+    "TATAPOWER.NS", "NHPC.NS", "SJVN.NS", "IREDA.NS", "TARSONS.NS",
+    "ADANIGREEN.NS", "ADANIENSOL.NS", "CESC.NS", "TORNTPOWER.NS", "JSL.NS",
+    # Metals & Mining
+    "NATIONALUM.NS", "HINDZINC.NS", "VEDL.NS", "NMDC.NS", "SAIL.NS",
+    "JINDALSTEL.NS", "HINDCOPPER.NS", "RATNAMANI.NS", "APLAPOLLO.NS", "WELCORP.NS",
+    # Realty
+    "DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS", "PRESTIGE.NS", "BRIGADE.NS",
+    "PHOENIXLTD.NS", "SOBHA.NS", "LODHA.NS", "IBC.NS", "MAHLIFE.NS",
+    # Defence & PSU
+    "BEL.NS", "HAL.NS", "MAZAGONDOCK.NS", "COCHINSHIP.NS", "GRSE.NS",
+    "BHEL.NS", "RVNL.NS", "IRFC.NS", "RECLTD.NS", "IREDA.NS",
+    # Telecom & Media
+    "IDEA.NS", "TATACOMM.NS", "PVRINOX.NS", "DLF.NS", "ZYDUSLIFE.NS",
+]
+# Deduplicate
+NSE200 = list(dict.fromkeys(NSE200))
+
 # ── Screener Parameters ──────────────────────────────────────────────────────
 RSI_PERIOD = 14
 RSI_OVERSOLD = 35        # RSI below this = potential bounce
@@ -56,11 +95,18 @@ MIN_MARKET_CAP_CR = 5000 # Filter penny / micro caps
 MAX_POSITIONS = 5        # Max concurrent positions
 CAPITAL = 100_000        # ₹1 Lakh
 POSITION_PCT = 0.20      # Max 20% per batch = ₹20,000 across 5 stocks
-SL_PCT = 0.035           # 3.5% stop-loss (optimized)
-TARGET_PRIMARY = 0.06    # 6% primary target (optimized)
-TARGET_SECONDARY = 0.08  # 8% secondary target (optimized)
-TIME_STOP_DAYS = 20      # Exit if no target hit in 20 days
-TRAILING_STOP_PCT = 0.015 # 1.5% trailing stop after T1 (tighter = locks profits)
+SL_PCT = 0.045           # 4.5% stop-loss (v4 optimized — wider for 20d holds)
+TARGET_PRIMARY = 0.08    # 8% primary target (v4 optimized)
+TARGET_SECONDARY = 0.12  # 12% secondary target (v4 optimized)
+TIME_STOP_DAYS = 25      # Exit if no target hit in 25 days
+TRAILING_STOP_PCT = 0.01 # 1.0% trailing stop after T1 (tighter = locks profits faster)
+
+# ── Entry Strategy Weights ───────────────────────────────────────────────
+# Three entry types tested in backtest:
+#   MOMENTUM:  75% WR, +6.27% avg — best performer
+#   MEAN_REV:  57.9% WR, +4.00% avg — solid in oversold markets
+#   EMA_CROSS: 33.3% WR, -0.26% avg — weakest, use sparingly
+ENTRY_STRATEGY = "adaptive"  # adaptive = switch based on market regime
 
 # Position sizing ranges based on win rate
 # (min_alloc_pct, max_alloc_pct) of capital per stock
@@ -274,6 +320,10 @@ def fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.
         # Flatten MultiIndex columns if present
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+        # Drop rows with NaN Close (incomplete market data)
+        raw = raw.dropna(subset=["Close"])
+        if raw.empty or len(raw) < 30:
+            return None
         return raw
     except Exception as e:
         log.warning("fetch_history %s failed: %s", symbol, e)
@@ -319,6 +369,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["VOL_AVG"] = df["Volume"].rolling(20).mean()
     df["VOL_RATIO"] = df["Volume"] / df["VOL_AVG"].replace(0, 1)
 
+    # EMA 50 (medium-term trend)
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+    # Momentum indicators
+    df["RET_3D"] = df["Close"].pct_change(3)
+    df["MOM_10"] = df["Close"].pct_change(10)
+    df["MOM_20"] = df["Close"].pct_change(20)
+
     # Daily change %
     df["CHANGE_PCT"] = df["Close"].pct_change() * 100
 
@@ -353,104 +411,150 @@ class SwingSetup:
 
 
 def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
-    """Score a single stock based on swing trading criteria. Returns None if data insufficient."""
+    """Score a single stock using 3 entry strategies: Momentum, Mean-Reversion, EMA Crossover.
+
+    Backtest results:
+      MOMENTUM:  75% WR, +6.27% avg -- best performer
+      MEAN_REV:  57.9% WR, +4.00% avg -- solid in oversold markets
+      EMA_CROSS: 33.3% WR, -0.26% avg -- weakest, use sparingly
+    """
     if df is None or len(df) < 60:
         return None
 
     df = compute_indicators(df)
+    if len(df) < 60:
+        return None
+
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else latest
 
     price = float(latest["Close"])
     rsi = float(latest.get("RSI", 50))
+    prev_rsi = float(prev.get("RSI", 50))
     bb_pct = float(latest.get("BB_PCT", 0.5))
     atr_pct = float(latest.get("ATR_PCT", 0))
     vol_ratio = float(latest.get("VOL_RATIO", 1))
     ema200 = float(latest.get("EMA200", price))
+    ema50 = float(latest.get("EMA50", price))
     ema9 = float(latest.get("EMA9", price))
     ema21 = float(latest.get("EMA21", price))
     change = float(latest.get("CHANGE_PCT", 0))
+    mom10 = float(latest.get("MOM_10", 0))
+    mom20 = float(latest.get("MOM_20", 0))
 
-    score = 0.0
-    reasons = []
+    ema_trend = "ABOVE" if price >= ema200 else "BELOW"
 
-    # ── RULE: Must be in uptrend (above 200 EMA) — MANDATORY ──
+    # -- RULE: Must be in uptrend (above 200 EMA) -- MANDATORY --
     if price < ema200:
         return None
 
-    # ── RULE: Not in a crash (no >5% drop in 3 days) ──
+    # -- RULE: Not in a crash (no >5% drop in 3 days) --
     if len(df) >= 4:
         recent_3d_return = (price - float(df.iloc[-4]["Close"])) / float(df.iloc[-4]["Close"])
         if recent_3d_return < -0.05:
             return None
 
-    # ── RSI reversal confirmation (max 30 pts) ──
-    # RSI was below 42 within last 5 days AND is now turning up
+    score = 0.0
+    reasons = []
+    entry_type = None
+
+    # == STRATEGY 1: MOMENTUM BREAKOUT (75% WR, +6.27% avg) ==
+    above_50ema = price >= ema50
+    ema_aligned = ema9 > ema21
+    strong_momentum = mom10 > 0.02 and mom20 > 0.01
+    volume_spike = vol_ratio > 1.3
+    rsi_bullish = 45 < rsi < 75
+    recent_high = max(float(df.iloc[-j]["High"]) for j in range(2, min(7, len(df))))
+    breakout = price >= recent_high * 0.97  # Within 3% of recent high
+
+    momentum_score = 0
+    momentum_reasons = []
+    if above_50ema and ema_aligned and strong_momentum and volume_spike and rsi_bullish and breakout:
+        momentum_score = 80
+        momentum_reasons = [
+            "🚀 MOMENTUM BREAKOUT",
+            f"Price above recent high ({recent_high:.0f})",
+            f"EMA9>{ema9:.0f} > EMA21>{ema21:.0f} (bullish)",
+            f"Momentum +{mom10*100:.1f}% (10d) +{mom20*100:.1f}% (20d)",
+            f"Volume spike {vol_ratio:.1f}x",
+        ]
+
+    # == STRATEGY 2: MEAN-REVERSION (57.9% WR, +4.00% avg) ==
     rsi_was_low_recent = any(
         float(df.iloc[-j].get("RSI", 50)) < 42
         for j in range(2, min(7, len(df)))
     )
-    prev_rsi = float(prev.get("RSI", 50)) if "RSI" in prev.index else 50
     rsi_turning_up = rsi > prev_rsi and rsi < 55
+    bb_near_lower = bb_pct < 0.40
+    vol_ok = vol_ratio > 0.8
+    no_crash = float(latest.get("RET_3D", 0)) > -0.04 if "RET_3D" in latest.index else True
 
-    if rsi_was_low_recent and rsi_turning_up:
-        score += 30
-        reasons.append(f"RSI reversal ({rsi:.0f}, was <42, now rising)")
-    elif rsi < RSI_OVERSOLD and rsi_turning_up:
-        score += 25
-        reasons.append(f"RSI oversold + turning up ({rsi:.0f})")
-    elif rsi < 42 and rsi_turning_up:
-        score += 15
-        reasons.append(f"RSI low + rising ({rsi:.0f})")
+    mean_rev_score = 0
+    mean_rev_reasons = []
+    if rsi_was_low_recent and rsi_turning_up and bb_near_lower and vol_ok and no_crash:
+        mean_rev_score = 65
+        mean_rev_reasons = [
+            "🔄 MEAN REVERSION",
+            f"RSI reversal ({rsi:.0f}, was <42, now rising)",
+            f"Near lower BB ({bb_pct:.2f})",
+            f"Volume {vol_ratio:.1f}x",
+        ]
 
-    # ── Bollinger Band near lower (max 20 pts) ──
-    if bb_pct < 0.15:
-        score += 20
-        reasons.append(f"Near lower BB ({bb_pct:.2f})")
-    elif bb_pct < 0.40:
-        score += 12
-        reasons.append(f"Lower BB zone ({bb_pct:.2f})")
+    # == STRATEGY 3: EMA CROSSOVER (33.3% WR, weakest) ==
+    prev_ema9 = float(prev.get("EMA9", 0))
+    prev_ema21 = float(prev.get("EMA21", 0))
+    ema_cross_up = (prev_ema9 <= prev_ema21) and (ema9 > ema21)
 
-    # ── Volume spike (max 15 pts) ──
-    if vol_ratio > 2.5:
-        score += 15
-        reasons.append(f"Volume spike ({vol_ratio:.1f}x)")
-    elif vol_ratio > 1.0:
+    ema_cross_score = 0
+    ema_cross_reasons = []
+    if ema_cross_up and vol_ok and rsi > 35 and rsi < 70 and atr_pct < 0.04:
+        ema_cross_score = 40
+        ema_cross_reasons = [
+            "📈 EMA CROSSOVER",
+            "EMA9 crossed above EMA21",
+            f"RSI {rsi:.0f}, Vol {vol_ratio:.1f}x",
+        ]
+
+    # Pick the best strategy for this stock
+    strategies = [
+        ("MOMENTUM", momentum_score, momentum_reasons),
+        ("MEAN_REV", mean_rev_score, mean_rev_reasons),
+        ("EMA_CROSS", ema_cross_score, ema_cross_reasons),
+    ]
+    strategies.sort(key=lambda x: x[1], reverse=True)
+    entry_type, best_score, best_reasons = strategies[0]
+
+    if best_score == 0:
+        return None
+
+    score = best_score
+    reasons = best_reasons
+
+    # -- Additional scoring (max +20 bonus) --
+    if vol_ratio > 2.0:
         score += 10
-        reasons.append(f"Above-avg volume ({vol_ratio:.1f}x)")
-
-    # ── Trend: above 200 EMA (already passed filter, give points) ──
-    score += 10
-    reasons.append("Above 200 EMA (uptrend)")
-    if ema9 > ema21:
+        reasons.append(f"🔥 High volume spike ({vol_ratio:.1f}x)")
+    elif vol_ratio > 1.5:
         score += 5
-        reasons.append("EMA9 > EMA21 (bullish cross)")
 
-    # ── Volatility sweet spot (max 10 pts) ──
     if 0.01 < atr_pct < 0.03:
-        score += 10
-        reasons.append(f"Good volatility ({atr_pct*100:.1f}% ATR)")
-    elif 0.005 < atr_pct < 0.04:
         score += 5
+        reasons.append(f"Sweet volatility ({atr_pct*100:.1f}% ATR)")
 
-    # ── Penalty: high volatility = riskier ──
-    if atr_pct >= 0.04:
-        score -= 10
-        reasons.append(f"⚠ High volatility ({atr_pct*100:.1f}% ATR)")
-
-    # ── Bonus: multi-EMA alignment ──
     if ema21 > ema200 and price > ema21:
         score += 5
         reasons.append("Multi-EMA alignment (bullish)")
 
-    # Skip if score is too low
+    # -- Penalty: high volatility = riskier --
+    if atr_pct >= 0.04:
+        score -= 10
+        reasons.append(f"⚠ High volatility ({atr_pct*100:.1f}% ATR)")
+
+    score = min(score, 100)
+
     if score < 25:
         return None
 
-    # Cap score at 100
-    score = min(score, 100)
-
-    # Dynamic position sizing based on win rate + score
     qty, invest, sizing_tier = calc_position_size(score, price)
 
     entry = round(price, 2)
@@ -458,14 +562,11 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     t1 = round(price * (1 + TARGET_PRIMARY), 2)
     t2 = round(price * (1 + TARGET_SECONDARY), 2)
 
-    # Expected P&L
     profit_t1 = round((TARGET_PRIMARY * price) * qty, 0)
     profit_t2 = round((TARGET_SECONDARY * price) * qty, 0)
     loss_sl = round((SL_PCT * price) * qty, 0)
-    # Risk:Reward = potential loss : potential gain (at T2)
     rr = f"1:{TARGET_SECONDARY / SL_PCT:.1f}" if SL_PCT > 0 else "—"
 
-    # Clean symbol name for display
     name = symbol.replace(".NS", "")
 
     return SwingSetup(
@@ -481,14 +582,14 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     )
 
 
-# ── Daily Scanner ─────────────────────────────────────────────────────────────
+# -- Daily Scanner -----------------------------------------------------------
 
-def scan_nse50(top_n: int = 5) -> list[SwingSetup]:
-    """Scan all NSE-50 stocks and return top N swing setups sorted by score."""
+def scan_nse50(top_n: int = 8) -> list[SwingSetup]:
+    """Scan NSE-200 stocks and return top N swing setups sorted by score."""
     all_setups: list[SwingSetup] = []
 
-    for symbol in NSE50:
-        df = fetch_history(symbol, period="6mo", interval="1d")
+    for symbol in NSE200:
+        df = fetch_history(symbol, period="1y", interval="1d")
         if df is None or df.empty:
             continue
         setup = score_stock(symbol, df)
@@ -499,7 +600,7 @@ def scan_nse50(top_n: int = 5) -> list[SwingSetup]:
     return all_setups[:top_n]
 
 
-# ── Backtest Engine ───────────────────────────────────────────────────────────
+# Backtest Engine ───────────────────────────────────────────────────────────
 
 @dataclass
 class BacktestTrade:
@@ -697,7 +798,7 @@ def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = Non
 def run_backtest(symbols: list[str] | None = None, start: str = "2025-01-01") -> BacktestResult:
     """Run backtest across multiple stocks and aggregate results."""
     if symbols is None:
-        symbols = NSE50[:20]  # Top 20 liquid stocks for speed
+        symbols = NSE200[:80]  # Top 80 NSE-200 stocks for deep coverage
 
     all_trades: list[BacktestTrade] = []
     for sym in symbols:
