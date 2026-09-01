@@ -46,6 +46,7 @@ from user_enroller import (
     can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
     get_all_daily_stats, get_daily_usage, get_user_total_enrollments,
     get_today_enrollments_detailed, get_telegram_profiles_batch, get_premium_user_ids,
+    get_account_total_counts, get_user_total_course_count,
     # Telegram profiles / owner user mgmt
     upsert_telegram_profile, format_user_label, resolve_user_ref,
     get_all_enroller_users, get_enroller_user_detail,
@@ -559,6 +560,10 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Premium status — single $in query
     premium_ids = get_premium_user_ids(all_uids)
 
+    # Overall course totals — 2 aggregation queries (account-level + user-level)
+    acc_totals = get_account_total_counts(all_uids)
+    user_totals = get_user_total_course_count(all_uids)
+
     def _label(uid: int) -> str:
         p = profiles.get(uid, {})
         un = p.get("username") or ""
@@ -592,12 +597,17 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         acct_count = len(entry["accounts"])
 
         lines.append(f"{emoji} <b>{_label(uid)}</b>{tag_str}")
-        lines.append(f"   {user_total} course{'s' if user_total != 1 else ''} via {acct_count} account{'s' if acct_count != 1 else ''}")
+        all_time = user_totals.get(uid, 0)
+        if all_time:
+            lines.append(f"   📅 today {user_total}  ·  📚 total {all_time}  ·  {acct_count} account{'s' if acct_count != 1 else ''}")
+        else:
+            lines.append(f"   {user_total} course{'s' if user_total != 1 else ''} via {acct_count} account{'s' if acct_count != 1 else ''}")
         lines.append(_SEP)
 
         for acc in entry["accounts"]:
             acc_total = len(acc["courses"])
-            lines.append(f"📁 <b>{acc['account_name']}</b>  ·  {acc_total} course{'s' if acc_total != 1 else ''}")
+            acc_all = acc_totals.get((uid, acc.get("account_id", 0)), 0)
+            lines.append(f"📁 <b>{acc['account_name']}</b>  ·  today {acc_total}  ·  total {acc_all}")
             for i, c in enumerate(acc["courses"][:8]):
                 ts = c["enrolled_at"]
                 time_str = ts.strftime("%H:%M") if ts else "?:??"

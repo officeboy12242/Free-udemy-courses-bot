@@ -911,6 +911,7 @@ def get_today_enrollments_detailed() -> list[dict]:
         for aid in sorted(grouped[uid].keys()):
             acc_label = acc_names.get(aid, f"Account {aid}" if aid else "Unknown")
             accounts_out.append({
+                "account_id": aid,
                 "account_name": acc_label,
                 "courses": grouped[uid][aid],
             })
@@ -919,6 +920,50 @@ def get_today_enrollments_detailed() -> list[dict]:
             "accounts": accounts_out,
         })
     return result
+
+
+def get_account_total_counts(user_ids: list[int]) -> dict[tuple[int, int], int]:
+    """Return total all-time course counts per (user_id, account_id) pair.
+
+    Uses a single aggregation pipeline.  Returns
+    ``{(user_id, account_id): count}``.
+    """
+    if not user_ids:
+        return {}
+    try:
+        db = _get_db()
+        pipeline = [
+            {"$match": {"user_id": {"$in": user_ids}}},
+            {"$group": {
+                "_id": {"user_id": "$user_id", "account_id": "$account_id"},
+                "total": {"$sum": 1},
+            }},
+        ]
+        result: dict[tuple[int, int], int] = {}
+        for doc in db.enrolled_courses.aggregate(pipeline):
+            key = (doc["_id"]["user_id"], doc["_id"]["account_id"] or 0)
+            result[key] = doc["total"]
+        return result
+    except Exception:
+        return {}
+
+
+def get_user_total_course_count(user_ids: list[int]) -> dict[int, int]:
+    """Return total all-time course counts per user_id (across all accounts).
+
+    Returns ``{user_id: count}``.
+    """
+    if not user_ids:
+        return {}
+    try:
+        db = _get_db()
+        pipeline = [
+            {"$match": {"user_id": {"$in": user_ids}}},
+            {"$group": {"_id": "$user_id", "total": {"$sum": 1}}},
+        ]
+        return {doc["_id"]: doc["total"] for doc in db.enrolled_courses.aggregate(pipeline)}
+    except Exception:
+        return {}
 
 
 # ─── Bot Settings (Owner) ─────────────────────────────────────────────────────
