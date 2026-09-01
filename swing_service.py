@@ -187,7 +187,7 @@ class SwingSetup:
 
 def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     """Score a single stock based on swing trading criteria. Returns None if data insufficient."""
-    if df is None or len(df) < EMA_TREND + 10:
+    if df is None or len(df) < 60:
         return None
 
     df = compute_indicators(df)
@@ -383,7 +383,7 @@ class BacktestResult:
 def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = None) -> list[BacktestTrade]:
     """Backtest swing strategy on a single stock over historical data."""
     df = fetch_history(symbol, period="1y", interval="1d")
-    if df is None or len(df) < EMA_TREND + 30:
+    if df is None or len(df) < 60:
         return []
 
     df = compute_indicators(df)
