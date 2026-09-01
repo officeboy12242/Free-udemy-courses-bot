@@ -61,6 +61,66 @@ TARGET_PRIMARY = 0.03    # 3% primary target
 TARGET_SECONDARY = 0.05  # 5% secondary target
 TIME_STOP_DAYS = 10      # Exit if no target hit in 10 days
 
+# Position sizing ranges based on win rate
+# (min_alloc_pct, max_alloc_pct) of capital per stock
+POSITION_TIERS = {
+    # win_rate_threshold: (per_stock_pct, description)
+    0:   (0.015, "Conservative — win rate unknown/low"),   # ₹1,500 per stock
+    40:  (0.020, "Normal — win rate 40-50%"),              # ₹2,000 per stock
+    50:  (0.025, "Moderate — win rate 50-60%"),            # ₹2,500 per stock
+    60:  (0.035, "Aggressive — win rate 60-70%"),          # ₹3,500 per stock
+    70:  (0.045, "Confident — win rate 70%+"),             # ₹4,500 per stock
+}
+
+
+def get_historical_win_rate() -> tuple[float, int]:
+    """Get win rate and total closed trades from paper trade history.
+
+    Returns (win_rate_percent, total_closed).
+    """
+    try:
+        db = _get_db()
+        closed = list(db.swing_trades.find({"status": "closed"}))
+        if not closed:
+            return 0.0, 0
+        wins = sum(1 for t in closed if t.get("pnl_pct", 0) > 0)
+        return round((wins / len(closed)) * 100, 1), len(closed)
+    except Exception:
+        return 0.0, 0
+
+
+def calc_position_size(score: float, price: float) -> tuple[int, float, str]:
+    """Calculate position size based on historical win rate + setup score.
+
+    Returns (qty, invest_amount, tier_description).
+    """
+    win_rate, total_closed = get_historical_win_rate()
+
+    # Find the right tier
+    tier_pct = 0.015
+    tier_desc = "Conservative — win rate unknown"
+    for threshold in sorted(POSITION_TIERS.keys(), reverse=True):
+        if win_rate >= threshold:
+            tier_pct, tier_desc = POSITION_TIERS[threshold]
+            break
+
+    # Boost allocation for high-confidence setups (score 70+)
+    if score >= 80:
+        tier_pct *= 1.3   # +30% for top-tier setups
+        tier_desc += " + High confidence boost"
+    elif score >= 70:
+        tier_pct *= 1.15  # +15% for strong setups
+        tier_desc += " + Strong setup boost"
+
+    # Cap at 10% of capital per stock (risk management)
+    tier_pct = min(tier_pct, 0.10)
+
+    per_stock = CAPITAL * tier_pct
+    qty = max(1, int(per_stock / price))
+    invest = qty * price
+
+    return qty, invest, tier_desc
+
 
 def _get_db():
     """Lazy MongoDB connection (same pattern as user_enroller)."""
@@ -181,8 +241,13 @@ class SwingSetup:
     ema_trend: str         # "ABOVE" or "BELOW" 200 EMA
     change_today: float
     reasons: list[str]     # why this stock scored well
-    suggested_qty: int     # number of shares for ₹20K allocation
+    suggested_qty: int     # number of shares
     suggested_invest: float
+    expected_profit_t1: float  # ₹ profit if T1 (+3%) hits
+    expected_profit_t2: float  # ₹ profit if T2 (+5%) hits
+    expected_loss_sl: float    # ₹ loss if SL (-2%) hits
+    risk_reward: str           # e.g. "1:1.5"
+    sizing_tier: str           # why this allocation size
 
 
 def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
@@ -289,15 +354,20 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     # Cap score at 100
     score = min(score, 100)
 
-    # Position sizing
-    per_stock = (CAPITAL * POSITION_PCT) / MAX_POSITIONS  # ₹4,000 per stock
-    qty = max(1, int(per_stock / price))
-    invest = qty * price
+    # Dynamic position sizing based on win rate + score
+    qty, invest, sizing_tier = calc_position_size(score, price)
 
     entry = round(price, 2)
     sl = round(price * (1 - SL_PCT), 2)
     t1 = round(price * (1 + TARGET_PRIMARY), 2)
     t2 = round(price * (1 + TARGET_SECONDARY), 2)
+
+    # Expected P&L
+    profit_t1 = round((TARGET_PRIMARY * price) * qty, 0)
+    profit_t2 = round((TARGET_SECONDARY * price) * qty, 0)
+    loss_sl = round((SL_PCT * price) * qty, 0)
+    # Risk:Reward = potential loss : potential gain (at T2)
+    rr = f"1:{TARGET_SECONDARY / SL_PCT:.1f}" if SL_PCT > 0 else "—"
 
     # Clean symbol name for display
     name = symbol.replace(".NS", "")
@@ -310,6 +380,8 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
         ema_trend=ema_trend, change_today=round(change, 2),
         reasons=reasons,
         suggested_qty=qty, suggested_invest=round(invest, 0),
+        expected_profit_t1=profit_t1, expected_profit_t2=profit_t2,
+        expected_loss_sl=loss_sl, risk_reward=rr, sizing_tier=sizing_tier,
     )
 
 

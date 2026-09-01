@@ -2060,29 +2060,39 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     _SEP = "━" * 32
-    per_stock = (CAPITAL * POSITION_PCT) / MAX_POSITIONS
+
+    # Win rate info for header
+    from swing_service import get_historical_win_rate
+    win_rate, total_closed = get_historical_win_rate()
+    wr_str = f"{win_rate:.0f}% ({total_closed} trades)" if total_closed > 0 else "No data yet"
 
     lines = [
         f"📈 <b>Swing Trade Alerts</b>",
         _SEP,
-        f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>  |  Max per stock: <b>₹{per_stock:,.0f}</b>",
-        f"🎯 Targets: +{int(3)}% / +{int(5)}%  |  🛑 SL: -{int(2)}%  |  ⏰ Time stop: {10}d",
+        f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>",
+        f"🎯 Targets: +3% / +5%  |  🛑 SL: -2%  |  ⏰ Time stop: 10d",
+        f"📊 Win rate: <b>{wr_str}</b>  |  Sizing: dynamic",
         "",
     ]
 
     for i, s in enumerate(setups, 1):
         lines.append(f"<b>{i}. {s.name}</b>  <i>(Score: {s.score:.0f}/100)</i>")
-        lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>")
+        lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>  |  Invest: <b>₹{s.suggested_invest:,.0f}</b>")
         lines.append(f"   ▸ SL: <code>₹{s.stop_loss:.2f}</code>  |  T1: <code>₹{s.target_1:.2f}</code>  |  T2: <code>₹{s.target_2:.2f}</code>")
-        lines.append(f"   ▸ RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x  |  ATR: {s.atr_pct}%")
-        lines.append(f"   ▸ Trend: {s.ema_trend} 200EMA  |  Today: {s.change_today:+.2f}%")
-        reasons_str = " · ".join(s.reasons[:4])
+        lines.append(f"   💵 If T1 hits: <b>+₹{s.expected_profit_t1:,.0f}</b>  |  If T2: <b>+₹{s.expected_profit_t2:,.0f}</b>  |  If SL: <b>-₹{s.expected_loss_sl:,.0f}</b>")
+        lines.append(f"   ⚖️ Risk:Reward = {s.risk_reward}  |  RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x")
+        reasons_str = " · ".join(s.reasons[:3])
         lines.append(f"   📋 {reasons_str}")
+        lines.append(f"   <i>📐 {s.sizing_tier}</i>")
         lines.append("")
 
     total_invest = sum(s.suggested_invest for s in setups)
+    total_profit_t1 = sum(s.expected_profit_t1 for s in setups)
+    total_profit_t2 = sum(s.expected_profit_t2 for s in setups)
+    total_loss = sum(s.expected_loss_sl for s in setups)
     lines.append(_SEP)
     lines.append(f"💼 Total deployment: <b>₹{total_invest:,.0f}</b> / ₹{CAPITAL:,.0f} ({total_invest/CAPITAL*100:.0f}%)")
+    lines.append(f"💰 If all hit T1: <b>+₹{total_profit_t1:,.0f}</b>  |  T2: <b>+₹{total_profit_t2:,.0f}</b>  |  SL: <b>-₹{total_loss:,.0f}</b>")
     lines.append("<i>⚠ Not financial advice. Do your own research.</i>")
 
     await update.effective_message.reply_html("\n".join(lines))
