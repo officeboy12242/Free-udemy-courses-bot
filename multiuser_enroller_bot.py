@@ -45,7 +45,7 @@ from user_enroller import (
     is_owner, is_premium, grant_premium, revoke_premium, get_all_premium_users,
     can_enroll, get_remaining_today, increment_daily_usage, FREE_DAILY_LIMIT,
     get_all_daily_stats, get_daily_usage, get_user_total_enrollments,
-    get_today_enrollments_detailed,
+    get_today_enrollments_detailed, get_telegram_profiles_batch, get_premium_user_ids,
     # Telegram profiles / owner user mgmt
     upsert_telegram_profile, format_user_label, resolve_user_ref,
     get_all_enroller_users, get_enroller_user_detail,
@@ -552,6 +552,25 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_html("\n".join(lines))
         return
 
+    # ── Batch-fetch ALL user metadata in 2 queries instead of N*2 ──
+    all_uids = [e["user_id"] for e in details]
+    profiles = get_telegram_profiles_batch(all_uids)
+
+    # Premium status — single $in query
+    premium_ids = get_premium_user_ids(all_uids)
+
+    def _label(uid: int) -> str:
+        p = profiles.get(uid, {})
+        un = p.get("username") or ""
+        nm = p.get("full_name") or ""
+        if un and nm:
+            return f"@{un} ({nm})"
+        if un:
+            return f"@{un}"
+        if nm:
+            return nm
+        return f"user_{uid}"
+
     total_courses = sum(
         len(c) for e in details for a in e["accounts"] for c in [a["courses"]]
     )
@@ -565,14 +584,14 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for entry in details:
         uid = entry["user_id"]
-        role = "owner" if is_owner(uid) else ("premium" if is_premium(uid) else "free")
+        role = "owner" if is_owner(uid) else ("premium" if uid in premium_ids else "free")
         emoji = ROLE_EMOJI[role]
         tag = ROLE_TAG[role]
         tag_str = f"  <i>[{tag}]</i>" if tag else ""
         user_total = sum(len(a["courses"]) for a in entry["accounts"])
         acct_count = len(entry["accounts"])
 
-        lines.append(f"{emoji} <b>{entry['display']}</b>{tag_str}")
+        lines.append(f"{emoji} <b>{_label(uid)}</b>{tag_str}")
         lines.append(f"   {user_total} course{'s' if user_total != 1 else ''} via {acct_count} account{'s' if acct_count != 1 else ''}")
         lines.append(_SEP)
 

@@ -97,6 +97,7 @@ def init_enroller_db():
         db.user_accounts.create_index([("user_id", 1), ("is_active", 1), ("auto_enroll", 1)])
         db.enrolled_courses.create_index([("user_id", 1), ("course_url", 1)])
         db.enrolled_courses.create_index([("user_id", 1), ("enrolled_at", -1)])
+        db.enrolled_courses.create_index([("enrolled_at", -1)])  # for /today query
         db.daily_usage.create_index([("user_id", 1), ("date", 1)], unique=True)
         db.premium_users.create_index([("user_id", 1)], unique=True)
         db.user_setup_state.create_index([("user_id", 1)], unique=True)
@@ -509,6 +510,21 @@ def is_premium(user_id: int) -> bool:
     return db.premium_users.find_one({"user_id": user_id}) is not None
 
 
+def get_premium_user_ids(user_ids: list[int]) -> set[int]:
+    """Batch-check premium status for multiple user_ids in ONE query."""
+    if not user_ids:
+        return set()
+    try:
+        db = _get_db()
+        docs = db.premium_users.find(
+            {"user_id": {"$in": user_ids}},
+            {"user_id": 1},
+        )
+        return {int(d["user_id"]) for d in docs}
+    except Exception:
+        return set()
+
+
 def grant_premium(user_id: int, granted_by: int) -> bool:
     """Grant premium access to a user"""
     try:
@@ -595,6 +611,27 @@ def get_telegram_profile(user_id: int) -> dict:
         }
     except Exception:
         return {"user_id": int(user_id), "username": "", "full_name": ""}
+
+
+def get_telegram_profiles_batch(user_ids: list[int]) -> dict[int, dict]:
+    """Batch-fetch telegram profiles for multiple user_ids in ONE query."""
+    if not user_ids:
+        return {}
+    try:
+        db = _get_db()
+        docs = db.telegram_profiles.find(
+            {"user_id": {"$in": [int(uid) for uid in user_ids]}},
+            {"user_id": 1, "username": 1, "full_name": 1},
+        )
+        return {
+            int(d["user_id"]): {
+                "username": d.get("username") or "",
+                "full_name": d.get("full_name") or "",
+            }
+            for d in docs
+        }
+    except Exception:
+        return {}
 
 
 def format_user_label(user_id: int) -> str:
@@ -867,7 +904,7 @@ def get_today_enrollments_detailed() -> list[dict]:
             "enrolled_at": d.get("enrolled_at"),
         })
 
-    # Build output
+    # Build output (no format_user_label here — caller batches lookups)
     result: list[dict] = []
     for uid in sorted(grouped.keys()):
         accounts_out: list[dict] = []
@@ -879,7 +916,6 @@ def get_today_enrollments_detailed() -> list[dict]:
             })
         result.append({
             "user_id": uid,
-            "display": format_user_label(uid),
             "accounts": accounts_out,
         })
     return result
