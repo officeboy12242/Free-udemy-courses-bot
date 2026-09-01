@@ -122,6 +122,82 @@ def calc_position_size(score: float, price: float) -> tuple[int, float, str]:
     return qty, invest, tier_desc
 
 
+def get_sizing_summary() -> dict:
+    """Return current sizing tier, win rate, and projected profits at each tier.
+
+    Used by /swing_sizing command.
+    """
+    win_rate, total_closed = get_historical_win_rate()
+
+    # Find current tier
+    current_pct = 0.015
+    current_desc = "Conservative — win rate unknown"
+    for threshold in sorted(POSITION_TIERS.keys(), reverse=True):
+        if win_rate >= threshold:
+            current_pct, current_desc = POSITION_TIERS[threshold]
+            break
+
+    # Build tier table
+    tiers = []
+    for threshold in sorted(POSITION_TIERS.keys()):
+        pct, desc = POSITION_TIERS[threshold]
+        # Calculate example at ₹500 stock price
+        example_price = 500.0
+        per_stock = CAPITAL * pct
+        qty = max(1, int(per_stock / example_price))
+        invest = qty * example_price
+        profit_t1 = round(TARGET_PRIMARY * invest, 0)
+        profit_t2 = round(TARGET_SECONDARY * invest, 0)
+        loss_sl = round(SL_PCT * invest, 0)
+        active = "◀ CURRENT" if (threshold == 0 and win_rate < 40) or (threshold > 0 and win_rate >= threshold and (threshold == max(t for t in POSITION_TIERS.keys() if t <= win_rate))) else ""
+        # Better active detection
+        active = ""
+        tiers.append({
+            "threshold": threshold,
+            "pct": pct,
+            "desc": desc,
+            "per_stock": round(per_stock),
+            "invest": round(invest),
+            "qty": qty,
+            "profit_t1": profit_t1,
+            "profit_t2": profit_t2,
+            "loss_sl": loss_sl,
+        })
+
+    # Mark current tier
+    active_threshold = 0
+    for threshold in sorted(POSITION_TIERS.keys(), reverse=True):
+        if win_rate >= threshold:
+            active_threshold = threshold
+            break
+    for t in tiers:
+        if t["threshold"] == active_threshold:
+            t["active"] = True
+
+    # Max concurrent deployment at each tier
+    max_deploy = round(CAPITAL * current_pct * MAX_POSITIONS)
+
+    # Sample allocation for today's ₹1L
+    sample_invest = CAPITAL * current_pct
+    sample_t1 = round(TARGET_PRIMARY * sample_invest * MAX_POSITIONS)
+    sample_t2 = round(TARGET_SECONDARY * sample_invest * MAX_POSITIONS)
+    sample_loss = round(SL_PCT * sample_invest * MAX_POSITIONS)
+
+    return {
+        "win_rate": win_rate,
+        "total_closed": total_closed,
+        "current_pct": current_pct,
+        "current_desc": current_desc,
+        "capital": CAPITAL,
+        "tiers": tiers,
+        "active_threshold": active_threshold,
+        "max_deploy": max_deploy,
+        "sample_t1": sample_t1,
+        "sample_t2": sample_t2,
+        "sample_loss": sample_loss,
+    }
+
+
 def _get_db():
     """Lazy MongoDB connection (same pattern as user_enroller)."""
     global _client, _db

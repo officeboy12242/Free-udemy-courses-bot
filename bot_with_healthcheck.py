@@ -125,7 +125,7 @@ from movie_service import (
 from swing_service import (
     scan_nse50, run_backtest as swing_run_backtest,
     log_swing_trade, close_swing_trade, get_open_trades, get_trade_summary,
-    run_paper_scan, get_paper_portfolio,
+    run_paper_scan, get_paper_portfolio, get_sizing_summary,
     CAPITAL, POSITION_PCT, MAX_POSITIONS,
 )
 
@@ -2296,6 +2296,60 @@ async def cmd_swing_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.effective_message.reply_html("\n".join(lines))
 
 
+async def cmd_swing_sizing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current position sizing tier, projected profits, and tier table."""
+    if not update.effective_message or not update.effective_user:
+        return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    await update.effective_message.reply_text("📐 Loading sizing info...")
+    try:
+        s = await asyncio.to_thread(get_sizing_summary)
+    except Exception as e:
+        await update.effective_message.reply_text(f"Failed: {e}")
+        return
+
+    _SEP = "━" * 36
+    lines = [
+        f"📐 <b>Position Sizing</b>",
+        _SEP,
+        f"💰 Capital: ₹{s['capital']:,}",
+        f"📊 Win rate: <b>{s['win_rate']}%</b>  ({s['total_closed']} closed trades)",
+        f"🎯 Current tier: <b>{s['current_desc']}</b>",
+        f"📌 Per stock: <b>₹{s['capital'] * s['current_pct']:,.0f}</b> ({s['current_pct']*100:.1f}%)",
+        "",
+        _SEP,
+        f"<b>Expected profit at current tier (5 concurrent stocks):</b>",
+        f"  📈 If all hit T1 (+3%):  <b>+₹{s['sample_t1']:,}</b>",
+        f"  📈 If all hit T2 (+5%):  <b>+₹{s['sample_t2']:,}</b>",
+        f"  📉 If all hit SL (-2%):  -₹{s['sample_loss']:,}",
+        f"  💼 Max deployed: ₹{s['max_deploy']:,}  |  Cash: ₹{s['capital'] - s['max_deploy']:,}",
+        "",
+        _SEP,
+        "<b>How allocation scales:</b>",
+    ]
+
+    for t in s["tiers"]:
+        active = " ◀ <b>YOU</b>" if t.get("active") else ""
+        lines.append(
+            f"{'━' if active else ' '} {t['threshold']}%+ WR → "
+            f"₹{t['per_stock']:,}/stock  "
+            f"(+₹{t['profit_t1']:,} T1 | +₹{t['profit_t2']:,} T2 | -₹{t['loss_sl']:,} SL)"
+            f"{active}"
+        )
+
+    lines.extend([
+        "",
+        _SEP,
+        "<i>Allocation auto-scales as win rate improves.</i>",
+        "<i>Score 80+ stocks get +30% extra allocation.</i>",
+    ])
+
+    await update.effective_message.reply_html("\n".join(lines))
+
+
 def build_telegram_application() -> Application:
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0)
     app = Application.builder().token(BOT_TOKEN).request(request).build()
@@ -2358,6 +2412,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("swing_journal", cmd_swing_journal))
     app.add_handler(CommandHandler("swing_status", cmd_swing_status))
     app.add_handler(CommandHandler("swing_scan", cmd_swing_scan))
+    app.add_handler(CommandHandler("swing_sizing", cmd_swing_sizing))
     
     # Message handler for setup input (must be last to not interfere with commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_setup_message))
