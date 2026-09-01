@@ -541,6 +541,16 @@ Reuses the same live message (no spam):
 /trade open — open trades only
 /testdip — sample dip alert
 /testalert — test alert delivery
+
+<b>💹 SWING TRADING</b>
+/swing — scan NSE-50 for top 5 swing setups (entry/SL/target)
+/swing_status — live paper portfolio with unrealized P&amp;L
+/swing_scan — run full paper trade cycle (close exits + open new)
+/swing_sizing — show allocation tiers &amp; expected profit
+/swing_bt &lt;date&gt; — backtest strategy from date
+/swing_journal — trade history with win rate
+
+_Locations auto-scaled based on win rate. Paper trades run daily at 9:35 AM._
 """
         base_help += owner_help
     
