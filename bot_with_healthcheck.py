@@ -122,11 +122,13 @@ from movie_service import (
     check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
     init_movie_site_urls, run_startup_site_health,
 )
+from market_calendar import is_nse_trading_day
 from swing_service import (
     scan_nse50, run_backtest as swing_run_backtest,
     log_swing_trade, close_swing_trade, get_open_trades, get_trade_summary,
     run_paper_scan, get_paper_portfolio, get_sizing_summary,
     CAPITAL, POSITION_PCT, MAX_POSITIONS, SL_PCT, TARGET_PRIMARY, TARGET_SECONDARY,
+    TIME_STOP_DAYS,
 )
 from trader_journal import (
     get_capital_status, get_trader_stats, get_recent_trades,
@@ -2099,7 +2101,8 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📈 <b>Swing Trade Alerts</b>",
         _SEP,
         f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>",
-        f"🎯 Targets: +3% / +5%  |  🛑 SL: -2%  |  ⏰ Time stop: 10d",
+        f"🎯 Targets: +{TARGET_PRIMARY*100:.0f}% / +{TARGET_SECONDARY*100:.0f}%  |  "
+        f"🛑 SL: -{SL_PCT*100:.0f}%  |  ⏰ Time stop: {TIME_STOP_DAYS}d",
         f"📊 Win rate: <b>{wr_str}</b>  |  Sizing: dynamic",
         "",
     ]
@@ -2135,6 +2138,7 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(_SEP)
     lines.append(f"💼 Total deployment: <b>₹{total_invest:,.0f}</b> / ₹{CAPITAL:,.0f} ({total_invest/CAPITAL*100:.0f}%)")
     lines.append(f"💰 If all hit T1: <b>+₹{total_profit_t1:,.0f}</b>  |  T2: <b>+₹{total_profit_t2:,.0f}</b>  |  SL: <b>-₹{total_loss:,.0f}</b>")
+    lines.append("<i>📋 These are setups only — run /swing_scan to book them as paper trades, then /swing_status to track them live.</i>")
     lines.append("<i>⚠ Not financial advice. Do your own research.</i>")
 
     await update.effective_message.reply_html("\n".join(lines))
@@ -2239,7 +2243,11 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if portfolio["open"]:
         _TYPE_EMOJI = {"MOMENTUM": "🚀", "MEAN_REV": "🔄", "EMA_CROSS": "📈", "52WK_BREAK": "📈", "MULTI_TF": "📊"}
         lines.append(f"📦 Open positions: {len(portfolio['open'])}  |  Invested: <b>₹{portfolio['total_invested']:,.0f}</b>")
-        lines.append(f"📈 Unrealized P&L: <b>{'+' if portfolio['total_unrealized'] >= 0 else ''}₹{portfolio['total_unrealized']:,.0f}</b>")
+        lines.append(
+            f"📈 Unrealized P&L: <b>{'+' if portfolio['total_unrealized'] >= 0 else ''}"
+            f"₹{portfolio['total_unrealized']:,.0f}</b>  "
+            f"({portfolio.get('total_unrealized_pct', 0):+.2f}%)"
+        )
         lines.append("")
         for p in portfolio["open"]:
             emoji = "🟢" if p["unrealized_pct"] >= 0 else "🔴"
@@ -2247,11 +2255,16 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             sl = p.get("sl", 0)
             t1 = p.get("t1", 0)
             t2 = p.get("t2", 0)
+            # Flag positions whose live quote could not be fetched, so a flat
+            # 0.00% is never mistaken for "price hasn't moved".
+            live_mark = "" if p.get("live", True) else "  ⚠️<i>no live price</i>"
+            entered = p.get("entered_at")
+            when = entered.strftime("%d %b") if isinstance(entered, datetime) else "?"
             lines.append(
                 f"{emoji} {badge} <b>{p['symbol'].replace('.NS','')}</b>  "
                 f"Entry ₹{p['entry']:.2f}  →  ₹{p['current']:.2f}  "
                 f"{p['unrealized_pct']:+.2f}%  ({p['unrealized_inr']:+,.0f} INR)  "
-                f"{p['days_held']}d held"
+                f"{p['days_held']}d held{live_mark}"
             )
             if sl or t1 or t2:
                 lines.append(
@@ -2259,7 +2272,21 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     f"T1 ₹{t1:.2f} (+{TARGET_PRIMARY*100:.0f}%)  |  "
                     f"T2 ₹{t2:.2f} (+{TARGET_SECONDARY*100:.0f}%)"
                 )
+            if p.get("t1_hit"):
+                lines.append(
+                    f"   🎯 T1 hit — trailing from peak ₹{p.get('peak_price', 0):.2f}, "
+                    f"stop ₹{p.get('trail_stop', 0):.2f}"
+                )
+            lines.append(f"   <i>Entered {when} · Qty {p['qty']}</i>")
         lines.append("")
+
+        if portfolio.get("stale_symbols"):
+            lines.append(
+                "⚠️ <i>Live price unavailable for: "
+                + ", ".join(s.replace(".NS", "") for s in portfolio["stale_symbols"])
+                + " — shown at entry price.</i>"
+            )
+            lines.append("")
     else:
         lines.append("📦 No open positions")
         lines.append("")
@@ -2282,7 +2309,10 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
     lines.append(_SEP)
-    lines.append("<i>Paper trade — not real money. Use /swing to scan for new setups.</i>")
+    lines.append(
+        "<i>Paper trade — not real money. /swing lists setups (does not record them); "
+        "/swing_scan books them into this portfolio.</i>"
+    )
 
     await update.effective_message.reply_html("\n".join(lines))
 
@@ -3521,8 +3551,8 @@ async def _run_paper_trade_daily(bot: Bot) -> None:
             target = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
             if now_ist >= target:
                 target += timedelta(days=1)
-            # Skip weekends
-            while target.weekday() >= 5:  # Saturday=5, Sunday=6
+            # Skip weekends and NSE holidays
+            while not is_nse_trading_day(target.date()):
                 target += timedelta(days=1)
             wait_secs = (target - now_ist).total_seconds()
             log.info("Swing paper scan scheduled in %.0f mins (at %s)", wait_secs / 60, target.strftime("%H:%M %Z"))

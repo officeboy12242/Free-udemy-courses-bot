@@ -33,24 +33,24 @@ NSE50 = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
     "HINDUNILVR.NS", "ITC.NS", "SBIN.NS", "BHARTIARTL.NS", "KOTAKBANK.NS",
     "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "TITAN.NS",
-    "SUNPHARMA.NS", "BAJFINANCE.NS", "WIPRO.NS", "HCLTECH.NS", "TATAMOTORS.NS",
+    "SUNPHARMA.NS", "BAJFINANCE.NS", "WIPRO.NS", "HCLTECH.NS", "TMPV.NS",
     "ULTRACEMCO.NS", "ONGC.NS", "NTPC.NS", "POWERGRID.NS", "M&M.NS",
     "JSWSTEEL.NS", "TATASTEEL.NS", "ADANIENT.NS", "ADANIPORTS.NS", "TECHM.NS",
     "BAJAJFINSV.NS", "INDUSINDBK.NS", "HDFCLIFE.NS", "SBILIFE.NS", "DIVISLAB.NS",
     "DRREDDY.NS", "CIPLA.NS", "APOLLOHOSP.NS", "NESTLEIND.NS", "EICHERMOT.NS",
     "COALINDIA.NS", "GRASIM.NS", "TATACONSUM.NS", "BRITANNIA.NS", "HEROMOTOCO.NS",
-    "BPCL.NS", "HINDALCO.NS", "SHRIRAMFIN.NS", "BAJAJ-AUTO.NS", "LTIM.NS",
+    "BPCL.NS", "HINDALCO.NS", "SHRIRAMFIN.NS", "BAJAJ-AUTO.NS",
 ]
 
 # ── NSE 200 Extended Universe ────────────────────────────────────────────────
 # Mid-cap + Large-cap for deeper coverage. Only liquid, well-followed stocks.
 NSE200 = NSE50 + [
     # Pharma & Healthcare
-    "TORNTPHARM.NS", "ALKEM.NS", "LALABORATORY.NS", "IPCALAB.NS", "LAURUSLABS.NS",
-    "AUROPHARMA.NS", "GLENMARK.NS", "BIOCON.NS", "TATAPHARMALIFE.NS", "ZYDUSLIFE.NS",
+    "TORNTPHARM.NS", "ALKEM.NS", "LALPATHLAB.NS", "IPCALAB.NS", "LAURUSLABS.NS",
+    "AUROPHARMA.NS", "GLENMARK.NS", "BIOCON.NS", "ZYDUSLIFE.NS",
     # IT & Digital
-    "MPHASIS.NS", "OFSS.NS", "COFORGE.NS", "PERSISTENT.NS", "COGENT.NS",
-    "LTTS.NS", "KPITTECH.NS", "HAPPSTMNDS.NS", "ZENTEC.NS", "TANLA.NS",
+    "MPHASIS.NS", "OFSS.NS", "COFORGE.NS", "PERSISTENT.NS", "LTTS.NS",
+    "KPITTECH.NS", "HAPPSTMNDS.NS", "ZENTEC.NS", "TANLA.NS",
     # Chemicals & Materials
     "DEEPAKNTR.NS", "ATUL.NS", "NAVINFLUOR.NS", "SRF.NS", "AAVAS.NS",
     "PIIND.NS", "CLEAN.NS", "ANURAS.NS", "FLUOROCHEM.NS", "GODREJIND.NS",
@@ -58,11 +58,11 @@ NSE200 = NSE50 + [
     "FEDERALBNK.NS", "IDFCFIRSTB.NS", "BANDHANBNK.NS", "PNB.NS", "CANBK.NS",
     "MUTHOOTFIN.NS", "MANAPPURAM.NS", "CHOLAFIN.NS", "ABFRL.NS", "CROMPTON.NS",
     # Consumer & Retail
-    "VOLTAS.NS", "BLUESTARLT.NS", "CROMPTON.NS", "TRENT.NS", "DIXON.NS",
+    "VOLTAS.NS", "BLUESTARCO.NS", "CROMPTON.NS", "TRENT.NS", "DIXON.NS",
     "EMAMILTD.NS", "MARICO.NS", "PGHH.NS", "RADICO.NS", "UNITDSPR.NS",
     # Auto & Ancillary
     "MOTHERSON.NS", "BOSCHLTD.NS", "MRF.NS", "TVSMOTOR.NS", "ASHOKLEY.NS",
-    "EXIDEIND.NS", "AMARARAJA.NS", "SUNTV.NS", "ZEE.NS", "NAUKRI.NS",
+    "EXIDEIND.NS", "ARE&M.NS", "SUNTV.NS", "ZEEL.NS", "NAUKRI.NS",
     # Energy & Infra
     "TATAPOWER.NS", "NHPC.NS", "SJVN.NS", "IREDA.NS", "TARSONS.NS",
     "ADANIGREEN.NS", "ADANIENSOL.NS", "CESC.NS", "TORNTPOWER.NS", "JSL.NS",
@@ -71,9 +71,9 @@ NSE200 = NSE50 + [
     "JINDALSTEL.NS", "HINDCOPPER.NS", "RATNAMANI.NS", "APLAPOLLO.NS", "WELCORP.NS",
     # Realty
     "DLF.NS", "GODREJPROP.NS", "OBEROIRLTY.NS", "PRESTIGE.NS", "BRIGADE.NS",
-    "PHOENIXLTD.NS", "SOBHA.NS", "LODHA.NS", "IBC.NS", "MAHLIFE.NS",
+    "PHOENIXLTD.NS", "SOBHA.NS", "LODHA.NS", "MAHLIFE.NS",
     # Defence & PSU
-    "BEL.NS", "HAL.NS", "MAZAGONDOCK.NS", "COCHINSHIP.NS", "GRSE.NS",
+    "BEL.NS", "HAL.NS", "MAZDOCK.NS", "COCHINSHIP.NS", "GRSE.NS",
     "BHEL.NS", "RVNL.NS", "IRFC.NS", "RECLTD.NS", "IREDA.NS",
     # Telecom & Media
     "IDEA.NS", "TATACOMM.NS", "PVRINOX.NS", "DLF.NS", "ZYDUSLIFE.NS",
@@ -311,8 +311,19 @@ def _ensure_indexes():
 
 # ── Data Fetching ─────────────────────────────────────────────────────────────
 
-def fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame | None:
-    """Fetch OHLCV history for a symbol via yfinance. Always closes session."""
+def fetch_history(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    min_rows: int = 30,
+) -> pd.DataFrame | None:
+    """Fetch OHLCV history for a symbol via yfinance.
+
+    ``min_rows`` guards the *screener* against half-loaded history (indicators
+    need ~60 bars). Short-window callers — live quotes, exit checks — must pass
+    a small ``min_rows``; the old hard-coded floor of 30 silently returned None
+    for every ``period="5d"`` call, which killed live prices and exit detection.
+    """
     try:
         raw = yf.download(symbol, period=period, interval=interval,
                           progress=False, auto_adjust=False)
@@ -323,12 +334,47 @@ def fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.
             raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
         # Drop rows with NaN Close (incomplete market data)
         raw = raw.dropna(subset=["Close"])
-        if raw.empty or len(raw) < 30:
+        if raw.empty or len(raw) < min_rows:
             return None
         return raw
     except Exception as e:
         log.warning("fetch_history %s failed: %s", symbol, e)
         return None
+
+
+def fetch_recent_bars(symbol: str, days: int = 7) -> pd.DataFrame | None:
+    """Fetch the last ``days`` calendar days of daily bars for live tracking.
+
+    Unlike the screener path this accepts a single bar, so it works intraday
+    and right after entry.
+    """
+    if days <= 7:
+        period = "5d"
+    elif days <= 25:
+        period = "1mo"
+    elif days <= 80:
+        period = "3mo"
+    elif days <= 170:
+        period = "6mo"
+    else:
+        period = "1y"
+    df = fetch_history(symbol, period=period, interval="1d", min_rows=1)
+    if df is None:
+        # yfinance occasionally returns an empty short window; retry wider.
+        df = fetch_history(symbol, period="3mo", interval="1d", min_rows=1)
+    return df
+
+
+def fetch_live_prices(symbols: list[str], days: int = 7) -> dict[str, pd.DataFrame]:
+    """Fetch recent bars for several symbols, skipping ones that fail."""
+    out: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        df = fetch_recent_bars(sym, days)
+        if df is not None and not df.empty:
+            out[sym] = df
+        else:
+            log.warning("Live price fetch failed for %s", sym)
+    return out
 
 
 # ── Technical Indicators ──────────────────────────────────────────────────────
@@ -1001,9 +1047,12 @@ def get_trade_summary(user_id: int, days: int = 30) -> dict:
 # ── Auto Paper Trading ───────────────────────────────────────────────────────
 
 def check_open_trades_for_exits() -> list[dict]:
-    """Check all open paper trades against current prices.
+    """Check all open paper trades against price action since entry.
 
-    Closes trades that hit SL, T1+trail, T2, or time stop.
+    Walks every daily bar *after* the entry bar so exits are not missed when
+    the scan skips a day (weekend, holiday, bot restart). Persists ``peak_price``
+    and ``t1_hit`` so the trailing stop survives across runs.
+
     Returns list of closed trade summaries.
     """
     db = _get_db()
@@ -1012,98 +1061,120 @@ def check_open_trades_for_exits() -> list[dict]:
     if not open_trades:
         return []
 
-    # Group by symbol to avoid duplicate fetches
+    from bson import ObjectId
+
+    now = datetime.utcnow()
+
+    # Fetch enough history to cover the oldest open position.
+    max_days = 7
+    for t in open_trades:
+        entered = t.get("entered_at")
+        if isinstance(entered, datetime):
+            max_days = max(max_days, (now - entered).days + 5)
+
     symbols = list({t["symbol"] for t in open_trades})
-    price_cache: dict[str, dict] = {}
-    for sym in symbols:
-        df = fetch_history(sym, period="5d", interval="1d")
-        if df is not None and not df.empty:
-            latest = df.iloc[-1]
-            price_cache[sym] = {
-                "close": float(latest["Close"]),
-                "high": float(latest["High"]),
-                "low": float(latest["Low"]),
-            }
+    bars_by_symbol = fetch_live_prices(symbols, days=max_days)
 
     closed_trades = []
     for trade in open_trades:
         sym = trade["symbol"]
-        prices = price_cache.get(sym)
-        if not prices:
+        df = bars_by_symbol.get(sym)
+        if df is None or df.empty:
             continue
 
         entry = trade["entry_price"]
         qty = trade["qty"]
-        high = prices["high"]
-        low = prices["low"]
-        close = prices["close"]
 
         # Use stored SL/T1/T2 if available, else compute
         sl = trade.get("sl") or entry * (1 - SL_PCT)
         t1 = trade.get("t1") or entry * (1 + TARGET_PRIMARY)
         t2 = trade.get("t2") or entry * (1 + TARGET_SECONDARY)
 
-        # Track peak price for trailing stop
-        peak = trade.get("peak_price", entry)
-        if high > peak:
-            peak = high
-        trail_stop = peak * (1 - TRAIL_PCT)
+        peak = float(trade.get("peak_price") or entry)
+        t1_hit = bool(trade.get("t1_hit", False))
 
-        # Calculate holding days
-        entered = trade["entered_at"]
+        entered = trade.get("entered_at")
         if isinstance(entered, datetime):
-            days_held = (datetime.utcnow() - entered).days
+            days_held = (now - entered).days
+            entry_day = pd.Timestamp(entered.date())
         else:
             days_held = 0
+            entry_day = None
+
+        # Only bars strictly after the entry day count — otherwise a trade
+        # opened at 09:35 can be stopped out by that same morning's low.
+        bars = df
+        if entry_day is not None:
+            idx = df.index
+            try:
+                naive = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+                bars = df[naive > entry_day]
+            except Exception:
+                bars = df
 
         exit_price = None
         exit_reason = None
 
-        # Stop-loss hit
-        if low <= sl:
-            exit_price = sl
-            exit_reason = "SL"
+        for ts, row in bars.iterrows():
+            high = float(row["High"])
+            low = float(row["Low"])
+            close = float(row["Close"])
 
-        # T2 hit
-        elif high >= t2:
-            exit_price = t2
-            exit_reason = "T2"
+            if high > peak:
+                peak = high
 
-        # T1 hit — start trailing at 1% below peak
-        elif high >= t1:
-            if low <= trail_stop:  # Trailing stop hit
-                exit_price = trail_stop
-                exit_reason = "TRAIL"
-            elif days_held >= TIME_STOP_DAYS:
-                exit_price = close
-                exit_reason = "TIME"
+            # Hard stop first — the conservative read when a single daily bar
+            # spans both the stop and the target.
+            if low <= sl:
+                exit_price = sl
+                exit_reason = "SL"
+                break
 
-        # Time stop
-        elif days_held >= TIME_STOP_DAYS:
-            exit_price = close
+            if high >= t2:
+                exit_price = t2
+                exit_reason = "T2"
+                break
+
+            if not t1_hit and high >= t1:
+                t1_hit = True
+                # Trailing only arms from the *next* bar; the same bar's low is
+                # noise around the target, not a genuine give-back.
+                continue
+
+            if t1_hit:
+                trail_stop = peak * (1 - TRAIL_PCT)
+                if low <= trail_stop:
+                    exit_price = trail_stop
+                    exit_reason = "TRAIL"
+                    break
+
+        if exit_price is None and days_held >= TIME_STOP_DAYS and len(bars) > 0:
+            exit_price = float(bars.iloc[-1]["Close"])
             exit_reason = "TIME"
 
-        # Update peak price in DB
-        if peak != trade.get("peak_price", entry):
-            from bson import ObjectId
-            db.swing_trades.update_one(
-                {"_id": ObjectId(trade["_id"])},
-                {"$set": {"peak_price": round(peak, 2)}},
-            )
+        # Persist trailing state even when the trade stays open
+        state_update = {}
+        if round(peak, 2) != round(float(trade.get("peak_price") or entry), 2):
+            state_update["peak_price"] = round(peak, 2)
+        if t1_hit != bool(trade.get("t1_hit", False)):
+            state_update["t1_hit"] = t1_hit
+        if state_update:
+            db.swing_trades.update_one({"_id": trade["_id"]}, {"$set": state_update})
 
         if exit_price is not None:
             pnl_pct = ((exit_price - entry) / entry) * 100
             pnl_inr = (exit_price - entry) * qty
-            from bson import ObjectId
             db.swing_trades.update_one(
-                {"_id": ObjectId(trade["_id"])},
+                {"_id": trade["_id"]},
                 {"$set": {
                     "status": "closed",
                     "exit_price": round(exit_price, 2),
                     "exit_reason": exit_reason,
                     "pnl_pct": round(pnl_pct, 2),
                     "pnl_inr": round(pnl_inr, 0),
-                    "exited_at": datetime.utcnow(),
+                    "peak_price": round(peak, 2),
+                    "t1_hit": t1_hit,
+                    "exited_at": now,
                 }},
             )
             closed_trades.append({
@@ -1175,7 +1246,7 @@ def run_paper_scan() -> dict:
         qty = max(1, int(per_stock / setup.entry))
         invest = qty * setup.entry
         try:
-            log_swing_trade(
+            doc = log_swing_trade(
                 user_id=0,  # paper trade (owner)
                 symbol=setup.symbol,
                 entry_price=setup.entry,
@@ -1183,16 +1254,19 @@ def run_paper_scan() -> dict:
                 status="open",
                 notes=f"{setup.entry_type}|score={setup.score}|reasons={','.join(setup.reasons[:3])}",
             )
-            # Also store SL/T1/T2 and entry_type in the document
-            db = _get_db()
+            # Attach SL/T1/T2 to the row we just inserted. Matching on symbol
+            # instead could update an unrelated older open row for that symbol.
+            from bson import ObjectId
             db.swing_trades.update_one(
-                {"symbol": setup.symbol, "status": "open", "user_id": 0},
+                {"_id": ObjectId(doc["_id"])},
                 {"$set": {
                     "sl": setup.stop_loss,
                     "t1": setup.target_1,
                     "t2": setup.target_2,
                     "entry_type": setup.entry_type,
                     "peak_price": setup.entry,
+                    "t1_hit": False,
+                    "score": setup.score,
                 }},
             )
             actions["opened"].append({
@@ -1217,31 +1291,49 @@ def get_paper_portfolio() -> dict:
     db = _get_db()
     if db is None:
         return {"open": [], "total_unrealized": 0, "total_invested": 0,
+                "total_unrealized_pct": 0.0,
                 "closed_count": 0, "closed_wins": 0, "closed_losses": 0,
-                "total_realized": 0, "recent_closed": []}
+                "total_realized": 0, "recent_closed": [], "stale_symbols": []}
     open_trades = list(db.swing_trades.find({"status": "open"}).sort("entered_at", -1))
     closed_trades = list(db.swing_trades.find({"status": "closed"}).sort("exited_at", -1).limit(50))
 
     # Fetch live prices for open trades
+    now = datetime.utcnow()
     symbols = list({t["symbol"] for t in open_trades})
+    max_days = 7
+    for t in open_trades:
+        entered = t.get("entered_at")
+        if isinstance(entered, datetime):
+            max_days = max(max_days, (now - entered).days + 5)
+
+    bars_by_symbol = fetch_live_prices(symbols, days=max_days)
     prices: dict[str, float] = {}
-    for sym in symbols:
-        df = fetch_history(sym, period="5d", interval="1d")
-        if df is not None and not df.empty:
-            prices[sym] = float(df.iloc[-1]["Close"])
+    price_asof: dict[str, Any] = {}
+    for sym, df in bars_by_symbol.items():
+        prices[sym] = float(df.iloc[-1]["Close"])
+        try:
+            price_asof[sym] = df.index[-1].to_pydatetime()
+        except Exception:
+            price_asof[sym] = None
+
+    stale = [s for s in symbols if s not in prices]
 
     portfolio = []
     total_unrealized = 0.0
     total_invested = 0.0
     for t in open_trades:
-        current = prices.get(t["symbol"], t["entry_price"])
+        live = prices.get(t["symbol"])
+        current = live if live is not None else t["entry_price"]
         unrealized_pct = ((current - t["entry_price"]) / t["entry_price"]) * 100
         unrealized_inr = (current - t["entry_price"]) * t["qty"]
         total_unrealized += unrealized_inr
         total_invested += t["entry_price"] * t["qty"]
 
         entered = t["entered_at"]
-        days_held = (datetime.utcnow() - entered).days if isinstance(entered, datetime) else 0
+        days_held = (now - entered).days if isinstance(entered, datetime) else 0
+
+        peak = float(t.get("peak_price") or t["entry_price"])
+        t1_hit = bool(t.get("t1_hit", False))
 
         portfolio.append({
             "symbol": t["symbol"],
@@ -1256,7 +1348,12 @@ def get_paper_portfolio() -> dict:
             "t1": t.get("t1", 0),
             "t2": t.get("t2", 0),
             "entry_type": t.get("entry_type", "?"),
-            "peak_price": t.get("peak_price", t["entry_price"]),
+            "peak_price": round(peak, 2),
+            "t1_hit": t1_hit,
+            "trail_stop": round(peak * (1 - TRAIL_PCT), 2) if t1_hit else 0,
+            "live": live is not None,
+            "price_asof": price_asof.get(t["symbol"]),
+            "entered_at": entered,
         })
 
     # Closed trade stats
@@ -1268,9 +1365,13 @@ def get_paper_portfolio() -> dict:
         "open": portfolio,
         "total_unrealized": round(total_unrealized, 0),
         "total_invested": round(total_invested, 0),
+        "total_unrealized_pct": round(
+            (total_unrealized / total_invested * 100), 2
+        ) if total_invested else 0.0,
         "closed_count": len(closed_trades),
         "closed_wins": len(closed_wins),
         "closed_losses": len(closed_losses),
         "total_realized": round(total_realized, 0),
         "recent_closed": closed_trades[:10],
+        "stale_symbols": stale,
     }
