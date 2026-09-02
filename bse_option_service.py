@@ -23,7 +23,8 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 
-BSE_DERIV_BASE = "https://api.bseindia.com/BseIndiaAPI/api/Derivative"
+BSE_API_BASE = "https://api.bseindia.com/BseIndiaAPI/api"
+BSE_DERIV_BASE = f"{BSE_API_BASE}/Derivative"
 BSE_REFERER = "https://www.bseindia.com/markets/Derivatives/DeriReports/DeriOptionchain.html"
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "").strip()
 SCRAPER_API_URL = "http://api.scraperapi.com"
@@ -127,7 +128,15 @@ def fetch_bse_expiries(scrip_cd: int = 1) -> list[str]:
     if cached and now - cached[0] < _EXPIRY_TTL:
         return cached[1]
 
-    text = _fetch_url(f"{BSE_DERIV_BASE}/getexpiry/w", {"scrip_cd": str(scrip_cd), "ProductType": "IO"})
+    # BSE moved the derivative API: /Derivative/getexpiry/w now 302s to
+    # error_Bse.html ("The Page you are looking for has been moved"), which is
+    # why this returned nothing and SENSEX looked IP-blocked. /ddlExpiry/w is
+    # the live endpoint and returns JSON under a "Table" key.
+    text = _fetch_url(f"{BSE_API_BASE}/ddlExpiry/w",
+                      {"scrip_cd": str(scrip_cd), "ProductType": "IO"})
+    if not text:
+        text = _fetch_url(f"{BSE_DERIV_BASE}/getexpiry/w",
+                          {"scrip_cd": str(scrip_cd), "ProductType": "IO"})
     if not text:
         return []
 
@@ -139,7 +148,11 @@ def fetch_bse_expiries(scrip_cd: int = 1) -> list[str]:
         for key in ("Table", "Expiry", "expiry", "data", "Data"):
             val = data.get(key)
             if isinstance(val, list):
-                expiries = [str(x.get("Expiry") or x.get("EXPIRY") or x) for x in val if x]
+                expiries = [
+                    str(x.get("Expiry") or x.get("EXPIRY") or x.get("eXPIRY")
+                        or x.get("expiry") or x)
+                    for x in val if x
+                ]
                 break
             if isinstance(val, str) and val:
                 expiries = [val]

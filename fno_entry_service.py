@@ -1809,12 +1809,30 @@ def _leg_spread_pct(row: dict, side: str) -> float:
 
 
 def _strategy_rank_base(strategy: str) -> int:
+    """Tie-break between strategies that fire on the same bar.
+
+    Ordered by measured profit factor, not by how sophisticated the strategy
+    sounds. Backtested on 59 sessions of 5m bars across the indices:
+
+        LIQUIDITY_SWEEP  PF 1.28   the only one measured positive
+        MEAN_REV         PF 0.93
+        ORB              PF 0.87
+        MACD_MTF         PF 0.81   previously ranked highest at 35
+
+    Confluence and PCR are unmeasured (they need option-chain history the
+    backtest does not have), so they sit between the sweep and the strategies
+    known to lose.
+
+    The sweep had no entry here when it was added, so it fell to the default
+    of 10 and lost every contest to strategies that lose money.
+    """
     return {
-        STRATEGY_CONFLUENCE: 30,
-        STRATEGY_MACD_MTF: 35,
-        STRATEGY_ORB: 25,
+        STRATEGY_LIQUIDITY_SWEEP: 45,
+        STRATEGY_CONFLUENCE: 25,
         STRATEGY_PCR_REVERSAL: 20,
-        STRATEGY_MEAN_REV: 22,
+        STRATEGY_MEAN_REV: 12,
+        STRATEGY_ORB: 11,
+        STRATEGY_MACD_MTF: 10,
     }.get(strategy, 10)
 
 
