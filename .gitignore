@@ -56,3 +56,5 @@ _commit_msg.txt
 _*.html
 *.html
 RENDER_ENV_SETUP.md
+
+.risk_bt_cache.pkl

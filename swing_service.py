@@ -20,6 +20,8 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
+import risk_model as rm
+
 log = logging.getLogger(__name__)
 
 # ── MongoDB helpers (lazy, same pattern as user_enroller) ─────────────────────
@@ -505,6 +507,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["VWAP"] = (df["Close"] * df["Volume"]).rolling(20).sum() / df["Volume"].rolling(20).sum()
     df["VWAP_DIST"] = (df["Close"] - df["VWAP"]) / df["VWAP"]
 
+    # Recent swing low — where the stop belongs structurally. A stop placed by
+    # volatility alone can still sit above an obvious support the market is
+    # about to retest, so the risk model takes whichever is further from entry.
+    df["SWING_LOW_10"] = df["Low"].rolling(10).min()
+    df["SWING_LOW_20"] = df["Low"].rolling(20).min()
+
     # Daily change %
     df["CHANGE_PCT"] = df["Close"].pct_change() * 100
 
@@ -537,9 +545,18 @@ class SwingSetup:
     risk_reward: str           # e.g. "1:2.4"
     sizing_tier: str           # why this allocation size
     entry_type: str = "MOMENTUM"  # strategy that triggered this setup
+    profile: str = "SCALP"        # SCALP (quick) or LONG (high-conviction)
+    r_value: float = 0.0          # rupee risk per share (entry - stop)
+    r_pct: float = 0.0            # stop distance as % of entry
+    risk_inr: float = 0.0         # total rupees at risk on this position
+    stop_atr_mult: float = 0.0    # how many ATRs the stop sits at
+    atr_abs: float = 0.0          # ATR in rupees
+    structure_stop: bool = False  # stop was set by the swing low
+    time_stop_days: int = 0
 
 
-def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
+def score_stock(symbol: str, df: pd.DataFrame, regime: str = "",
+                open_risk_inr: float = 0.0) -> SwingSetup | None:
     """Score a single stock using 3 entry strategies: Momentum, Mean-Reversion, EMA Crossover.
 
     Backtest results:
@@ -720,17 +737,40 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
     if score < 15:
         return None
 
-    qty, invest, sizing_tier = calc_position_size(score, price)
+    # ── Risk model: profile, ATR/structure stop, R-multiple targets ──────────
+    # Levels used to be flat percentages of price (5% stop, 8%/12% targets),
+    # which ignored how much the stock actually moves. Now the profile decides
+    # the shape and the stop is derived from ATR and structure.
+    profile = rm.pick_profile(score, entry_type or "", atr_pct, regime)
+    if profile is None:
+        return None
 
-    entry = round(price, 2)
-    sl = round(price * (1 - SL_PCT), 2)
-    t1 = round(price * (1 + TARGET_PRIMARY), 2)
-    t2 = round(price * (1 + TARGET_SECONDARY), 2)
+    atr_abs = float(latest.get("ATR", 0)) or (atr_pct * price)
+    swing_low = float(latest.get("SWING_LOW_10", 0)) or None
 
-    profit_t1 = round((TARGET_PRIMARY * price) * qty, 0)
-    profit_t2 = round((TARGET_SECONDARY * price) * qty, 0)
-    loss_sl = round((SL_PCT * price) * qty, 0)
-    rr = f"1:{TARGET_SECONDARY / SL_PCT:.1f}" if SL_PCT > 0 else "—"
+    levels = rm.compute_levels(price, atr_abs, profile, swing_low)
+    if levels is None:
+        return None
+
+    sizing = rm.size_position(levels, capital=CAPITAL, open_risk_inr=open_risk_inr)
+    if sizing.qty < 1:
+        return None
+
+    entry = levels.entry
+    sl, t1, t2 = levels.stop, levels.t1, levels.t2
+    qty, invest = sizing.qty, sizing.invest
+
+    profit_t1 = round((t1 - entry) * qty * profile.partial_at_t1
+                      + (t2 - entry) * qty * (1 - profile.partial_at_t1), 0)
+    profit_t2 = round((t2 - entry) * qty, 0)
+    loss_sl = round(sizing.risk_inr, 0)
+    rr = f"1:{profile.t2_r:.1f}"
+
+    sizing_tier = sizing.note
+    if levels.structure_used:
+        reasons.append(f"Stop under swing low {swing_low:.2f} ({levels.stop_atr_mult:.1f} ATR)")
+    else:
+        reasons.append(f"Stop at {levels.stop_atr_mult:.1f} ATR ({levels.r_pct:.1f}%)")
 
     name = symbol.replace(".NS", "")
 
@@ -745,25 +785,59 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
         expected_profit_t1=profit_t1, expected_profit_t2=profit_t2,
         expected_loss_sl=loss_sl, risk_reward=rr, sizing_tier=sizing_tier,
         entry_type=entry_type or "MOMENTUM",
+        profile=profile.name,
+        r_value=levels.r_value,
+        r_pct=levels.r_pct,
+        risk_inr=round(sizing.risk_inr, 0),
+        stop_atr_mult=levels.stop_atr_mult,
+        atr_abs=round(atr_abs, 2),
+        structure_stop=levels.structure_used,
+        time_stop_days=profile.time_stop_days,
     )
 
 
 # -- Daily Scanner -----------------------------------------------------------
 
-def scan_nse50(top_n: int = 8) -> list[SwingSetup]:
-    """Scan NSE-200 stocks and return top N swing setups sorted by score."""
-    all_setups: list[SwingSetup] = []
+def scan_nse50(top_n: int = 8, open_risk_inr: float = 0.0) -> list[SwingSetup]:
+    """Scan the NSE-200 universe and return the best setups.
 
+    Market regime is detected once per scan (not per stock) and passed down so
+    the risk model can refuse multi-week holds in a hostile tape.
+
+    Results are ranked LONG-first: a high-conviction positional setup is worth
+    more than a scalp of equal score, because it carries a wider stop and a
+    further target.
+    """
+    regime = ""
+    try:
+        from market_regime import detect_regime
+        regime = (detect_regime() or {}).get("regime", "")
+    except Exception as e:
+        log.warning("Regime detection failed, scanning without it: %s", e)
+
+    all_setups: list[SwingSetup] = []
     for symbol in NSE200:
         df = fetch_history(symbol, period="1y", interval="1d")
         if df is None or df.empty:
             continue
-        setup = score_stock(symbol, df)
+        try:
+            setup = score_stock(symbol, df, regime=regime, open_risk_inr=open_risk_inr)
+        except Exception as e:
+            log.warning("score_stock failed for %s: %s", symbol, e)
+            continue
         if setup:
             all_setups.append(setup)
 
-    all_setups.sort(key=lambda s: s.score, reverse=True)
+    all_setups.sort(key=lambda s: (s.profile == "LONG", s.score), reverse=True)
     return all_setups[:top_n]
+
+
+def scan_by_profile(top_n_long: int = 4, top_n_scalp: int = 4) -> dict[str, list[SwingSetup]]:
+    """Scan once and split the results into the two books."""
+    setups = scan_nse50(top_n=(top_n_long + top_n_scalp) * 3)
+    longs = [s for s in setups if s.profile == "LONG"][:top_n_long]
+    scalps = [s for s in setups if s.profile == "SCALP"][:top_n_scalp]
+    return {"LONG": longs, "SCALP": scalps}
 
 
 # Backtest Engine ───────────────────────────────────────────────────────────
@@ -1121,13 +1195,24 @@ def get_trade_summary(user_id: int, days: int = 30) -> dict:
 # ── Auto Paper Trading ───────────────────────────────────────────────────────
 
 def check_open_trades_for_exits() -> list[dict]:
-    """Check all open paper trades against price action since entry.
+    """Manage open positions bar by bar under their own profile's rules.
 
-    Walks every daily bar *after* the entry bar so exits are not missed when
-    the scan skips a day (weekend, holiday, bot restart). Persists ``peak_price``
-    and ``t1_hit`` so the trailing stop survives across runs.
+    Walks every daily bar after entry so nothing is missed when a scan skips a
+    day. For each bar, in order:
 
-    Returns list of closed trade summaries.
+      1. Hard stop — the ratcheting stop from the risk model, which starts at
+         the ATR/structure level, jumps to breakeven once the trade is up
+         ``breakeven_at_r``, then trails by ``trail_atr`` ATRs from the peak.
+      2. T2 — the runner target, full exit.
+      3. Otherwise ratchet the stop upward and carry on.
+
+    The stop is checked before the target because within a single daily bar we
+    cannot know which came first, and assuming the worse of the two is the
+    honest reading.
+
+    Trailing state (peak, stop, whether T1 and breakeven are done) is persisted
+    so it survives across scans; the old version recomputed from one stale bar
+    and forgot that T1 had been reached.
     """
     db = _get_db()
     _ensure_indexes()
@@ -1135,11 +1220,8 @@ def check_open_trades_for_exits() -> list[dict]:
     if not open_trades:
         return []
 
-    from bson import ObjectId
-
     now = datetime.utcnow()
 
-    # Fetch enough history to cover the oldest open position.
     max_days = 7
     for t in open_trades:
         entered = t.get("entered_at")
@@ -1158,14 +1240,28 @@ def check_open_trades_for_exits() -> list[dict]:
 
         entry = trade["entry_price"]
         qty = trade["qty"]
+        profile = rm.get_profile(trade.get("profile", "SCALP"))
 
-        # Use stored SL/T1/T2 if available, else compute
-        sl = trade.get("sl") or entry * (1 - SL_PCT)
-        t1 = trade.get("t1") or entry * (1 + TARGET_PRIMARY)
-        t2 = trade.get("t2") or entry * (1 + TARGET_SECONDARY)
+        # Fall back to the profile's own geometry for rows written before the
+        # risk model existed, so legacy positions are still managed sanely.
+        atr = float(trade.get("atr_abs") or 0)
+        stored_stop = trade.get("sl")
+        if not atr:
+            atr = (entry * 0.02)
+        r_value = float(trade.get("r_value") or 0)
+        if r_value <= 0:
+            r_value = (entry - stored_stop) if stored_stop else profile.stop_atr * atr
+        if r_value <= 0:
+            continue
 
-        peak = float(trade.get("peak_price") or entry)
-        t1_hit = bool(trade.get("t1_hit", False))
+        state = rm.TradeState(
+            stop=float(stored_stop or (entry - r_value)),
+            peak=float(trade.get("peak_price") or entry),
+            t1_hit=bool(trade.get("t1_hit", False)),
+            breakeven_done=bool(trade.get("breakeven_done", False)),
+            partial_booked=bool(trade.get("partial_booked", False)),
+        )
+        t2_price = float(trade.get("t2") or (entry + profile.t2_r * r_value))
 
         entered = trade.get("entered_at")
         if isinstance(entered, datetime):
@@ -1175,8 +1271,6 @@ def check_open_trades_for_exits() -> list[dict]:
             days_held = 0
             entry_day = None
 
-        # Only bars strictly after the entry day count — otherwise a trade
-        # opened at 09:35 can be stopped out by that same morning's low.
         bars = df
         if entry_day is not None:
             idx = df.index
@@ -1189,148 +1283,153 @@ def check_open_trades_for_exits() -> list[dict]:
         exit_price = None
         exit_reason = None
 
-        for ts, row in bars.iterrows():
+        for _ts, row in bars.iterrows():
             high = float(row["High"])
             low = float(row["Low"])
-            close = float(row["Close"])
 
-            if high > peak:
-                peak = high
-
-            # Hard stop first — the conservative read when a single daily bar
-            # spans both the stop and the target.
-            if low <= sl:
-                exit_price = sl
-                exit_reason = "SL"
+            # Stop first — conservative when one bar spans stop and target.
+            if low <= state.stop:
+                exit_price = state.stop
+                if state.t1_hit:
+                    exit_reason = "TRAIL"
+                elif state.breakeven_done:
+                    exit_reason = "BE"
+                else:
+                    exit_reason = "SL"
                 break
 
-            if high >= t2:
-                exit_price = t2
+            if high >= t2_price:
+                exit_price = t2_price
                 exit_reason = "T2"
                 break
 
-            if not t1_hit and high >= t1:
-                t1_hit = True
-                # Trailing only arms from the *next* bar; the same bar's low is
-                # noise around the target, not a genuine give-back.
-                continue
+            state = rm.update_stop(state, high, low, entry, r_value, atr, profile)
 
-            if t1_hit:
-                trail_stop = peak * (1 - TRAIL_PCT)
-                if low <= trail_stop:
-                    exit_price = trail_stop
-                    exit_reason = "TRAIL"
-                    break
-
-        if exit_price is None and days_held >= TIME_STOP_DAYS and len(bars) > 0:
+        if exit_price is None and days_held >= profile.time_stop_days and len(bars) > 0:
             exit_price = float(bars.iloc[-1]["Close"])
             exit_reason = "TIME"
 
-        # Persist trailing state even when the trade stays open
-        state_update = {}
-        if round(peak, 2) != round(float(trade.get("peak_price") or entry), 2):
-            state_update["peak_price"] = round(peak, 2)
-        if t1_hit != bool(trade.get("t1_hit", False)):
-            state_update["t1_hit"] = t1_hit
-        if state_update:
-            db.swing_trades.update_one({"_id": trade["_id"]}, {"$set": state_update})
+        state_update = {
+            "peak_price": round(state.peak, 2),
+            "sl": round(state.stop, 2),
+            "t1_hit": state.t1_hit,
+            "breakeven_done": state.breakeven_done,
+        }
 
         if exit_price is not None:
             pnl_pct = ((exit_price - entry) / entry) * 100
             pnl_inr = (exit_price - entry) * qty
-            db.swing_trades.update_one(
-                {"_id": trade["_id"]},
-                {"$set": {
-                    "status": "closed",
-                    "exit_price": round(exit_price, 2),
-                    "exit_reason": exit_reason,
-                    "pnl_pct": round(pnl_pct, 2),
-                    "pnl_inr": round(pnl_inr, 0),
-                    "peak_price": round(peak, 2),
-                    "t1_hit": t1_hit,
-                    "exited_at": now,
-                }},
-            )
+            state_update.update({
+                "status": "closed",
+                "exit_price": round(exit_price, 2),
+                "exit_reason": exit_reason,
+                "pnl_pct": round(pnl_pct, 2),
+                "pnl_inr": round(pnl_inr, 0),
+                "r_multiple": round((exit_price - entry) / r_value, 2),
+                "exited_at": now,
+            })
+            db.swing_trades.update_one({"_id": trade["_id"]}, {"$set": state_update})
             closed_trades.append({
                 "symbol": sym,
                 "entry": entry,
                 "exit": round(exit_price, 2),
                 "pnl_pct": round(pnl_pct, 2),
                 "pnl_inr": round(pnl_inr, 0),
+                "r_multiple": round((exit_price - entry) / r_value, 2),
                 "reason": exit_reason,
+                "profile": profile.name,
                 "days_held": days_held,
             })
+        else:
+            db.swing_trades.update_one({"_id": trade["_id"]}, {"$set": state_update})
 
     return closed_trades
 
 
 def run_paper_scan() -> dict:
-    """Full paper trade cycle:
-    1. Close trades that hit SL/T1/T2/time-stop
-    2. Scan NSE-50 for new setups
-    3. Open paper trades for top setups (if not already open)
-    4. Return summary of actions taken.
+    """Full paper trade cycle, risk-budgeted.
+
+    1. Manage open positions (stop ratchets, exits)
+    2. Measure how much risk is already committed
+    3. Scan for setups, sized against the risk that remains
+    4. Open the best of them, LONG book first
+
+    Position count is no longer the only limit. The binding constraint is total
+    open risk: five positions with tight stops is a smaller bet than two with
+    wide ones, and the old MAX_POSITIONS count could not tell the difference.
     """
     db = _get_db()
     if db is None:
-        return {"closed": [], "opened": [], "already_open": [], "scan_failed": True}
+        return {"closed": [], "opened": [], "already_open": [], "scan_failed": True,
+                "open_risk": 0.0, "risk_budget": 0.0}
     _ensure_indexes()
     actions = {
         "closed": [],
         "opened": [],
         "already_open": [],
         "scan_failed": False,
+        "open_risk": 0.0,
+        "risk_budget": 0.0,
     }
 
-    # Step 1: Check existing open trades for exits
     try:
         actions["closed"] = check_open_trades_for_exits()
     except Exception as e:
         log.warning("Paper trade exit check failed: %s", e)
 
-    # Step 2: Get currently open symbols so we don't double-enter
     open_trades = list(db.swing_trades.find({"status": "open"}))
     open_symbols = {t["symbol"] for t in open_trades}
 
-    # Step 3: Count how many slots are free
-    open_count = len(open_trades)
-    slots_free = MAX_POSITIONS - open_count
+    # Risk still on the table: for each open position, distance from the
+    # current (already ratcheted) stop to entry. A position trailing above
+    # breakeven contributes no risk at all.
+    open_risk = 0.0
+    for t in open_trades:
+        entry = float(t.get("entry_price") or 0)
+        stop = float(t.get("sl") or 0)
+        qty = int(t.get("qty") or 0)
+        if entry and stop and qty:
+            open_risk += max(0.0, (entry - stop) * qty)
+    actions["open_risk"] = round(open_risk, 0)
 
-    if slots_free <= 0:
-        return actions  # All slots filled
+    portfolio_cap = CAPITAL * rm.MAX_PORTFOLIO_RISK_PCT
+    actions["risk_budget"] = round(max(0.0, portfolio_cap - open_risk), 0)
 
-    # Step 4: Scan for new setups (request extra to fill all slots)
+    slots_free = MAX_POSITIONS - len(open_trades)
+    if slots_free <= 0 or open_risk >= portfolio_cap:
+        return actions
+
     try:
-        setups = scan_nse50(slots_free + 5)  # request extra in case some are already open
+        setups = scan_nse50(slots_free + 8, open_risk_inr=open_risk)
     except Exception as e:
-        log.warning("Paper scan NSE50 failed: %s", e)
+        log.warning("Paper scan failed: %s", e)
         actions["scan_failed"] = True
         return actions
 
-    per_stock = (CAPITAL * POSITION_PCT) / MAX_POSITIONS
+    from bson import ObjectId
 
+    committed = open_risk
     for setup in setups:
         if len(actions["opened"]) >= slots_free:
             break
         if setup.symbol in open_symbols:
             actions["already_open"].append(setup.symbol)
             continue
+        # Re-check against risk committed earlier in this same loop, so a batch
+        # of new entries cannot collectively blow through the portfolio cap.
+        if committed + setup.risk_inr > portfolio_cap:
+            continue
 
-        # Open paper trade
-        qty = max(1, int(per_stock / setup.entry))
-        invest = qty * setup.entry
         try:
             doc = log_swing_trade(
                 user_id=0,  # paper trade (owner)
                 symbol=setup.symbol,
                 entry_price=setup.entry,
-                qty=qty,
+                qty=setup.suggested_qty,
                 status="open",
-                notes=f"{setup.entry_type}|score={setup.score}|reasons={','.join(setup.reasons[:3])}",
+                notes=(f"{setup.profile}|{setup.entry_type}|score={setup.score}"
+                       f"|reasons={','.join(setup.reasons[:3])}"),
             )
-            # Attach SL/T1/T2 to the row we just inserted. Matching on symbol
-            # instead could update an unrelated older open row for that symbol.
-            from bson import ObjectId
             db.swing_trades.update_one(
                 {"_id": ObjectId(doc["_id"])},
                 {"$set": {
@@ -1338,25 +1437,40 @@ def run_paper_scan() -> dict:
                     "t1": setup.target_1,
                     "t2": setup.target_2,
                     "entry_type": setup.entry_type,
+                    "profile": setup.profile,
                     "peak_price": setup.entry,
                     "t1_hit": False,
+                    "breakeven_done": False,
+                    "partial_booked": False,
                     "score": setup.score,
+                    "r_value": setup.r_value,
+                    "risk_inr": setup.risk_inr,
+                    "atr_abs": setup.atr_abs,
+                    "stop_atr_mult": setup.stop_atr_mult,
+                    "time_stop_days": setup.time_stop_days,
                 }},
             )
+            committed += setup.risk_inr
             actions["opened"].append({
                 "symbol": setup.symbol,
                 "entry": setup.entry,
-                "qty": qty,
-                "invest": round(invest, 0),
+                "qty": setup.suggested_qty,
+                "invest": round(setup.suggested_invest, 0),
                 "score": setup.score,
                 "sl": setup.stop_loss,
                 "t1": setup.target_1,
                 "t2": setup.target_2,
                 "entry_type": setup.entry_type,
+                "profile": setup.profile,
+                "risk_inr": setup.risk_inr,
+                "r_pct": setup.r_pct,
+                "stop_atr_mult": setup.stop_atr_mult,
             })
         except Exception as e:
             log.warning("Paper trade open failed %s: %s", setup.symbol, e)
 
+    actions["open_risk"] = round(committed, 0)
+    actions["risk_budget"] = round(max(0.0, portfolio_cap - committed), 0)
     return actions
 
 
@@ -1367,7 +1481,8 @@ def get_paper_portfolio() -> dict:
         return {"open": [], "total_unrealized": 0, "total_invested": 0,
                 "total_unrealized_pct": 0.0,
                 "closed_count": 0, "closed_wins": 0, "closed_losses": 0,
-                "total_realized": 0, "recent_closed": [], "stale_symbols": []}
+                "total_realized": 0, "recent_closed": [], "stale_symbols": [],
+                "open_risk": 0, "risk_budget": CAPITAL * rm.MAX_PORTFOLIO_RISK_PCT}
     open_trades = list(db.swing_trades.find({"status": "open"}).sort("entered_at", -1))
     closed_trades = list(db.swing_trades.find({"status": "closed"}).sort("exited_at", -1).limit(50))
 
@@ -1391,6 +1506,7 @@ def get_paper_portfolio() -> dict:
             price_asof[sym] = None
 
     stale = [s for s in symbols if s not in prices]
+    total_open_risk = 0.0
 
     portfolio = []
     total_unrealized = 0.0
@@ -1408,6 +1524,10 @@ def get_paper_portfolio() -> dict:
 
         peak = float(t.get("peak_price") or t["entry_price"])
         t1_hit = bool(t.get("t1_hit", False))
+        # Risk still live: zero once the stop is at or above entry.
+        stop_now = float(t.get("sl") or 0)
+        if stop_now:
+            total_open_risk += max(0.0, (t["entry_price"] - stop_now) * t["qty"])
 
         portfolio.append({
             "symbol": t["symbol"],
@@ -1424,7 +1544,15 @@ def get_paper_portfolio() -> dict:
             "entry_type": t.get("entry_type", "?"),
             "peak_price": round(peak, 2),
             "t1_hit": t1_hit,
-            "trail_stop": round(peak * (1 - TRAIL_PCT), 2) if t1_hit else 0,
+            "profile": t.get("profile", "SCALP"),
+            "risk_inr": t.get("risk_inr", 0),
+            "r_value": t.get("r_value", 0),
+            "stop_atr_mult": t.get("stop_atr_mult", 0),
+            "breakeven_done": bool(t.get("breakeven_done", False)),
+            # Open R-multiple: how many units of initial risk this trade is up.
+            "r_multiple": round(
+                (current - t["entry_price"]) / t["r_value"], 2
+            ) if t.get("r_value") else 0,
             "live": live is not None,
             "price_asof": price_asof.get(t["symbol"]),
             "entered_at": entered,
@@ -1448,4 +1576,8 @@ def get_paper_portfolio() -> dict:
         "total_realized": round(total_realized, 0),
         "recent_closed": closed_trades[:10],
         "stale_symbols": stale,
+        "open_risk": round(total_open_risk, 0),
+        "risk_budget": round(
+            max(0.0, CAPITAL * rm.MAX_PORTFOLIO_RISK_PCT - total_open_risk), 0
+        ),
     }

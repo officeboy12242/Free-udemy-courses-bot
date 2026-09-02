@@ -2095,54 +2095,79 @@ async def cmd_swing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Win rate info for header
     from swing_service import get_historical_win_rate
+    import risk_model as rm
     win_rate, total_closed = get_historical_win_rate()
     wr_str = f"{win_rate:.0f}% ({total_closed} trades)" if total_closed > 0 else "No data yet"
+
+    longs = [s for s in setups if s.profile == "LONG"]
+    scalps = [s for s in setups if s.profile == "SCALP"]
 
     lines = [
         f"📈 <b>Swing Trade Alerts</b>",
         _SEP,
-        f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>",
-        f"🎯 Targets: +{TARGET_PRIMARY*100:.0f}% / +{TARGET_SECONDARY*100:.0f}%  |  "
-        f"🛑 SL: -{SL_PCT*100:.0f}%  |  ⏰ Time stop: {TIME_STOP_DAYS}d",
-        f"📊 Win rate: <b>{wr_str}</b>  |  Sizing: dynamic",
+        f"💰 Capital: <b>₹{CAPITAL:,.0f}</b>  |  Risk/trade: <b>{rm.RISK_PER_TRADE_PCT*100:.1f}%</b> "
+        f"(₹{CAPITAL*rm.RISK_PER_TRADE_PCT:,.0f})",
+        f"🎯 Stops and targets are ATR-based — each trade risks the same rupees",
+        f"📊 Win rate: <b>{wr_str}</b>",
         "",
     ]
 
-    for i, s in enumerate(setups, 1):
-        # Detect entry type from reasons (5 strategy types)
-        badge = "🔄"
-        for r in s.reasons:
-            if "MOMENTUM" in r:
-                badge = "🚀"; break
-            elif "52WK" in r:
-                badge = "📈"; break
-            elif "MULTI-TF" in r or "CONFLUENCE" in r:
-                badge = "📊"; break
-            elif "MEAN" in r or "REVERSION" in r:
-                badge = "🔄"; break
-            elif "EMA CROSSOVER" in r:
-                badge = "📈"; break
-        lines.append(f"<b>{i}. {s.name}</b>  {badge}  <i>(Score: {s.score:.0f}/100)</i>")
-        lines.append(f"   ▸ Entry: <code>₹{s.entry:.2f}</code>  |  Qty: <b>{s.suggested_qty}</b>  |  Invest: <b>₹{s.suggested_invest:,.0f}</b>")
-        lines.append(f"   ▸ SL: <code>₹{s.stop_loss:.2f}</code>  |  T1: <code>₹{s.target_1:.2f}</code>  |  T2: <code>₹{s.target_2:.2f}</code>")
-        lines.append(f"   💵 If T1: <b>+₹{s.expected_profit_t1:,.0f}</b>  |  T2: <b>+₹{s.expected_profit_t2:,.0f}</b>  |  SL: <b>-₹{s.expected_loss_sl:,.0f}</b>")
-        lines.append(f"   ⚖️ R:R {s.risk_reward}  |  RSI: {s.rsi}  |  BB: {s.bb_pct:.2f}  |  Vol: {s.vol_ratio}x  |  ATR: {s.atr_pct}%")
-        reasons_str = " \u00b7 ".join(s.reasons[:4])
-        lines.append(f"   📋 {reasons_str}")
-        lines.append(f"   <i>📐 {s.sizing_tier}</i>")
+    _PROFILE_HDR = {
+        "LONG": "🏆 <b>LONG — high-conviction positional</b>",
+        "SCALP": "⚡ <b>SCALP — quick momentum</b>",
+    }
+
+    idx = 0
+    for pname, group in (("LONG", longs), ("SCALP", scalps)):
+        if not group:
+            continue
+        prof = rm.get_profile(pname)
+        lines.append(_PROFILE_HDR[pname])
+        lines.append(
+            f"<i>stop {prof.stop_atr:.1f} ATR · T1 {prof.t1_r:.1f}R "
+            f"(book {prof.partial_at_t1*100:.0f}%) · T2 {prof.t2_r:.1f}R · "
+            f"trail {prof.trail_atr:.1f} ATR · {prof.time_stop_days}d max</i>"
+        )
         lines.append("")
+        for s in group:
+            idx += 1
+            lines.append(f"<b>{idx}. {s.name}</b>  <i>({s.entry_type} · score {s.score:.0f})</i>")
+            lines.append(
+                f"   ▸ Entry <code>₹{s.entry:.2f}</code>  |  Qty <b>{s.suggested_qty}</b>  "
+                f"|  Invest <b>₹{s.suggested_invest:,.0f}</b>"
+            )
+            lines.append(
+                f"   🛑 SL <code>₹{s.stop_loss:.2f}</code> "
+                f"(-{s.r_pct:.1f}% · {s.stop_atr_mult:.1f} ATR)"
+                f"{' · under swing low' if s.structure_stop else ''}"
+            )
+            lines.append(
+                f"   🎯 T1 <code>₹{s.target_1:.2f}</code>  |  "
+                f"T2 <code>₹{s.target_2:.2f}</code>  |  R:R {s.risk_reward}"
+            )
+            lines.append(
+                f"   💵 Risk <b>₹{s.expected_loss_sl:,.0f}</b>  →  "
+                f"T2 <b>+₹{s.expected_profit_t2:,.0f}</b>"
+            )
+            lines.append(f"   📋 {' · '.join(s.reasons[:3])}")
+            lines.append("")
 
     total_invest = sum(s.suggested_invest for s in setups)
-    total_profit_t1 = sum(s.expected_profit_t1 for s in setups)
+    total_risk = sum(s.expected_loss_sl for s in setups)
     total_profit_t2 = sum(s.expected_profit_t2 for s in setups)
-    total_loss = sum(s.expected_loss_sl for s in setups)
     lines.append(_SEP)
-    lines.append(f"💼 Total deployment: <b>₹{total_invest:,.0f}</b> / ₹{CAPITAL:,.0f} ({total_invest/CAPITAL*100:.0f}%)")
-    lines.append(f"💰 If all hit T1: <b>+₹{total_profit_t1:,.0f}</b>  |  T2: <b>+₹{total_profit_t2:,.0f}</b>  |  SL: <b>-₹{total_loss:,.0f}</b>")
-    lines.append("<i>📋 These are setups only — run /swing_scan to book them as paper trades, then /swing_status to track them live.</i>")
+    lines.append(
+        f"💼 Deployment <b>₹{total_invest:,.0f}</b> / ₹{CAPITAL:,.0f} "
+        f"({total_invest/CAPITAL*100:.0f}%)"
+    )
+    lines.append(
+        f"⚠️ Total risk if every stop hits: <b>-₹{total_risk:,.0f}</b> "
+        f"({total_risk/CAPITAL*100:.1f}% of capital)  |  All T2: <b>+₹{total_profit_t2:,.0f}</b>"
+    )
+    lines.append("<i>📋 Setups only — /swing_scan books them, /swing_status tracks them.</i>")
     lines.append("<i>⚠ Not financial advice. Do your own research.</i>")
 
-    await update.effective_message.reply_html("\n".join(lines))
+    await reply_html_chunked(update.effective_message, "\n".join(lines))
 
 
 async def cmd_swing_bt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2245,6 +2270,10 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _TYPE_EMOJI = {"MOMENTUM": "🚀", "MEAN_REV": "🔄", "EMA_CROSS": "📈", "52WK_BREAK": "📈", "MULTI_TF": "📊"}
         lines.append(f"📦 Open positions: {len(portfolio['open'])}  |  Invested: <b>₹{portfolio['total_invested']:,.0f}</b>")
         lines.append(
+            f"⚠️ Open risk: <b>₹{portfolio.get('open_risk', 0):,.0f}</b>  |  "
+            f"Budget left: <b>₹{portfolio.get('risk_budget', 0):,.0f}</b>"
+        )
+        lines.append(
             f"📈 Unrealized P&L: <b>{'+' if portfolio['total_unrealized'] >= 0 else ''}"
             f"₹{portfolio['total_unrealized']:,.0f}</b>  "
             f"({portfolio.get('total_unrealized_pct', 0):+.2f}%)"
@@ -2252,7 +2281,7 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append("")
         for p in portfolio["open"]:
             emoji = "🟢" if p["unrealized_pct"] >= 0 else "🔴"
-            badge = _TYPE_EMOJI.get(p.get("entry_type", ""), "📌")
+            badge = {"LONG": "🏆", "SCALP": "⚡"}.get(p.get("profile", ""), "📌")
             sl = p.get("sl", 0)
             t1 = p.get("t1", 0)
             t2 = p.get("t2", 0)
@@ -2267,12 +2296,19 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"{p['unrealized_pct']:+.2f}%  ({p['unrealized_inr']:+,.0f} INR)  "
                 f"{p['days_held']}d held{live_mark}"
             )
+            if p.get("r_value"):
+                lines.append(
+                    f"   📐 {p.get('profile', '?')} · "
+                    f"{p.get('r_multiple', 0):+.2f}R · "
+                    f"risk ₹{p.get('risk_inr', 0):,.0f} "
+                    f"({p.get('stop_atr_mult', 0):.1f} ATR stop)"
+                )
             if sl or t1 or t2:
                 lines.append(
-                    f"   SL ₹{sl:.2f} (-{SL_PCT*100:.0f}%)  |  "
-                    f"T1 ₹{t1:.2f} (+{TARGET_PRIMARY*100:.0f}%)  |  "
-                    f"T2 ₹{t2:.2f} (+{TARGET_SECONDARY*100:.0f}%)"
+                    f"   SL ₹{sl:.2f}  |  T1 ₹{t1:.2f}  |  T2 ₹{t2:.2f}"
                 )
+            if p.get("breakeven_done") and not p.get("t1_hit"):
+                lines.append("   🛡️ Stop at breakeven — risk removed")
             if p.get("t1_hit"):
                 lines.append(
                     f"   🎯 T1 hit — trailing from peak ₹{p.get('peak_price', 0):.2f}, "
