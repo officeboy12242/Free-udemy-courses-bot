@@ -2209,12 +2209,35 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
     if not chain:
         tech = _fetch_intraday(cfg["yahoo"], nse_only_fallback=bool(cfg.get("nse_only_fallback")))
         err = "Option chain unavailable"
+        ladder = None
         if cfg.get("bse_scrip_cd"):
+            # BSE moved its option-chain API and the replacement is not
+            # reachable, so there is no live chain: no bid/ask, no OI. The
+            # strike grid and the expiry are still exact, so price the ladder
+            # theoretically rather than returning nothing tradeable.
             err = (
-                "BSE Sensex option chain unavailable from this server "
-                "(BSE blocks some cloud IPs; NSE indices still work)"
+                "BSE option chain unavailable - showing estimated premiums. "
+                "Strikes and index levels are exact; premiums are "
+                "Black-Scholes estimates, so verify at your broker."
             )
-        return {"name": cfg["name"], "nse": cfg["nse"], "error": err, "tech": tech}
+            try:
+                import sensex_strikes as _ss
+                from bse_option_service import fetch_bse_expiries as _exp
+                spot = float(tech.get("spot") or 0)
+                expiries = _exp(int(cfg["bse_scrip_cd"]))
+                if spot > 0 and expiries:
+                    iv = tech.get("vix") or 12.0
+                    ladder = _ss.strike_ladder(
+                        spot, expiries[0], iv=float(iv),
+                        width=3, step=int(cfg.get("step", 100)),
+                    )
+                    ladder["lot"] = int(cfg.get("lot", 20))
+            except Exception as e:
+                log.warning("SENSEX ladder failed: %s", e)
+        out = {"name": cfg["name"], "nse": cfg["nse"], "error": err, "tech": tech}
+        if ladder and ladder.get("rows"):
+            out["ladder"] = ladder
+        return out
 
     spot = float(chain["spot"])
     tech = _fetch_intraday(
@@ -2538,7 +2561,35 @@ def _format_one_index_html(r: dict[str, Any], capital: dict[str, Any] | None = N
     if r.get("error"):
         tech = r.get("tech") or {}
         spot_line = f"\nSpot: <code>{tech['spot']}</code>" if tech.get("spot") else ""
-        return f"<b>\u26a1 {name}</b> <code>{nse}</code>\n\u26a0\ufe0f {html.escape(r['error'])}{spot_line}\n"
+        head = (f"<b>⚡ {name}</b> <code>{nse}</code>\n"
+                f"⚠️ {html.escape(r['error'])}{spot_line}\n")
+
+        # No live chain, but the strike grid is arithmetic and the expiry is
+        # known, so show a priced ladder rather than nothing tradeable.
+        lad = r.get("ladder")
+        if lad and lad.get("rows"):
+            lot = int(lad.get("lot", 20))
+            rows = [
+                "",
+                (f"<b>Strike ladder</b> · expiry {html.escape(str(lad['expiry']))} "
+                 f"({lad['days_to_expiry']:.1f}d) · IV {lad['iv_used']:.1f}% · lot {lot}"),
+                "<pre>",
+                f"{'strike':>7s} {'CE':>8s} {'CE/lot':>8s} | {'PE':>8s} {'PE/lot':>8s}",
+            ]
+            for x in lad["rows"]:
+                mark = "  ATM" if x["strike"] == lad["atm"] else ""
+                rows.append(
+                    f"{x['strike']:7d} {x['ce']:8.2f} {x['ce_cost']:8,.0f} | "
+                    f"{x['pe']:8.2f} {x['pe_cost']:8,.0f}{mark}"
+                )
+            rows.append("</pre>")
+            rows.append(
+                "<i>Premiums are Black-Scholes estimates, not live quotes: no "
+                "bid/ask, no OI, no volatility skew. Strike and index levels "
+                "are exact.</i>"
+            )
+            head += "\n".join(rows) + "\n"
+        return head
 
     side = r["side"]
     side_emoji = "\U0001f7e2" if side == "CE" else "\U0001f534"
