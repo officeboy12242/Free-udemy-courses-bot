@@ -175,11 +175,23 @@ def _normalize_expiry_for_chain(expiry: str) -> str:
 
 
 def fetch_bse_option_chain_raw(scrip_cd: int, expiry: str) -> dict[str, Any] | None:
-    expiry_param = _normalize_expiry_for_chain(expiry)
+    # The live endpoint is DerivOptionChain_IV/w, found in the Angular
+    # controller behind beta.bseindia.com's option-chain page. The old
+    # Derivative/getOptionChain/w 302s to error_Bse.html, and plain
+    # DerivOptionChain/w (without _IV) is also gone.
+    #
+    # Expiry goes in as BSE returns it from ddlExpiry ("03 Sep 2026"); the
+    # DD/MM/YYYY normalisation the old endpoint wanted makes this one fail.
     text = _fetch_url(
-        f"{BSE_DERIV_BASE}/getOptionChain/w",
-        {"scrip_cd": str(scrip_cd), "strprice": "", "Expiry": expiry_param},
+        f"{BSE_API_BASE}/DerivOptionChain_IV/w",
+        {"scrip_cd": str(scrip_cd), "Expiry": expiry.strip(), "strprice": ""},
     )
+    if not text:
+        expiry_param = _normalize_expiry_for_chain(expiry)
+        text = _fetch_url(
+            f"{BSE_DERIV_BASE}/getOptionChain/w",
+            {"scrip_cd": str(scrip_cd), "strprice": "", "Expiry": expiry_param},
+        )
     if not text:
         return None
     data = _parse_json(text)
@@ -200,6 +212,16 @@ def _ival(val: Any) -> int:
 
 
 def _bse_row_to_nse(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Map one DerivOptionChain_IV row into the NSE shape the rest of the code reads.
+
+    The BSE payload is asymmetric, which is easy to get wrong: call fields carry
+    a C_ prefix (C_Last_Trd_Price, C_BidPrice, C_Open_Interest) while the put
+    fields for the same strike are unprefixed (Last_Trd_Price, BidPrice,
+    Open_Interest). Change in OI is Absolute_Change_OI, not Change_OI.
+
+    Numbers arrive as strings with thousands separators ("79,200.00") and empty
+    strings for untraded strikes, both handled by _fval.
+    """
     strike_raw = (
         row.get("Strike_Price") or row.get("strikePrice") or row.get("StrikePrice")
         or row.get("STRIKE") or row.get("strike")
@@ -207,31 +229,37 @@ def _bse_row_to_nse(row: dict[str, Any]) -> dict[str, Any] | None:
     if strike_raw is None:
         return None
     strike = int(_fval(strike_raw))
-
-    ce_oi = _ival(row.get("C_oi") or row.get("CE_OI") or row.get("C_Open_Interest") or row.get("ce_oi"))
-    pe_oi = _ival(row.get("P_oi") or row.get("PE_OI") or row.get("P_Open_Interest") or row.get("pe_oi"))
-    ce_chg = _ival(row.get("C_chg_oi") or row.get("CE_CHG_OI") or row.get("C_Change_OI") or row.get("ce_chg_oi"))
-    pe_chg = _ival(row.get("P_chg_oi") or row.get("PE_CHG_OI") or row.get("P_Change_OI") or row.get("pe_chg_oi"))
+    if strike <= 0:
+        return None
 
     return {
         "strikePrice": strike,
         "CE": {
-            "lastPrice": _fval(row.get("C_LTP") or row.get("CE_LTP") or row.get("C_LastPrice") or row.get("ce_ltp")),
-            "buyPrice1": _fval(row.get("C_Bid") or row.get("CE_Bid") or row.get("C_BidPrice")),
-            "sellPrice1": _fval(row.get("C_Ask") or row.get("CE_Ask") or row.get("C_OfferPrice")),
-            "openInterest": ce_oi,
-            "changeinOpenInterest": ce_chg,
-            "impliedVolatility": _fval(row.get("C_IV") or row.get("CE_IV")),
-            "totalTradedVolume": _ival(row.get("C_Volume") or row.get("CE_Volume") or row.get("C_TradedQty")),
+            "lastPrice": _fval(row.get("C_Last_Trd_Price") or row.get("C_LTP")),
+            "buyPrice1": _fval(row.get("C_BidPrice") or row.get("C_Bid")),
+            "sellPrice1": _fval(row.get("C_OfferPrice") or row.get("C_Ask")),
+            "bidQty": _ival(row.get("C_BIdQty")),
+            "askQty": _ival(row.get("C_OfferQty")),
+            "openInterest": _ival(row.get("C_Open_Interest")),
+            "changeinOpenInterest": _ival(row.get("C_Absolute_Change_OI")),
+            "impliedVolatility": _fval(row.get("C_IV")),
+            "totalTradedVolume": _ival(row.get("C_Vol_Traded")),
+            "change": _fval(row.get("C_NetChange")),
+            "identifier": row.get("C_Series_Code") or "",
         },
+        # Put side is the unprefixed half of the same row.
         "PE": {
-            "lastPrice": _fval(row.get("P_LTP") or row.get("PE_LTP") or row.get("P_LastPrice") or row.get("pe_ltp")),
-            "buyPrice1": _fval(row.get("P_Bid") or row.get("PE_Bid") or row.get("P_BidPrice")),
-            "sellPrice1": _fval(row.get("P_Ask") or row.get("PE_Ask") or row.get("P_OfferPrice")),
-            "openInterest": pe_oi,
-            "changeinOpenInterest": pe_chg,
-            "impliedVolatility": _fval(row.get("P_IV") or row.get("PE_IV")),
-            "totalTradedVolume": _ival(row.get("P_Volume") or row.get("PE_Volume") or row.get("P_TradedQty")),
+            "lastPrice": _fval(row.get("Last_Trd_Price") or row.get("P_LTP")),
+            "buyPrice1": _fval(row.get("BidPrice") or row.get("P_BidPrice")),
+            "sellPrice1": _fval(row.get("OfferPrice") or row.get("P_OfferPrice")),
+            "bidQty": _ival(row.get("BIdQty")),
+            "askQty": _ival(row.get("OfferQty")),
+            "openInterest": _ival(row.get("Open_Interest")),
+            "changeinOpenInterest": _ival(row.get("Absolute_Change_OI")),
+            "impliedVolatility": _fval(row.get("IV")),
+            "totalTradedVolume": _ival(row.get("Vol_Traded")),
+            "change": _fval(row.get("NetChange")),
+            "identifier": row.get("p_Series_Code") or "",
         },
     }
 
@@ -252,6 +280,10 @@ def _extract_chain_rows(data: dict[str, Any]) -> tuple[float, list[dict[str, Any
     for item in rows_raw:
         if not isinstance(item, dict):
             continue
+        # DerivOptionChain_IV repeats the underlying on every row rather than
+        # sending it once at the top level.
+        if not spot:
+            spot = _fval(item.get("UlaValue"))
         parsed = _bse_row_to_nse(item)
         if parsed:
             rows.append(parsed)

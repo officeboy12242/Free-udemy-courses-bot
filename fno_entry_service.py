@@ -2475,8 +2475,8 @@ def _format_aggressive_html(signal: dict[str, Any], side: str) -> str:
         f" \u00b7 Vol <code>{agg['volume']:,}</code>\n"
         f"{cap_line}"
         f"\u2502\n"
-        f"\u2502  \u26a1 <b>+5%</b>  {_ru(aex['s5'])}  <i>+{aex['s5_pts']:.2f}{s5_rs}</i>\n"
-        f"\u2502  \u26a1 <b>+10%</b>  {_ru(aex['s10'])}  <i>+{aex['s10_pts']:.2f}</i>\n"
+        f"\u2502  \u26a1 <b>+{aex['s5_pct']:.0f}%</b>  {_ru(aex['s5'])}  <i>+{aex['s5_pts']:.2f}{s5_rs}</i>\n"
+        f"\u2502  \u26a1 <b>+{aex['s10_pct']:.0f}%</b>  {_ru(aex['s10'])}  <i>+{aex['s10_pts']:.2f}</i>\n"
         f"\u2502  \U0001f3af <b>T1</b>  {_ru(aex['t1'])}  <i>+{aex['t1_pts']:.2f}{t1_rs}</i>"
         f"  \u00b7  \U0001f53b <b>SL</b> {_ru(aex['sl'])}\n"
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
@@ -3308,8 +3308,8 @@ def format_trade_detail_html(alert: dict[str, Any], live_prem: float | None = No
         lines.append(f"Live: <b>{_ru(live_prem)}</b>  ({sign}{pnl:.2f} pts / {sign}{pnl_pct}%)")
         lines.append("")
         lines.append("<b>Targets:</b>")
-        for tag, key in (("SL", "sl_premium"), ("+3%", "s3_premium"), ("+5%", "s5_premium"),
-                         ("+10%", "s10_premium"), ("T1", "t1_premium"), ("T2", "t2_premium")):
+        for tag, key in (("SL", "sl_premium"), ("T1(1R)", "s3_premium"), ("T2(1.75R)", "s5_premium"),
+                         ("T3(3R)", "s10_premium"), ("T1", "t1_premium"), ("T2", "t2_premium")):
             val = alert.get(key)
             if val is not None:
                 hit = ""
@@ -3450,7 +3450,7 @@ def format_exit_alert_html(alert: dict[str, Any], level: str, live_prem: float, 
         tag_color = "\U0001f7e2"
     elif level == "S10":
         emoji = "\u26a1"
-        title = "QUICK SCALP \u2014 +10% HIT"
+        title = "QUICK SCALP \u2014 3R HIT"
         action = "Book 20% more. Move SL to entry (cost-free trade)."
         tag_color = "\U0001f7e1"
     elif level == "S5":
