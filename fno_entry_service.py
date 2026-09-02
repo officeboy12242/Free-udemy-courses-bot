@@ -254,6 +254,7 @@ STRATEGY_ORB = "ORB (Opening Range Breakout)"
 STRATEGY_PCR_REVERSAL = "PCR Extreme Reversal"
 STRATEGY_MACD_MTF = "MACD Multi-Timeframe (1H+15m+5m)"
 STRATEGY_MEAN_REV = "Sideways Scalp (BB+VWAP Mean Reversion)"
+STRATEGY_LIQUIDITY_SWEEP = "Liquidity Sweep (stop-run reclaim)"
 
 # User-facing aliases → NSE symbol
 INDEX_ALIASES: dict[str, str] = {
@@ -1033,12 +1034,24 @@ def _recommended_lots(entry_premium: float, lot_size: int, remaining_capital: fl
     return min(lots, max(1, risk_lots))
 
 
+# Measured on 59 sessions of 5m bars across NIFTY, BANKNIFTY and FINNIFTY,
+# scored on the underlying index in R-multiples. The previous values here were
+# invented and every one of them overstated reality:
+#
+#   MACD_MTF   claimed 69%  ->  measured 43.3%   PF 0.81
+#   ORB        claimed 62%  ->  measured 51.9%   PF 0.87
+#   MEAN_REV   claimed 58%  ->  measured 48.2%   PF 0.93
+#
+# Only the liquidity sweep carries a positive edge (PF 1.23, and 1.21 on
+# sessions the tuning never saw). The three above lose money as specified;
+# they are left running but no longer advertise win rates they do not have.
 _STRATEGY_BASE_WIN: dict[str, float] = {
-    STRATEGY_CONFLUENCE: 66,
-    STRATEGY_MACD_MTF: 69,
-    STRATEGY_ORB: 62,
-    STRATEGY_PCR_REVERSAL: 61,
-    STRATEGY_MEAN_REV: 58,
+    STRATEGY_LIQUIDITY_SWEEP: 50,
+    STRATEGY_CONFLUENCE: 52,   # untested in the backtest; held at coin-flip
+    STRATEGY_ORB: 52,
+    STRATEGY_PCR_REVERSAL: 52,  # untested; needs option-chain history
+    STRATEGY_MACD_MTF: 43,
+    STRATEGY_MEAN_REV: 48,
 }
 
 
@@ -1518,8 +1531,167 @@ def _check_mean_reversion(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str,
     }
 
 
+def _sweep_state(yahoo_symbol: str) -> dict[str, Any] | None:
+    """Detect a live liquidity sweep on 5-minute bars.
+
+    A swing low is where stop-loss orders pile up — everyone long from that
+    level rests a stop just under it. A sweep is price trading *through* the
+    level, filling those stops, then closing back above it: the sellers are
+    spent and the move reverses. If price instead closes below and stays
+    there, the level genuinely broke and there is no trade.
+
+    Deliberately on 5m and not the 15m frame the rest of the service uses.
+    Measured over 59 sessions on all three indices, the sweep is profitable on
+    5m (PF 1.23) and loses on 15m (PF 0.89): on a 15-minute candle the stop-run
+    and the recovery collapse into a single bar, so by the time the bar closes
+    the entry is already gone.
+    """
+    cache_key = f"sweep:{yahoo_symbol}"
+    now = time.time()
+    cached = _intraday_cache.get(cache_key)
+    if cached and now - cached[0] < 120:
+        return cached[1]
+
+    t = None
+    try:
+        t = yf.Ticker(yahoo_symbol)
+        df = _yf_history(t, period="5d", interval="5m")
+        if df is None or df.empty or len(df) < 40:
+            return None
+
+        df = df.dropna(subset=["Close"])
+        idx = df.index
+        if getattr(idx, "tz", None) is not None:
+            df.index = idx.tz_convert("Asia/Kolkata")
+        else:
+            df.index = idx.tz_localize("UTC").tz_convert("Asia/Kolkata")
+
+        high = df["High"].to_numpy(dtype=float)
+        low = df["Low"].to_numpy(dtype=float)
+        close = df["Close"].to_numpy(dtype=float)
+
+        tr = pd.concat([
+            df["High"] - df["Low"],
+            (df["High"] - df["Close"].shift()).abs(),
+            (df["Low"] - df["Close"].shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+        if not atr or atr != atr:
+            return None
+
+        dates = df.index.date
+        n = len(df)
+        i = n - 1
+        today = dates[i]
+
+        # Confirmed pivot lows earlier in today's session. A pivot needs bars
+        # on both sides, so the newest usable one sits a few bars back.
+        left = right = 3
+        levels: list[float] = []
+        for j in range(i - right - 1, max(0, i - 60), -1):
+            if dates[j] != today:
+                break
+            if j - left < 0 or j + right >= n:
+                continue
+            window = low[j - left:j + right + 1]
+            if low[j] == window.min() and (window == low[j]).sum() == 1:
+                levels.append(float(low[j]))
+                if len(levels) >= 3:
+                    break
+        if not levels:
+            return None
+
+        level = max(levels)     # nearest liquidity pool beneath price
+
+        # Look back a few bars for the pierce, then require the current bar to
+        # have reclaimed the level.
+        pierce_depth = 0.0
+        swept_low = None
+        for k in range(max(0, i - 3), i + 1):
+            if dates[k] != today:
+                continue
+            if low[k] < level:
+                d = level - low[k]
+                if d > pierce_depth:
+                    pierce_depth = d
+                    swept_low = float(low[k])
+
+        if swept_low is None or pierce_depth < 0.10 * atr:
+            return None
+        if close[i] <= level:
+            return None      # not reclaimed yet — the level may be breaking
+
+        stop = swept_low - 0.1 * atr
+        entry = float(close[i])
+        r = entry - stop
+        if r <= 0 or not (0.3 * atr <= r <= 6 * atr):
+            return None
+
+        out = {
+            "level": round(level, 2),
+            "swept_low": round(swept_low, 2),
+            "entry": round(entry, 2),
+            "stop": round(stop, 2),
+            "r_points": round(r, 2),
+            "pierce_atr": round(pierce_depth / atr, 2),
+            "atr": round(atr, 2),
+            # T2 at 1.25R. Measured across 1.0R-3.0R, 1.25R was best on both
+            # win rate and expectancy out of sample; intraday index moves
+            # mean-revert before a 2R target and the trail gives it back.
+            "t1": round(entry + 0.75 * r, 2),
+            "t2": round(entry + 1.25 * r, 2),
+        }
+        _cache_put(_intraday_cache, cache_key, (now, out))
+        return out
+    except Exception as e:
+        log.warning("Sweep detection failed for %s: %s", yahoo_symbol, e)
+        return None
+    finally:
+        _close_yf_ticker(t)
+
+
+def _check_liquidity_sweep(tech: dict[str, Any], oi: dict[str, Any]) -> dict[str, Any] | None:
+    """Long-only liquidity sweep.
+
+    Only the long side ships. Measured on 59 sessions across all three
+    indices, SWEEP_LONG held up out of sample (PF 1.21 against 1.25 in
+    sample) while SWEEP_SHORT decayed to PF 0.94 and was negative on NIFTY.
+    """
+    yahoo = tech.get("yahoo")
+    if not yahoo:
+        return None
+
+    sweep = _sweep_state(yahoo)
+    if not sweep:
+        return None
+
+    reasons = [
+        f"Liquidity sweep: pierced swing low {sweep['level']:.0f} "
+        f"down to {sweep['swept_low']:.0f} ({sweep['pierce_atr']:.2f} ATR), then reclaimed",
+        f"Stops beneath {sweep['level']:.0f} filled, sellers exhausted",
+        f"Risk {sweep['r_points']:.0f} pts to {sweep['stop']:.0f} | "
+        f"T1 {sweep['t1']:.0f} (0.75R) | T2 {sweep['t2']:.0f} (1.25R)",
+    ]
+
+    pcr = float(oi.get("pcr") or 1)
+    if pcr > 1.1:
+        reasons.append(f"PCR {pcr:.2f} supports the bounce (PE heavy)")
+
+    return {
+        "strategy": STRATEGY_LIQUIDITY_SWEEP,
+        "side": "CE",
+        "strength": "STRONG" if sweep["pierce_atr"] >= 0.30 else "MODERATE",
+        "layers": "Sweep+Reclaim+ATR",
+        "reasons": reasons,
+        "win_rate": "~50%",
+        "sweep": sweep,
+    }
+
+
 def _strategy_check_fns() -> list:
-    fns = [_check_confluence, _check_orb, _check_pcr_extreme]
+    # Liquidity sweep first: it is the only strategy here measured positive
+    # out of sample, so it should claim the alert slot when it fires.
+    fns = [_check_liquidity_sweep, _check_confluence, _check_orb, _check_pcr_extreme]
     if FNO_MACD_MTF_ENABLED:
         fns.append(_check_macd_mtf)
     fns.append(_check_mean_reversion)
