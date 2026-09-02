@@ -3,7 +3,7 @@ Async AI commentary for F&O trade messages.
 
 Reuses the AI API keys from the whatsapp-bot project (.env):
   GEMINI_API_KEY  -> generativelanguage.googleapis.com (gemini-2.5-flash)
-  GROQ_API_KEY    -> api.groq.com/openai/v1/chat/completions (llama-3.3-70b-versatile)
+  GROQ_API_KEY    -> api.groq.com/openai/v1/chat/completions (openai/gpt-oss-120b)
 
 Every call is best-effort: short timeout, graceful None on any failure so the
 trading bot never depends on the LLM being up.
@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 AI_TIMEOUT = float(os.getenv("FNO_AI_TIMEOUT", "12"))
 
 _SYSTEM_PROMPT = (

@@ -13,27 +13,81 @@ from datetime import datetime, timedelta
 log = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Model was hard-coded to gemini-2.0-flash, which Google retired — every call
+# returned HTTP 404 and the whole analyzer silently produced nothing. Read the
+# same env vars fno_ai.py uses so there is one place to bump the model.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 
-def _call_gemini(prompt: str, system: str = "") -> str:
-    """Call Gemini API."""
-    if not GEMINI_API_KEY:
-        return "Gemini API key not configured"
+# Sentinel returned when no provider could answer. Callers that parse JSON must
+# check this rather than feeding an error string to json.loads().
+AI_UNAVAILABLE = "AI_UNAVAILABLE"
+
+
+def _call_groq(prompt: str, system: str = "") -> str | None:
+    """Fallback provider. Returns None if unavailable so callers can degrade."""
+    if not GROQ_API_KEY:
+        return None
     try:
         import requests
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        messages = []
         if system:
-            payload["systemInstruction"] = {"parts": [{"text": system}]}
-        resp = requests.post(url, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No response")
-        else:
-            log.error("Gemini API error: %s %s", resp.status_code, resp.text[:200])
-            return f"API error: {resp.status_code}"
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL, "messages": messages, "temperature": 0.3},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log.error("Groq API error: %s %s", resp.status_code, resp.text[:200])
+            return None
+        choices = resp.json().get("choices") or [{}]
+        return (choices[0].get("message", {}).get("content") or "").strip() or None
     except Exception as e:
-        log.error("Gemini call failed: %s", e)
-        return f"Error: {e}"
+        log.error("Groq call failed: %s", e)
+        return None
+
+
+def _call_gemini(prompt: str, system: str = "") -> str:
+    """Call Gemini, falling back to Groq. Returns AI_UNAVAILABLE on total failure."""
+    if GEMINI_API_KEY:
+        try:
+            import requests
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{GEMINI_MODEL}:generateContent"
+            )
+            payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+            if system:
+                payload["systemInstruction"] = {"parts": [{"text": system}]}
+            resp = requests.post(
+                url, json=payload, timeout=30,
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": GEMINI_API_KEY},
+            )
+            if resp.status_code == 200:
+                parts = (resp.json().get("candidates", [{}])[0]
+                         .get("content", {}).get("parts", []) or [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return text
+                log.warning("Gemini returned an empty response; trying Groq")
+            else:
+                log.error("Gemini API error: %s %s — trying Groq",
+                          resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.error("Gemini call failed: %s — trying Groq", e)
+
+    fallback = _call_groq(prompt, system)
+    if fallback:
+        return fallback
+
+    log.error("No AI provider available (Gemini and Groq both failed)")
+    return AI_UNAVAILABLE
 
 def analyze_trade(trade: dict) -> str:
     """Analyze a single trade with Gemini AI."""
@@ -101,6 +155,9 @@ Return ONLY a JSON array (no markdown) with 2-4 improvement suggestions.
 Each: {{"title": "...", "category": "entry|exit|sizing|sector|regime", "priority": "high|medium|low", "before": "current value", "after": "suggested value", "rationale": "data-driven reason"}}"""
 
     response = _call_gemini(prompt, system)
+    if response == AI_UNAVAILABLE:
+        log.warning("Skipping improvement suggestions — no AI provider reachable")
+        return []
 
     # Parse JSON from response
     try:
