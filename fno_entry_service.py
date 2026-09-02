@@ -199,6 +199,18 @@ FNO_INDICES: list[dict[str, Any]] = [
      "step": 50, "prem_min": 120, "prem_max": 380, "lot": 25},
     {"nse": "MIDCPNIFTY", "yahoo": "NIFTY_MID_SELECT.NS", "name": "Midcap Nifty",
      "step": 25, "prem_min": 80, "prem_max": 260, "lot": 50, "nse_only_fallback": True},
+    # BSE index. Option chain comes from BSE's own API via bse_scrip_cd rather
+    # than NSELive; price data is Yahoo's ^BSESN, which carries full 5m history.
+    #
+    # Deliberately NOT in FNO_INDEX_FOCUS by default. The liquidity sweep was
+    # measured on 59 sessions of SENSEX and loses money there — PF 0.95 overall,
+    # 0.96 in sample, 0.94 out — while the same detector runs at PF 1.48 on
+    # NIFTY. Stable across the split, so it is a real negative rather than
+    # noise. Available for /entry and manual queries; add it to
+    # FNO_INDEX_FOCUS only if you want the alerts anyway.
+    {"nse": "SENSEX", "yahoo": "^BSESN", "name": "Sensex",
+     "step": 100, "prem_min": 100, "prem_max": 400, "lot": 20,
+     "bse_scrip_cd": 1, "nse_only_fallback": True},
 ]
 
 # Optional: restrict trading to a subset of indices, e.g. FNO_INDEX_FOCUS=NIFTY.
@@ -206,6 +218,16 @@ FNO_INDICES: list[dict[str, Any]] = [
 # (auto-alerts, /entry, /alert prefs, summaries) derives from FNO_INDICES.
 FNO_INDEX_FOCUS: set[str] = {
     s.strip().upper() for s in os.getenv("FNO_INDEX_FOCUS", "").split(",") if s.strip()
+}
+
+# Indices that stay available for /entry and charts but never raise an
+# auto-alert. FNO_INDEX_FOCUS controls what exists at all; this controls what
+# is allowed to message you. SENSEX is excluded by default because the sweep
+# measures PF 0.95 there against 1.48 on NIFTY.
+FNO_AUTO_ALERT_EXCLUDE: set[str] = {
+    s.strip().upper()
+    for s in os.getenv("FNO_AUTO_ALERT_EXCLUDE", "SENSEX").split(",")
+    if s.strip()
 }
 if FNO_INDEX_FOCUS:
     FNO_INDICES = [cfg for cfg in FNO_INDICES if cfg["nse"] in FNO_INDEX_FOCUS]
@@ -2139,7 +2161,9 @@ def scan_all_indices() -> list[dict[str, Any]]:
     cycle_stats = _empty_scan_stats()
     nse = NSELive()
     try:
-        for i, cfg in enumerate(FNO_INDICES):
+        alertable = [c for c in FNO_INDICES
+                     if c["nse"] not in FNO_AUTO_ALERT_EXCLUDE]
+        for i, cfg in enumerate(alertable):
             try:
                 if i > 0:
                     time.sleep(0.5)
