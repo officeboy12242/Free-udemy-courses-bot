@@ -2602,11 +2602,11 @@ def format_entry_telegram_html(payload: dict[str, Any]) -> str:
     cap = payload.get("capital") or _daily_capital_state()
     parts = [
         "<b>\u26a1 INDEX OPTIONS \u2014 SCALP SHEET</b>",
-        "<b>Strategies:</b> Confluence + ORB + PCR + MACD MTF",
+        "<b>Strategies:</b> Liquidity Sweep + Confluence + ORB + PCR + MACD MTF",
         f"<i>Updated {html.escape(payload['as_of_ist'])}</i>",
         _capital_line_html(cap),
         "",
-        "Quick book +5% / +10% \u00b7 then 50% at T1 (+20%) \u00b7 trail rest to T2 (+35%) \u00b7 hard SL",
+        "Targets are R-multiples of the stop · T1 1.0R · T2 1.75R · T3 3.0R · hard SL",
         "",
     ]
     for r in payload["indices"]:
