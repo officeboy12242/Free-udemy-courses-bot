@@ -3441,6 +3441,36 @@ async def start_http_server(app: web.Application):
     )
 
 
+async def _keep_alive() -> None:
+    """Ping our own /health so Render's free tier doesn't idle-suspend us.
+
+    A polling Telegram bot receives no inbound HTTP traffic, so Render spins the
+    service down after ~15 minutes and the bot silently stops answering. Render
+    injects RENDER_EXTERNAL_URL; without it (local runs) this task is a no-op.
+    """
+    base = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base:
+        log.info("Keep-alive disabled (RENDER_EXTERNAL_URL not set)")
+        return
+
+    import aiohttp
+
+    interval = int(os.getenv("KEEPALIVE_INTERVAL", "600"))  # 10 min < 15 min idle window
+    log.info("💓 Keep-alive pinging %s/health every %ss", base, interval)
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(f"{base}/health") as resp:
+                    if resp.status != 200:
+                        log.warning("Keep-alive ping returned HTTP %s", resp.status)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Keep-alive ping failed: %s", e)
+        await asyncio.sleep(interval)
+
+
 # ─── Main loop ───────────────────────────────────────────────────────────────
 
 async def run_news_autopost(bot: Bot):
@@ -3661,6 +3691,7 @@ async def main():
         asyncio.create_task(auto_enroll_job(tg_app)),
         asyncio.create_task(run_startup_site_health(bot)),
         asyncio.create_task(run_movie_site_monitor(bot)),
+        asyncio.create_task(_keep_alive()),
     ]
     if MARKET_FEATURES_ENABLED:
         log.info(
