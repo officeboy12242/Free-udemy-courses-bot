@@ -2341,6 +2341,9 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
             return {
                 "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
                 "spot": round(spot, 2), "tech": tech, "oi": oi,
+                "chain_as_on": chain.get("as_on"),
+                "chain_freshness": chain.get("freshness"),
+                "chain_age_minutes": chain.get("age_minutes"),
                 **best,
                 "all_triggered": all_triggered,
             }
@@ -2354,6 +2357,9 @@ def analyze_index(cfg: dict[str, Any], nse: NSELive | None = None) -> dict[str, 
         return {
             "name": cfg["name"], "nse": cfg["nse"], "expiry": chain["expiry"],
             "spot": round(spot, 2), "tech": tech, "oi": oi,
+            "chain_as_on": chain.get("as_on"),
+            "chain_freshness": chain.get("freshness"),
+            "chain_age_minutes": chain.get("age_minutes"),
             "strategy": "No fresh setup", "side": stale_side, "strength": "STALE",
             "layers": "0/4",
             "reasons": ["All setups already alerted today — wait for a fresh setup"],
@@ -2647,6 +2653,7 @@ def _format_one_index_html(r: dict[str, Any], capital: dict[str, Any] | None = N
         f" \u00b7 \u0394OI <code>{r['leg_chg_oi']:+,}</code>"
         f" \u00b7 Vol <code>{r['leg_volume']:,}</code>\n"
         f"\u2502  \U0001f4c5 Expiry  <code>{html.escape(r['expiry'])}</code>\n"
+        f"{_chain_age_html(r)}"
         f"\u2502\n"
         f"{_exit_targets_html(ex, book_hints=False)}"
         f"\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
@@ -2665,6 +2672,37 @@ def format_entry_telegram(payload: dict[str, Any]) -> str:
     for tag in ("<b>", "</b>", "<u>", "</u>", "<i>", "</i>", "<code>", "</code>"):
         text = text.replace(tag, "")
     return text
+
+
+def _chain_age_html(r: dict[str, Any]) -> str:
+    """Warn when a premium came from a settlement snapshot rather than live.
+
+    BSE (and NSE after hours) keep serving the last chain, so a stale premium
+    looks identical to a live one. The 03-Sep 76600 CE reads 153.15 from the
+    19:01 snapshot while the live screen showed 166.90 — a gap big enough to
+    size a trade wrongly.
+    """
+    state = r.get("chain_freshness")
+    as_on = r.get("chain_as_on")
+    if not state or state == "live" or not as_on:
+        return ""
+
+    age = r.get("chain_age_minutes") or 0
+    if age >= 1440:
+        age_txt = f" ({age // 1440}d old)"
+    elif age >= 60:
+        age_txt = f" ({age // 60}h old)"
+    elif age:
+        age_txt = f" ({age}m old)"
+    else:
+        age_txt = ""
+
+    return (
+        "│  ⚠️ <i>Premium as of "
+        + html.escape(as_on)
+        + age_txt
+        + " — settlement, not live. Verify before entry.</i>\n"
+    )
 
 
 def format_entry_telegram_html(payload: dict[str, Any]) -> str:

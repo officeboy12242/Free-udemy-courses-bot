@@ -12,6 +12,8 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import time
 from typing import Any
 from urllib.parse import quote
@@ -22,6 +24,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 log = logging.getLogger(__name__)
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 BSE_API_BASE = "https://api.bseindia.com/BseIndiaAPI/api"
 BSE_DERIV_BASE = f"{BSE_API_BASE}/Derivative"
@@ -296,6 +300,45 @@ def _extract_chain_rows(data: dict[str, Any]) -> tuple[float, list[dict[str, Any
     return spot, rows
 
 
+_BSE_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _parse_bse_as_on(stamp: str) -> datetime | None:
+    """Parse BSE's "02 Sep 2026 | 19:01" stamp into an IST-aware datetime."""
+    m = re.match(r"^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})\s*\|\s*(\d{1,2}):(\d{2})",
+                 (stamp or "").strip())
+    if not m:
+        return None
+    mon = _BSE_MONTHS.get(m.group(2).lower())
+    if not mon:
+        return None
+    try:
+        return datetime(int(m.group(3)), mon, int(m.group(1)),
+                        int(m.group(4)), int(m.group(5)), tzinfo=_IST)
+    except ValueError:
+        return None
+
+
+def _chain_freshness(as_of: datetime | None) -> tuple[str, int | None]:
+    """How usable the snapshot is right now.
+
+    Outside market hours the data is final rather than stale, which is a
+    different thing from a feed that has gone quiet mid-session; only the
+    latter is worth refusing to quote from.
+    """
+    if as_of is None:
+        return "unknown", None
+    now = datetime.now(_IST)
+    age = int((now - as_of).total_seconds() // 60)
+    mins = now.hour * 60 + now.minute
+    market_open = now.weekday() < 5 and (9 * 60 + 15) <= mins <= (15 * 60 + 30)
+    if not market_open:
+        return "closed", age
+    return ("live", age) if age <= 15 else ("stale", age)
+
+
 def parse_bse_option_chain(scrip_cd: int = 1) -> dict[str, Any] | None:
     """Sensex option chain in NSE-compatible row format."""
     now = time.time()
@@ -319,6 +362,23 @@ def parse_bse_option_chain(scrip_cd: int = 1) -> dict[str, Any] | None:
         log.warning("BSE Sensex: empty option chain for expiry %s", expiry)
         return None
 
-    result = {"spot": spot, "expiry": expiry, "rows": rows}
+    # BSE keeps serving the last snapshot after the session ends, and the only
+    # marker is the ASON stamp. Without surfacing it a settlement price reads as
+    # a live quote: the 03-Sep 76600 CE prints 153.15 from the 19:01 snapshot
+    # while the live screen showed 166.90.
+    as_on = ((raw.get("ASON") or {}).get("DT_TM") or "").strip()
+    as_of = _parse_bse_as_on(as_on)
+    state, age_min = _chain_freshness(as_of)
+
+    result = {
+        "spot": spot,
+        "expiry": expiry,
+        "rows": rows,
+        "as_on": as_on,
+        "as_of": as_of,
+        "freshness": state,      # live | stale | closed | unknown
+        "age_minutes": age_min,
+        "is_live": state == "live",
+    }
     _CHAIN_CACHE[scrip_cd] = (now, result)
     return result
