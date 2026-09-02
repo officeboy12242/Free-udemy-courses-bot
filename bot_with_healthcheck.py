@@ -126,7 +126,7 @@ from swing_service import (
     scan_nse50, run_backtest as swing_run_backtest,
     log_swing_trade, close_swing_trade, get_open_trades, get_trade_summary,
     run_paper_scan, get_paper_portfolio, get_sizing_summary,
-    CAPITAL, POSITION_PCT, MAX_POSITIONS,
+    CAPITAL, POSITION_PCT, MAX_POSITIONS, SL_PCT, TARGET_PRIMARY, TARGET_SECONDARY,
 )
 from trader_journal import (
     get_capital_status, get_trader_stats, get_recent_trades,
@@ -2237,17 +2237,28 @@ async def cmd_swing_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
 
     if portfolio["open"]:
+        _TYPE_EMOJI = {"MOMENTUM": "🚀", "MEAN_REV": "🔄", "EMA_CROSS": "📈", "52WK_BREAK": "📈", "MULTI_TF": "📊"}
         lines.append(f"📦 Open positions: {len(portfolio['open'])}  |  Invested: <b>₹{portfolio['total_invested']:,.0f}</b>")
         lines.append(f"📈 Unrealized P&L: <b>{'+' if portfolio['total_unrealized'] >= 0 else ''}₹{portfolio['total_unrealized']:,.0f}</b>")
         lines.append("")
         for p in portfolio["open"]:
             emoji = "🟢" if p["unrealized_pct"] >= 0 else "🔴"
+            badge = _TYPE_EMOJI.get(p.get("entry_type", ""), "📌")
+            sl = p.get("sl", 0)
+            t1 = p.get("t1", 0)
+            t2 = p.get("t2", 0)
             lines.append(
-                f"{emoji} <b>{p['symbol'].replace('.NS','')}</b>  "
-                f"Entry: ₹{p['entry']:.2f}  →  Now: ₹{p['current']:.2f}  "
+                f"{emoji} {badge} <b>{p['symbol'].replace('.NS','')}</b>  "
+                f"Entry ₹{p['entry']:.2f}  →  ₹{p['current']:.2f}  "
                 f"{p['unrealized_pct']:+.2f}%  ({p['unrealized_inr']:+,.0f} INR)  "
                 f"{p['days_held']}d held"
             )
+            if sl or t1 or t2:
+                lines.append(
+                    f"   SL ₹{sl:.2f} (-{SL_PCT*100:.0f}%)  |  "
+                    f"T1 ₹{t1:.2f} (+{TARGET_PRIMARY*100:.0f}%)  |  "
+                    f"T2 ₹{t2:.2f} (+{TARGET_SECONDARY*100:.0f}%)"
+                )
         lines.append("")
     else:
         lines.append("📦 No open positions")

@@ -98,6 +98,7 @@ POSITION_PCT = 0.20      # Max 20% per batch = ₹20,000 across 5 stocks
 SL_PCT = 0.05             # 5% stop-loss (strategy lab optimized) (v4 optimized — wider for 20d holds)
 TARGET_PRIMARY = 0.08    # 8% primary target (optimized) (v4 optimized)
 TARGET_SECONDARY = 0.12  # 12% secondary target (optimized) (v4 optimized)
+TRAIL_PCT = 0.01          # 1% trailing stop after T1 hit
 TIME_STOP_DAYS = 25      # Exit if no target hit in 25 days
 TRAILING_STOP_PCT = 0.01 # 1.0% trailing stop (locks profits fast) after T1 (tighter = locks profits faster)
 
@@ -398,9 +399,9 @@ class SwingSetup:
     name: str
     score: float           # 0-100 composite score
     entry: float           # suggested entry price
-    stop_loss: float       # 2% below entry
-    target_1: float        # 3% above entry
-    target_2: float        # 5% above entry
+    stop_loss: float
+    target_1: float
+    target_2: float
     rsi: float
     bb_pct: float
     atr_pct: float
@@ -410,11 +411,12 @@ class SwingSetup:
     reasons: list[str]     # why this stock scored well
     suggested_qty: int     # number of shares
     suggested_invest: float
-    expected_profit_t1: float  # ₹ profit if T1 (+3%) hits
-    expected_profit_t2: float  # ₹ profit if T2 (+5%) hits
-    expected_loss_sl: float    # ₹ loss if SL (-2%) hits
-    risk_reward: str           # e.g. "1:1.5"
+    expected_profit_t1: float
+    expected_profit_t2: float
+    expected_loss_sl: float
+    risk_reward: str           # e.g. "1:2.4"
     sizing_tier: str           # why this allocation size
+    entry_type: str = "MOMENTUM"  # strategy that triggered this setup
 
 
 def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
@@ -595,7 +597,7 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
 
     score = min(score, 100)
 
-    if score < 25:
+    if score < 15:
         return None
 
     qty, invest, sizing_tier = calc_position_size(score, price)
@@ -622,6 +624,7 @@ def score_stock(symbol: str, df: pd.DataFrame) -> SwingSetup | None:
         suggested_qty=qty, suggested_invest=round(invest, 0),
         expected_profit_t1=profit_t1, expected_profit_t2=profit_t2,
         expected_loss_sl=loss_sl, risk_reward=rr, sizing_tier=sizing_tier,
+        entry_type=entry_type or "MOMENTUM",
     )
 
 
@@ -698,7 +701,7 @@ def backtest_stock(symbol: str, start: str = "2025-01-01", end: str | None = Non
     Improved entry: requires uptrend + RSI reversal confirmation + volume.
     Improved exit: trailing stop after T1, wider SL for 15-20 day holds.
     """
-    df = fetch_history(symbol, period="1y", interval="1d")
+    df = fetch_history(symbol, period="2y", interval="1d")
     if df is None or len(df) < 60:
         return []
 
@@ -1035,9 +1038,16 @@ def check_open_trades_for_exits() -> list[dict]:
         low = prices["low"]
         close = prices["close"]
 
-        sl = entry * (1 - SL_PCT)
-        t1 = entry * (1 + TARGET_PRIMARY)
-        t2 = entry * (1 + TARGET_SECONDARY)
+        # Use stored SL/T1/T2 if available, else compute
+        sl = trade.get("sl") or entry * (1 - SL_PCT)
+        t1 = trade.get("t1") or entry * (1 + TARGET_PRIMARY)
+        t2 = trade.get("t2") or entry * (1 + TARGET_SECONDARY)
+
+        # Track peak price for trailing stop
+        peak = trade.get("peak_price", entry)
+        if high > peak:
+            peak = high
+        trail_stop = peak * (1 - TRAIL_PCT)
 
         # Calculate holding days
         entered = trade["entered_at"]
@@ -1059,11 +1069,11 @@ def check_open_trades_for_exits() -> list[dict]:
             exit_price = t2
             exit_reason = "T2"
 
-        # T1 hit — trail to breakeven
+        # T1 hit — start trailing at 1% below peak
         elif high >= t1:
-            if low <= entry:  # Trailing SL at breakeven hit
-                exit_price = entry
-                exit_reason = "T1_TRAIL_BE"
+            if low <= trail_stop:  # Trailing stop hit
+                exit_price = trail_stop
+                exit_reason = "TRAIL"
             elif days_held >= TIME_STOP_DAYS:
                 exit_price = close
                 exit_reason = "TIME"
@@ -1072,6 +1082,14 @@ def check_open_trades_for_exits() -> list[dict]:
         elif days_held >= TIME_STOP_DAYS:
             exit_price = close
             exit_reason = "TIME"
+
+        # Update peak price in DB
+        if peak != trade.get("peak_price", entry):
+            from bson import ObjectId
+            db.swing_trades.update_one(
+                {"_id": ObjectId(trade["_id"])},
+                {"$set": {"peak_price": round(peak, 2)}},
+            )
 
         if exit_price is not None:
             pnl_pct = ((exit_price - entry) / entry) * 100
@@ -1136,9 +1154,9 @@ def run_paper_scan() -> dict:
     if slots_free <= 0:
         return actions  # All slots filled
 
-    # Step 4: Scan for new setups
+    # Step 4: Scan for new setups (request extra to fill all slots)
     try:
-        setups = scan_nse50(slots_free + 2)  # fetch extra in case some are already open
+        setups = scan_nse50(slots_free + 5)  # request extra in case some are already open
     except Exception as e:
         log.warning("Paper scan NSE50 failed: %s", e)
         actions["scan_failed"] = True
@@ -1163,7 +1181,19 @@ def run_paper_scan() -> dict:
                 entry_price=setup.entry,
                 qty=qty,
                 status="open",
-                notes=f"score={setup.score} reasons={','.join(setup.reasons[:3])}",
+                notes=f"{setup.entry_type}|score={setup.score}|reasons={','.join(setup.reasons[:3])}",
+            )
+            # Also store SL/T1/T2 and entry_type in the document
+            db = _get_db()
+            db.swing_trades.update_one(
+                {"symbol": setup.symbol, "status": "open", "user_id": 0},
+                {"$set": {
+                    "sl": setup.stop_loss,
+                    "t1": setup.target_1,
+                    "t2": setup.target_2,
+                    "entry_type": setup.entry_type,
+                    "peak_price": setup.entry,
+                }},
             )
             actions["opened"].append({
                 "symbol": setup.symbol,
@@ -1174,6 +1204,7 @@ def run_paper_scan() -> dict:
                 "sl": setup.stop_loss,
                 "t1": setup.target_1,
                 "t2": setup.target_2,
+                "entry_type": setup.entry_type,
             })
         except Exception as e:
             log.warning("Paper trade open failed %s: %s", setup.symbol, e)
@@ -1221,6 +1252,11 @@ def get_paper_portfolio() -> dict:
             "unrealized_inr": round(unrealized_inr, 0),
             "days_held": days_held,
             "notes": t.get("notes", ""),
+            "sl": t.get("sl", 0),
+            "t1": t.get("t1", 0),
+            "t2": t.get("t2", 0),
+            "entry_type": t.get("entry_type", "?"),
+            "peak_price": t.get("peak_price", t["entry_price"]),
         })
 
     # Closed trade stats
