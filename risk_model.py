@@ -29,6 +29,7 @@ positional setups held through noise.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, asdict
 from typing import Any
 
@@ -343,3 +344,99 @@ def update_stop(
 def summarize_profiles() -> list[dict[str, Any]]:
     """Profile table for display in the bot."""
     return [asdict(p) for p in (LONG, SCALP)]
+
+
+# ── F&O options ──────────────────────────────────────────────────────────────
+# Options need their own numbers. A 14% move in an option premium is a routine
+# intraday swing driven by a small move in the index, so the same stop that
+# reads as "wide" on a stock is noise on a weekly option.
+#
+# Two defects this replaces:
+#
+#   • Targets below the stop. Risking 14% of premium to make 3% is a 0.21:1
+#     payoff that needs an 82.4% hit rate merely to break even; the +5% target
+#     needs 73.7%. Those were the headline scalp targets.
+#   • All-in sizing. Taking the maximum affordable lots put 90-98% of capital
+#     into a single option and 12-14% of capital at risk on one trade, against
+#     1% on the equity book.
+
+# 3% not 1%: index lots are chunky, and at ₹50k capital a 2% budget cannot fit
+# a single NIFTY lot (one lot at ₹120 premium risks ₹1,260 on a 14% stop).
+# Still four times tighter than the 12-14% the all-in sizing was taking.
+FNO_RISK_PER_TRADE_PCT = float(os.getenv("FNO_RISK_PER_TRADE_PCT", "0.03"))
+FNO_MAX_DEPLOY_PCT = 0.35       # never more than 35% of capital in one option
+FNO_MIN_RR = 1.0                # no target closer than the stop
+
+
+def fno_targets(entry_premium: float, sl_pct: float) -> dict[str, float]:
+    """Premium targets as R-multiples of the stop, so payoff always beats risk.
+
+    R here is the premium risked per unit (entry - stop). The first target sits
+    at 1R, which needs a 50% hit rate to break even rather than 82%.
+    """
+    if entry_premium <= 0 or not (0 < sl_pct < 100):
+        return {}
+    stop = entry_premium * (1 - sl_pct / 100.0)
+    r = entry_premium - stop
+    return {
+        "entry": round(entry_premium, 2),
+        "sl": round(stop, 2),
+        "r_pts": round(r, 2),
+        "t1": round(entry_premium + 1.0 * r, 2),   # 1R  — breakeven WR 50%
+        "t2": round(entry_premium + 1.75 * r, 2),  # 1.75R — the runner
+        "t3": round(entry_premium + 3.0 * r, 2),   # 3R  — trend day
+        "t1_r": 1.0,
+        "t2_r": 1.75,
+        "t3_r": 3.0,
+    }
+
+
+def fno_lots_for_risk(
+    capital: float,
+    premium: float,
+    lot_size: int,
+    sl_pct: float,
+    risk_pct: float = FNO_RISK_PER_TRADE_PCT,
+) -> dict[str, Any]:
+    """Lots sized so a stopped-out trade costs ``risk_pct`` of capital.
+
+    Replaces "buy as many lots as the balance allows". Returns 0 lots when even
+    one lot would risk more than the budget — refusing the trade is the correct
+    answer there, not taking it anyway.
+    """
+    if premium <= 0 or lot_size <= 0 or capital <= 0:
+        return {"lots": 0, "reason": "invalid inputs"}
+
+    risk_per_lot = premium * (sl_pct / 100.0) * lot_size
+    if risk_per_lot <= 0:
+        return {"lots": 0, "reason": "invalid stop"}
+
+    budget = capital * risk_pct
+    lots = int(budget // risk_per_lot)
+
+    cost_per_lot = premium * lot_size
+    max_by_deploy = int((capital * FNO_MAX_DEPLOY_PCT) // cost_per_lot)
+    capped = False
+    if lots > max_by_deploy:
+        lots, capped = max_by_deploy, True
+
+    if lots < 1:
+        need = risk_per_lot / risk_pct
+        return {"lots": 0,
+                "risk_per_lot": round(risk_per_lot, 2),
+                "capital_needed": round(need, 0),
+                "reason": (f"one lot risks ₹{risk_per_lot:,.0f} — over the "
+                           f"₹{budget:,.0f} budget. Needs ₹{need:,.0f} capital "
+                           f"at {risk_pct*100:.0f}% risk, or a tighter stop.")}
+
+    deployed = lots * cost_per_lot
+    risk = lots * risk_per_lot
+    return {
+        "lots": lots,
+        "deployed": round(deployed, 2),
+        "risk_inr": round(risk, 2),
+        "risk_pct": round(risk / capital * 100, 2),
+        "deploy_pct": round(deployed / capital * 100, 1),
+        "capped_by": "deploy_cap" if capped else "risk",
+        "reason": f"{lots} lot(s), risking ₹{risk:,.0f} ({risk / capital * 100:.1f}%)",
+    }

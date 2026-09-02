@@ -210,6 +210,8 @@ FNO_INDEX_FOCUS: set[str] = {
 if FNO_INDEX_FOCUS:
     FNO_INDICES = [cfg for cfg in FNO_INDICES if cfg["nse"] in FNO_INDEX_FOCUS]
 
+import risk_model as rm
+
 FNO_SL_PCT = float(os.getenv("FNO_SL_PCT", "14"))
 SL_MULT = 1.0 - FNO_SL_PCT / 100.0
 T1_MULT = 1.20
@@ -223,7 +225,22 @@ def _lot_size(nse_symbol: str) -> int:
 
 
 def _lots_for_capital(capital: float, premium: float, lot_size: int) -> int:
-    """Max lots affordable with given capital."""
+    """Lots sized by risk, not by what the balance can afford.
+
+    This used to return the maximum affordable lots, which put 90-98% of
+    capital into a single option and risked 12-14% of the account on one
+    trade. Sizing off the stop caps that at FNO_RISK_PER_TRADE_PCT.
+
+    Returns 0 when even one lot exceeds the risk budget — the caller should
+    skip the trade rather than take an oversized one.
+    """
+    if premium <= 0 or lot_size <= 0:
+        return 0
+    return rm.fno_lots_for_risk(capital, premium, lot_size, FNO_SL_PCT)["lots"]
+
+
+def _lots_affordable(capital: float, premium: float, lot_size: int) -> int:
+    """Raw affordability, kept for display of what capital *could* buy."""
     cost_per_lot = premium * lot_size
     if cost_per_lot <= 0:
         return 0
@@ -912,15 +929,16 @@ def _pick_aggressive_strike(
 
 def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
     prem = max(entry_premium, 5.0)
-    s3_mult = 1.0 + FNO_SCALP_T3_PCT / 100.0
-    s5_mult = 1.0 + FNO_SCALP_T5_PCT / 100.0
-    s10_mult = 1.0 + FNO_SCALP_T10_PCT / 100.0
-    sl = round(prem * SL_MULT, 2)
-    s3 = round(prem * s3_mult, 2)
-    s5 = round(prem * s5_mult, 2)
-    s10 = round(prem * s10_mult, 2)
-    t1 = round(prem * T1_MULT, 2)
-    t2 = round(prem * T2_MULT, 2)
+    # Targets are R-multiples of the premium stop, not fixed percentages of
+    # premium. The old +3%/+5% books against a 14% stop were 0.21:1 and 0.36:1
+    # payoffs, needing 82% and 74% hit rates just to break even.
+    _t = rm.fno_targets(prem, FNO_SL_PCT)
+    sl = _t["sl"]
+    s3 = _t["t1"]     # 1.00R — breakeven hit rate 50%
+    s5 = _t["t2"]     # 1.75R — breakeven hit rate 36%
+    s10 = _t["t3"]    # 3.00R — breakeven hit rate 25%
+    t1 = _t["t2"]
+    t2 = _t["t3"]
     lot = lot_size if lot_size > 0 else 1
     d: dict[str, Any] = {
         "entry": round(prem, 2),
@@ -931,9 +949,10 @@ def _scalp_exits(entry_premium: float, lot_size: int = 0) -> dict[str, float]:
         "s10_pts": round(s10 - prem, 2),
         "t1_pts": round(t1 - prem, 2),
         "t2_pts": round(t2 - prem, 2),
-        "s3_pct": FNO_SCALP_T3_PCT,
-        "s5_pct": FNO_SCALP_T5_PCT,
-        "s10_pct": FNO_SCALP_T10_PCT,
+        "s3_pct": round((s3 - prem) / prem * 100, 1),
+        "s5_pct": round((s5 - prem) / prem * 100, 1),
+        "s10_pct": round((s10 - prem) / prem * 100, 1),
+        "r_pts": _t["r_pts"],
         "rr": round((t1 - prem) / (prem - sl), 1) if prem > sl else 0.0,
         "lot": lot_size,
     }
@@ -1007,8 +1026,11 @@ def _recommended_lots(entry_premium: float, lot_size: int, remaining_capital: fl
     lots = 1
     if t2_per_lot > 0 and t2_per_lot < FNO_PROFIT_TARGET_MIN:
         lots = max(1, math.ceil(FNO_PROFIT_TARGET_MIN / t2_per_lot))
-    afford = max(1, _lots_for_capital(max(cap, 0), entry_premium, lot_size))
-    return min(lots, afford)
+    # Risk cap. The floor of 1 keeps the alert renderable when even a single
+    # lot exceeds the risk budget (chunky index lots on small capital); the
+    # alert text carries the resulting risk so it is not hidden.
+    risk_lots = _lots_for_capital(max(cap, 0), entry_premium, lot_size)
+    return min(lots, max(1, risk_lots))
 
 
 _STRATEGY_BASE_WIN: dict[str, float] = {
