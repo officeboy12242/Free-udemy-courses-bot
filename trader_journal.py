@@ -227,7 +227,10 @@ def get_trader_stats(days: int = 30) -> dict:
     """Get trading statistics for last N days."""
     db = _get_db()
     since = datetime.utcnow() - timedelta(days=days)
-    trades = list(db.trader_journal.find({"status": "closed", "entered_at": {"$gte": since}}))
+    trades = [
+        _normalize_swing_trade(t)
+        for t in db.swing_trades.find({"status": "closed", "entered_at": {"$gte": since}})
+    ]
 
     if not trades:
         return {"total": 0, "wins": 0, "losses": 0, "wr": 0, "avg_pnl": 0, "total_pnl": 0,
@@ -282,6 +285,80 @@ def get_trader_stats(days: int = 30) -> dict:
         "by_sector": by_sector,
     }
 
+# ── swing_trades adapter ─────────────────────────────────────────────────────
+# Real trading writes to swing_trades (swing_service); the trader_journal
+# collection was never written to by anything. Read swing_trades and normalise
+# it into the shape the AI analyzer expects.
+
+def _parse_notes(notes: str) -> tuple[float, list[str]]:
+    """Pull score and reasons out of a trade note.
+
+    Two formats exist in the collection: the current
+    "TYPE|score=NN|reasons=a,b,c" and an older space-separated
+    "score=NN reasons=a,b,c" with no type prefix. Match on the keys rather
+    than the separator so both parse.
+    """
+    import re
+
+    text = notes or ""
+    score = 0.0
+    m = re.search(r"score=([0-9]+(?:\.[0-9]+)?)", text)
+    if m:
+        try:
+            score = float(m.group(1))
+        except ValueError:
+            pass
+    reasons: list[str] = []
+    m = re.search(r"reasons=(.*)$", text, re.S)
+    if m:
+        tail = m.group(1).split("|")[0]
+        reasons = [r.strip() for r in tail.split(",") if r.strip()]
+    return score, reasons
+
+
+def _strategy_from_notes(notes: str) -> str:
+    """Legacy notes put the strategy first; newer space-separated ones omit it."""
+    head = (notes or "").split("|")[0].strip()
+    if head and "=" not in head and len(head) <= 20:
+        return head
+    return "unknown"
+
+
+def _normalize_swing_trade(t: dict) -> dict:
+    """Map a swing_trades document to the analyzer's trade shape."""
+    from swing_service import get_sector
+
+    symbol = t.get("symbol", "")
+    notes_score, reasons = _parse_notes(t.get("notes", ""))
+    entered = t.get("entered_at")
+    exited = t.get("exited_at")
+    if isinstance(entered, datetime):
+        end = exited if isinstance(exited, datetime) else datetime.utcnow()
+        holding_days = max((end - entered).days, 0)
+    else:
+        holding_days = 0
+
+    return {
+        "_id": t.get("_id"),
+        "symbol": symbol.replace(".NS", ""),
+        "sector": get_sector(symbol),
+        "strategy": t.get("entry_type") or _strategy_from_notes(t.get("notes", "")),
+        "status": t.get("status"),
+        "entry_price": t.get("entry_price"),
+        "exit_price": t.get("exit_price"),
+        "pnl_pct": t.get("pnl_pct", 0),
+        "pnl_inr": t.get("pnl_inr", 0),
+        "exit_reason": t.get("exit_reason"),
+        "holding_days": holding_days,
+        "score": t.get("score") or notes_score,
+        "reasons": reasons,
+        "entry_date": entered.strftime("%Y-%m-%d") if isinstance(entered, datetime) else "?",
+        "exit_date": exited.strftime("%Y-%m-%d") if isinstance(exited, datetime) else None,
+        "entered_at": entered,
+        "exited_at": exited,
+    }
+
+
 # ── Improvement Tickets ──
 def create_improvement_ticket(ticket: ImprovementTicket) -> str:
     """Create an improvement ticket (pending review)."""
@@ -297,6 +374,43 @@ def create_improvement_ticket(ticket: ImprovementTicket) -> str:
     result = db.trader_improvements.insert_one(doc)
     log.info("Improvement ticket created: %s", ticket.title)
     return str(result.inserted_id)
+
+def create_tickets_from_suggestions(
+    suggestions: list[dict],
+    trade_ids: list[str] | None = None,
+) -> list[dict]:
+    """Persist AI suggestions as pending tickets, skipping ones already open.
+
+    Without this the analyzer printed suggestions and threw them away, so
+    /improve was permanently empty and /approve had nothing to act on.
+    Deduped on title against tickets that are still pending or approved, so
+    re-running the analysis does not pile up copies of the same advice.
+    """
+    db = _get_db()
+    _ensure_indexes()
+    created = []
+    for s in suggestions or []:
+        title = (s.get("title") or "").strip()
+        if not title:
+            continue
+        if db.trader_improvements.find_one(
+            {"title": title, "status": {"$in": ["pending", "approved"]}}
+        ):
+            log.info("Skipping duplicate improvement ticket: %s", title)
+            continue
+        ticket = ImprovementTicket(
+            title=title,
+            description=s.get("rationale", "") or "",
+            category=s.get("category", "other"),
+            priority=s.get("priority", "medium"),
+            before=s.get("before"),
+            after=s.get("after"),
+            rationale=s.get("rationale", "") or "",
+            trade_ids=trade_ids or [],
+        )
+        created.append({"id": create_improvement_ticket(ticket), "title": title})
+    return created
+
 
 def get_pending_tickets() -> list[dict]:
     """Get all pending improvement tickets."""
@@ -324,38 +438,28 @@ def reject_ticket(ticket_id: str) -> dict:
     return {"ok": result.modified_count > 0}
 
 def apply_ticket(ticket_id: str) -> dict:
-    """Mark ticket as applied (after system implements the change)."""
+    """Record that an approved change has been made to the strategy by hand.
+
+    This does NOT edit strategy parameters. The previous version branched on
+    category and set applied = True in every branch without touching anything,
+    so a ticket could reach status "applied" while the strategy was unchanged.
+    Parameter changes are deliberate and manual; this only marks the ticket as
+    done so it stops showing up as outstanding.
+    """
     from bson import ObjectId
     db = _get_db()
     ticket = db.trader_improvements.find_one({"_id": ObjectId(ticket_id)})
     if not ticket:
         return {"error": "Ticket not found"}
+    if ticket.get("status") != "approved":
+        return {"error": f"Ticket is {ticket.get('status')}, approve it first"}
 
-    # Actually apply the change based on category
-    category = ticket.get("category", "")
-    before = ticket.get("before")
-    after = ticket.get("after")
-
-    applied = False
-    if category == "sl":
-        from swing_service import SL_PCT
-        # Will be applied via parameter update
-        applied = True
-    elif category == "t1":
-        applied = True
-    elif category == "t2":
-        applied = True
-    elif category == "sector":
-        applied = True  # Sector filter update
-    else:
-        applied = True  # Generic apply
-
-    if applied:
-        db.trader_improvements.update_one(
-            {"_id": ObjectId(ticket_id)},
-            {"$set": {"status": "applied", "applied_at": datetime.utcnow()}}
-        )
-    return {"ok": applied, "category": category}
+    db.trader_improvements.update_one(
+        {"_id": ObjectId(ticket_id)},
+        {"$set": {"status": "applied", "applied_at": datetime.utcnow()}},
+    )
+    return {"ok": True, "category": ticket.get("category", ""),
+            "title": ticket.get("title", "")}
 
 def get_improvement_history() -> list[dict]:
     """Get all improvement tickets with status."""
@@ -366,5 +470,7 @@ def get_improvement_history() -> list[dict]:
 def get_recent_trades(limit: int = 10) -> list[dict]:
     """Get recent trades."""
     db = _get_db()
-    trades = list(db.trader_journal.find().sort("entered_at", -1).limit(limit))
-    return trades
+    return [
+        _normalize_swing_trade(t)
+        for t in db.swing_trades.find().sort("entered_at", -1).limit(limit)
+    ]

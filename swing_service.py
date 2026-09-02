@@ -81,6 +81,80 @@ NSE200 = NSE50 + [
 # Deduplicate
 NSE200 = list(dict.fromkeys(NSE200))
 
+# ── Sector Map ───────────────────────────────────────────────────────────────
+# swing_trades rows carry no sector, but the AI analyzer and win/loss pattern
+# code both group by it. Keyed on the bare NSE name (no ".NS" suffix).
+SECTOR_MAP: dict[str, str] = {
+    # Banking
+    "HDFCBANK": "Banking", "ICICIBANK": "Banking", "SBIN": "Banking",
+    "KOTAKBANK": "Banking", "AXISBANK": "Banking", "INDUSINDBK": "Banking",
+    "FEDERALBNK": "Banking", "IDFCFIRSTB": "Banking", "BANDHANBNK": "Banking",
+    "PNB": "Banking", "CANBK": "Banking",
+    # Finance & Insurance
+    "BAJFINANCE": "Finance", "BAJAJFINSV": "Finance", "SHRIRAMFIN": "Finance",
+    "MUTHOOTFIN": "Finance", "MANAPPURAM": "Finance", "CHOLAFIN": "Finance",
+    "AAVAS": "Finance", "IRFC": "Finance", "RECLTD": "Finance",
+    "HDFCLIFE": "Insurance", "SBILIFE": "Insurance",
+    # IT
+    "TCS": "IT", "INFY": "IT", "WIPRO": "IT", "HCLTECH": "IT", "TECHM": "IT",
+    "MPHASIS": "IT", "OFSS": "IT", "COFORGE": "IT", "PERSISTENT": "IT",
+    "LTTS": "IT", "KPITTECH": "IT", "HAPPSTMNDS": "IT", "ZENTEC": "IT",
+    "TANLA": "IT", "NAUKRI": "Internet",
+    # Pharma & Healthcare
+    "SUNPHARMA": "Pharma", "DIVISLAB": "Pharma", "DRREDDY": "Pharma",
+    "CIPLA": "Pharma", "TORNTPHARM": "Pharma", "ALKEM": "Pharma",
+    "IPCALAB": "Pharma", "LAURUSLABS": "Pharma", "AUROPHARMA": "Pharma",
+    "GLENMARK": "Pharma", "BIOCON": "Pharma", "ZYDUSLIFE": "Pharma",
+    "APOLLOHOSP": "Healthcare", "LALPATHLAB": "Healthcare", "TARSONS": "Healthcare",
+    # FMCG & Consumer
+    "HINDUNILVR": "FMCG", "ITC": "FMCG", "NESTLEIND": "FMCG",
+    "TATACONSUM": "FMCG", "BRITANNIA": "FMCG", "MARICO": "FMCG",
+    "EMAMILTD": "FMCG", "PGHH": "FMCG", "RADICO": "FMCG", "UNITDSPR": "FMCG",
+    "ASIANPAINT": "Consumer", "TITAN": "Consumer", "VOLTAS": "Consumer",
+    "BLUESTARCO": "Consumer", "CROMPTON": "Consumer", "DIXON": "Consumer",
+    "TRENT": "Retail", "ABFRL": "Retail",
+    # Auto & Ancillary
+    "MARUTI": "Auto", "TMPV": "Auto", "M&M": "Auto", "EICHERMOT": "Auto",
+    "HEROMOTOCO": "Auto", "BAJAJ-AUTO": "Auto", "MOTHERSON": "Auto",
+    "BOSCHLTD": "Auto", "MRF": "Auto", "TVSMOTOR": "Auto", "ASHOKLEY": "Auto",
+    "EXIDEIND": "Auto", "ARE&M": "Auto",
+    # Energy, Power & Infra
+    "RELIANCE": "Energy", "ONGC": "Energy", "BPCL": "Energy",
+    "NTPC": "Power", "POWERGRID": "Power", "TATAPOWER": "Power",
+    "NHPC": "Power", "SJVN": "Power", "IREDA": "Power", "ADANIGREEN": "Power",
+    "ADANIENSOL": "Power", "CESC": "Power", "TORNTPOWER": "Power",
+    "LT": "Infra", "ADANIPORTS": "Infra", "RVNL": "Infra",
+    "ADANIENT": "Conglomerate",
+    # Metals & Mining
+    "JSWSTEEL": "Metals", "TATASTEEL": "Metals", "HINDALCO": "Metals",
+    "NATIONALUM": "Metals", "HINDZINC": "Metals", "VEDL": "Metals",
+    "NMDC": "Metals", "SAIL": "Metals", "JINDALSTEL": "Metals",
+    "HINDCOPPER": "Metals", "RATNAMANI": "Metals", "APLAPOLLO": "Metals",
+    "WELCORP": "Metals", "JSL": "Metals", "COALINDIA": "Mining",
+    # Cement
+    "ULTRACEMCO": "Cement", "GRASIM": "Cement",
+    # Chemicals
+    "DEEPAKNTR": "Chemicals", "ATUL": "Chemicals", "NAVINFLUOR": "Chemicals",
+    "SRF": "Chemicals", "PIIND": "Chemicals", "CLEAN": "Chemicals",
+    "ANURAS": "Chemicals", "FLUOROCHEM": "Chemicals", "GODREJIND": "Chemicals",
+    # Realty
+    "DLF": "Realty", "GODREJPROP": "Realty", "OBEROIRLTY": "Realty",
+    "PRESTIGE": "Realty", "BRIGADE": "Realty", "PHOENIXLTD": "Realty",
+    "SOBHA": "Realty", "LODHA": "Realty", "MAHLIFE": "Realty",
+    # Defence & PSU
+    "BEL": "Defence", "HAL": "Defence", "MAZDOCK": "Defence",
+    "COCHINSHIP": "Defence", "GRSE": "Defence", "BHEL": "Defence",
+    # Telecom & Media
+    "BHARTIARTL": "Telecom", "IDEA": "Telecom", "TATACOMM": "Telecom",
+    "SUNTV": "Media", "ZEEL": "Media", "PVRINOX": "Media",
+}
+
+
+def get_sector(symbol: str) -> str:
+    """Sector for an NSE symbol, with or without the .NS suffix."""
+    return SECTOR_MAP.get(symbol.replace(".NS", "").upper(), "Other")
+
+
 # ── Screener Parameters ──────────────────────────────────────────────────────
 RSI_PERIOD = 14
 RSI_OVERSOLD = 35        # RSI below this = potential bounce

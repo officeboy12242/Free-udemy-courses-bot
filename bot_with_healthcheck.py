@@ -133,6 +133,7 @@ from swing_service import (
 from trader_journal import (
     get_capital_status, get_trader_stats, get_recent_trades,
     get_pending_tickets, approve_ticket, reject_ticket, get_improvement_history,
+    create_tickets_from_suggestions, apply_ticket,
 )
 from ai_analyzer import (
     analyze_trade, generate_improvement_suggestions, search_strategy_improvements,
@@ -2497,8 +2498,18 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             lines.append(f"   • {insight}")
         lines.append("")
 
-    # Suggestions
+    # Suggestions — persist as tickets so /improve and /approve have something
+    # to act on. Previously these were printed to chat and then discarded.
     if suggestions:
+        try:
+            trade_ids = [str(t.get("_id")) for t in trades if t.get("_id")]
+            created = await asyncio.to_thread(
+                create_tickets_from_suggestions, suggestions, trade_ids
+            )
+        except Exception as e:
+            log.warning("Could not save improvement tickets: %s", e)
+            created = []
+
         lines.append(f"💡 <b>{len(suggestions)} Improvement Suggestions:</b>")
         for i, s in enumerate(suggestions, 1):
             lines.append(f"\n{i}. <b>{s.get('title', '?')}</b> [{s.get('category', '?')}]")
@@ -2506,9 +2517,19 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             lines.append(f"   Before: {s.get('before', '?')}")
             lines.append(f"   After: {s.get('after', '?')}")
             lines.append(f"   Why: {s.get('rationale', '?')}")
-        lines.append(f"\n<i>Use /approve to approve, /reject to reject.</i>")
+        dupes = len(suggestions) - len(created)
+        saved = f"\n📋 Saved {len(created)} new ticket(s)"
+        if dupes > 0:
+            saved += f" · {dupes} already open"
+        lines.append(saved)
+        lines.append("<i>Use /improve to review, /approve to approve, /reject to reject.</i>")
+    elif stats.get("total", 0) < 5:
+        lines.append(
+            f"💡 No suggestions yet — need 5+ closed trades "
+            f"(you have {stats.get('total', 0)})"
+        )
     else:
-        lines.append("💡 No improvement suggestions yet (need 5+ trades)")
+        lines.append("💡 No suggestions returned — AI provider unavailable?")
 
     await update.effective_message.reply_html("\n".join(lines))
 
@@ -2559,9 +2580,48 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text(f"No ticket found with prefix: {prefix}"); return
         result = await asyncio.to_thread(approve_ticket, str(matching[0]['_id']))
         if result.get('ok'):
-            await update.effective_message.reply_text(f"✅ Approved: {matching[0].get('title', '?')}\n\nThe change will be applied in the next cycle.")
+            await update.effective_message.reply_text(f"✅ Approved: {matching[0].get('title', '?')}\n\nParameter changes are manual \u2014 edit swing_service.py, then /apply {str(matching[0]['_id'])[:8]} to close the ticket.")
         else:
             await update.effective_message.reply_text("Failed to approve.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Error: {e}")
+
+
+async def cmd_apply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark an approved ticket as applied, once you've made the change yourself."""
+    if not update.effective_message or not update.effective_user: return
+    if not is_owner(update.effective_user.id):
+        await update.effective_message.reply_text("Owner only."); return
+
+    args = context.args
+    if not args:
+        await update.effective_message.reply_text(
+            "Usage: /apply <ticket_id_prefix>\n\n"
+            "Marks an approved ticket as done. Parameter changes are manual — "
+            "edit the constants in swing_service.py, then run this to close the ticket."
+        )
+        return
+
+    prefix = args[0]
+    try:
+        history = await asyncio.to_thread(get_improvement_history)
+        matching = [t for t in history
+                    if str(t["_id"]).startswith(prefix) and t.get("status") == "approved"]
+        if not matching:
+            await update.effective_message.reply_text(
+                f"No approved ticket found with prefix: {prefix}\n"
+                "Approve it first with /approve, or check /improve."
+            )
+            return
+        result = await asyncio.to_thread(apply_ticket, str(matching[0]["_id"]))
+        if result.get("ok"):
+            await update.effective_message.reply_text(
+                f"✅ Marked applied: {result.get('title', '?')}"
+            )
+        else:
+            await update.effective_message.reply_text(
+                f"Failed: {result.get('error', 'unknown error')}"
+            )
     except Exception as e:
         await update.effective_message.reply_text(f"Error: {e}")
 
@@ -2796,6 +2856,7 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("improve", cmd_improve))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("reject", cmd_reject))
+    app.add_handler(CommandHandler("apply", cmd_apply))
     app.add_handler(CommandHandler("journal", cmd_journal))
     app.add_handler(CommandHandler("strategy", cmd_strategy))
     
