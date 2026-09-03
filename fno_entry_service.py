@@ -45,7 +45,7 @@ import yfinance as yf
 from dotenv import load_dotenv
 from jugaad_data.nse import NSELive
 
-from bse_option_service import parse_bse_option_chain
+from bse_option_service import _chain_freshness, parse_bse_option_chain
 from fno_storage import (
     already_alerted as _already_alerted,
     clear_user_alert_indices,
@@ -781,6 +781,17 @@ def _fetch_intraday(
     return out
 
 
+def _parse_nse_timestamp(stamp: str) -> datetime | None:
+    """NSE stamps its chain as "03-Sep-2026 09:57:00" (IST)."""
+    s = (stamp or "").strip()
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str, Any] | None:
     client = nse or NSELive()
     try:
@@ -793,7 +804,21 @@ def _parse_option_chain(nse_symbol: str, nse: NSELive | None = None) -> dict[str
         rows = [d for d in rec.get("data", []) if d.get("expiryDates") == expiry]
         if not rows:
             return None
-        return {"spot": spot, "expiry": expiry, "rows": rows}
+        # NSE keeps serving the last chain after the close exactly as BSE does,
+        # so NIFTY needs the same staleness marker or the identical bug lands
+        # here after hours: a settlement premium presented as a live quote.
+        as_on = (rec.get("timestamp") or "").strip()
+        as_of = _parse_nse_timestamp(as_on)
+        state, age_min = _chain_freshness(as_of)
+        return {
+            "spot": spot,
+            "expiry": expiry,
+            "rows": rows,
+            "as_on": as_on,
+            "freshness": state,
+            "age_minutes": age_min,
+            "is_live": state == "live",
+        }
     except Exception as e:
         log.warning("Option chain failed for %s: %s", nse_symbol, e)
         return None
@@ -1077,22 +1102,44 @@ _STRATEGY_BASE_WIN: dict[str, float] = {
 }
 
 
+# Ceiling for any displayed confidence. The best bucket in the backtest was the
+# A+ liquidity sweep at 57%, so a number above this is not an estimate, it is
+# advertising. The old ceiling was 92% and setups routinely pinned to it.
+_CONFIDENCE_MAX = 65
+_CONFIDENCE_MIN = 35
+
+
 def _confidence_pct(strategy: str, quality_score: float | None = None, alert_ready: bool | None = None) -> int:
-    """Win-probability estimate from the strategy's edge + this setup's quality score."""
-    base = _STRATEGY_BASE_WIN.get(strategy, 60)
+    """Win-probability estimate from the strategy's measured edge and setup quality.
+
+    Two things were wrong here and they compounded.
+
+    quality_score is handed the candidate's *rank*, which is already
+    qscore + _strategy_rank_base(strategy). Subtracting the rank base again
+    stops the strategy's own weighting being counted twice; without that a
+    confluence setup arrived carrying an extra 25 points of "quality".
+
+    The multiplier was 0.4 against a 92% ceiling, so that double-counted score
+    ran the estimate straight to the cap - a live SENSEX card showed
+    "Win confidence: 92%" for a strategy measured at 52%. The scale is now
+    gentle and bounded, and the cap sits at what was actually observed.
+    """
+    base = _STRATEGY_BASE_WIN.get(strategy, 50)
     adj = 0.0
     if quality_score is not None:
-        adj += (float(quality_score) - 55) * 0.4
+        q = float(quality_score) - _strategy_rank_base(strategy)
+        adj += max(-8.0, min(8.0, (q - 55) * 0.15))
     if alert_ready is True:
-        adj += 3
+        adj += 2
     elif alert_ready is False:
-        adj -= 3
-    return int(max(40, min(92, round(base + adj))))
+        adj -= 2
+    return int(max(_CONFIDENCE_MIN, min(_CONFIDENCE_MAX, round(base + adj))))
 
 
 def _confidence_html(strategy: str, quality_score: float | None = None, alert_ready: bool | None = None) -> str:
     p = _confidence_pct(strategy, quality_score, alert_ready)
-    label = "HIGH" if p >= 75 else ("MEDIUM" if p >= 62 else "LOW")
+    # Rescaled to the new range; 75 was unreachable once the cap moved to 65.
+    label = "HIGH" if p >= 58 else ("MEDIUM" if p >= 50 else "LOW")
     return (
         f"\U0001f4ca Win confidence: <b>{p}%</b> \u00b7 Loss risk: <b>{100 - p}%</b> "
         f"<i>({label})</i>"
