@@ -115,11 +115,27 @@ PROFILES: dict[str, Profile] = {"SCALP": SCALP, "LONG": LONG}
 #   52WK_BREAK   n= 26  avg +0.029%  win 57.7%
 #   MULTI_TF     n=719  avg -0.256%  win 52.6%   <- worse than baseline
 #
-# MULTI_TF fired on 72% of all signals and returned less than buying on a
-# random day, which is what dragged the whole system negative. It is blocked
-# rather than merely down-weighted: no exit geometry rescues a negative edge.
-_BLOCKED_TYPES = {"MULTI_TF", "EMA_CROSS"}
+# Those forward returns are raw: entry to a fixed horizon, no stop. MULTI_TF
+# was blocked on that basis, which was wrong. Its MEDIAN 10-day return was
+# +0.350% against a -0.256% mean - a fat left tail, not a dead signal, and a
+# stop is precisely what removes a left tail. Re-tested with the ATR stop and
+# R-multiple targets this model actually uses, on 2y of daily bars:
+#
+#   MULTI_TF     n=4154  57.2% WR  PF 1.14   train 1.05  test 1.34
+#   the others   n=2078  56.4% WR  PF 1.23   train 1.12  test 1.50
+#
+# So MULTI_TF is tradeable under these exits, just weaker: it earns SCALP
+# treatment, never the wider stop and longer hold of the LONG book. Blocking it
+# entirely left /swing returning nothing on any day the other three did not
+# fire, which on a broad rally is every day.
+#
+# EMA_CROSS stays blocked. It was the weakest of the five on the original
+# measurement and has not been re-tested under this model, so it is excluded on
+# absence of evidence rather than evidence of absence.
+_BLOCKED_TYPES = {"EMA_CROSS"}
 _LONG_ELIGIBLE = {"MOMENTUM", "MEAN_REV", "52WK_BREAK"}
+# Tradeable, but capped at the SCALP profile.
+_SCALP_ONLY = {"MULTI_TF"}
 
 
 def get_profile(name: str) -> Profile:
@@ -147,7 +163,8 @@ def pick_profile(
 
     if score >= LONG.min_score and etype in _LONG_ELIGIBLE:
         candidate = LONG
-    elif score >= SCALP.min_score and etype in _LONG_ELIGIBLE:
+    elif score >= SCALP.min_score and (etype in _LONG_ELIGIBLE or etype in _SCALP_ONLY):
+        # MULTI_TF lands here: real edge, but not enough to earn a 40-day hold.
         candidate = SCALP
     else:
         return None
