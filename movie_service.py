@@ -1,7 +1,7 @@
 """
 Movie scraper — supports multiple sources:
   - HDHub4u         (https://new2.hdhub4u.cl/)          ← primary
-  - 4KHDHub         (https://4khdhub.link/category/hindi-movies/)
+  - 4KHDHub         (https://4khdhub.one/)
   - MoviesDrive     (https://new2.moviesdrives.my/)
   - HDMovie2        (https://newhdmovie2.pro/)
   - Vegamovies      (https://vegamovies.global/)
@@ -9,22 +9,17 @@ Movie scraper — supports multiple sources:
   - BollyFlix       (https://new.bollyflix.gd/)
   - MoviesMod       (https://moviesmod.farm/)
   - AtoZ Cinemas    (https://atoz.cinemaz.workers.dev/)
-  - MkV Base        (https://mkvbase.site/)
   - ZeeFliz         (https://zeefliz.beer/)
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
 import html
 import json
 import logging
 import os
-import random
 import re
-import shutil
 import threading
 import time
 import urllib.parse
@@ -57,10 +52,6 @@ log = logging.getLogger(__name__)
 # Sign up free at https://www.scraperapi.com  — 5,000 req/month free
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 SCRAPER_API_URL = "http://api.scraperapi.com"
-# ScraperAPI alternatives (mkvbase CF on Render free — no Chrome)
-ZENROWS_API_KEY = os.getenv("ZENROWS_API_KEY", "")
-SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY", "")
-BYPARR_URL = (os.getenv("BYPARR_URL") or os.getenv("FLARESOLVERR_URL") or "").rstrip("/")
 
 # Full browser-like headers to avoid 403 blocks
 HEADERS = {
@@ -86,6 +77,7 @@ HEADERS = {
 
 # Some sites have SSL chain issues on Windows / cloud deployments.
 _NO_VERIFY_HOSTS = {
+    "4khdhub.one",
     "4khdhub.link",
     "cryptoinsights.site",
     "hblinks.org",
@@ -257,7 +249,7 @@ def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
     try:
         url = HDH_CATEGORY if page == 1 else f"{HDH_BASE}/category/hindi-movies/page/{page}/"
         # Prime the session with the homepage first (gets cookies, sets Referer)
-        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.one")
         session.headers["Referer"] = HDH_BASE + "/"
         resp = _get(url, timeout=20)
         resp.raise_for_status()
@@ -284,7 +276,7 @@ def hdh_latest_movies(page: int = 1) -> list[dict[str, str]]:
 def hdh_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     """Return poster + list of quality/link blocks for a 4KHDHub movie page."""
     try:
-        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.one")
         session.headers["Referer"] = HDH_CATEGORY
         page_timeout = 10 if fast else 20
         page_retries = 0 if fast else 2
@@ -337,6 +329,18 @@ def hdh_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
                 href = a.get("href", "")
                 if text and href:
                     links.append({"name": text, "url": href})
+            if links:
+                # Resolve greenmotors/gadgetsweb → hubcloud/hubdrive (not ad pages)
+                expanded = _expand_gw_links(
+                    [{"label": lk["name"], "url": lk["url"]} for lk in links]
+                )
+                links = [
+                    {"name": (x.get("label") or x.get("name") or "Download"), "url": x["url"]}
+                    for x in expanded
+                    if (x.get("url") or "").startswith("http")
+                ]
+                # Drop unresolved ad-gates so callers don't get shorteners
+                links = [lk for lk in links if not _is_gw_ad_url(lk["url"])]
             if links:
                 qualities.append({
                     "quality": quality_title,
@@ -623,7 +627,7 @@ def md_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
 def hdh_search(query: str, limit: int = 10, *, timeout: int = 20, retries: int = 2) -> list[dict[str, str]]:
     """Search 4KHDHub using the ?s= query parameter."""
     try:
-        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.link")
+        session = _session_for(urlparse(HDH_BASE).netloc or "4khdhub.one")
         session.headers["Referer"] = HDH_BASE + "/"
         resp = _get(f"{HDH_BASE}/", params={"s": query}, timeout=timeout, retries=retries)
         resp.raise_for_status()
@@ -1955,18 +1959,156 @@ def format_bollyflix_message(movie_title: str, data: dict[str, Any], footer: boo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Gadgetsweb / Cryptoinsights resolver
-#  Chain: gadgetsweb → cryptoinsights (extract 'o') → atob→atob→rot13→atob→JSON
-#         → atob → hblinks.org → final HubCloud/HubDrive/GoFile links
+#  Ad-gate resolver (gadgetsweb / greenmotors / whatever they rename to next)
+#  Chain: gate/?id=… → HTML s('o','…') → atob×2 → ROT13 → atob → JSON → final
+#  Hosts are detected by ?id= shape + learned from successful resolves (persisted).
 # ══════════════════════════════════════════════════════════════════════════════
 
-_GW_AD_DOMAINS = {"gadgetsweb.xyz", "gadgetsweb.com", "cryptoinsights.site", "greenmountmotors.com"}
+_AD_GATE_TRY_ORDER = (
+    "greenmotors.club",
+    "greenmountmotors.com",
+    "gadgetsweb.xyz",
+    "gadgetsweb.com",
+    "cryptoinsights.site",
+)
+_AD_GATE_SEED = frozenset(_AD_GATE_TRY_ORDER)
+# Back-compat alias used by older call sites / comments
+_GW_AD_DOMAINS = set(_AD_GATE_SEED)
 
 _FINAL_HOST_KEYWORDS = {
     "hubcloud", "hubdrive", "gofile", "pixeldrain", "mediafire",
     "gdrive", "filepress", "gdflix", "fastdl", "megaup",
     "drive.google", "hblinks",
 }
+
+# Listing sites — never treat their own pages as ad-gates
+_AD_GATE_SKIP_HOST_PARTS = (
+    "hdhub4u", "4khdhub", "moviesdrive", "bollyflix", "vegamovies",
+    "moviesmod", "hdmovie2", "sdmoviespoint", "cinemaz", "zeefliz",
+    "telegram", "t.me", "youtube", "imdb",
+)
+
+_AD_GATE_ID_RE = re.compile(r"^[A-Za-z0-9+/_\-]{40,}={0,3}$")
+_AD_GATE_FILE = Path(
+    os.getenv(
+        "MOVIE_AD_GATES_FILE",
+        str(
+            Path("/tmp/movie_ad_gates.json")
+            if os.getenv("RENDER")
+            else Path(__file__).with_name("movie_ad_gates.json")
+        ),
+    )
+)
+_AD_GATE_LEARNED: set[str] = set()
+_ad_gate_lock = threading.Lock()
+
+
+def _is_final_host_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(kw in host for kw in _FINAL_HOST_KEYWORDS)
+
+
+def _looks_like_ad_gate_id(gid: str) -> bool:
+    return bool(gid and _AD_GATE_ID_RE.match(gid.strip()))
+
+
+def _ad_gate_known_hosts() -> set[str]:
+    with _ad_gate_lock:
+        return set(_AD_GATE_SEED) | set(_AD_GATE_LEARNED)
+
+
+def _is_gw_ad_url(url: str) -> bool:
+    """True for ad-gate / shortener URLs that need o= decode (or learned hosts)."""
+    if not (url or "").startswith("http"):
+        return False
+    if _is_final_host_url(url):
+        return False
+    host = urlparse(url).netloc.lower()
+    if any(p in host for p in _AD_GATE_SKIP_HOST_PARTS):
+        return False
+    if host in _ad_gate_known_hosts():
+        return True
+    # Name heuristics for common rename patterns
+    if any(x in host for x in ("greenmotor", "gadgetsweb", "cryptoinsight", "howblog")):
+        return True
+    # Dynamic: long base64-ish ?id= on an unknown host (greenmotors family encode)
+    qs = urllib.parse.parse_qs(urlparse(url).query)
+    gid = (qs.get("id") or [""])[0]
+    return _looks_like_ad_gate_id(gid)
+
+
+def _persist_ad_gate_hosts() -> None:
+    with _ad_gate_lock:
+        hosts = sorted(_AD_GATE_LEARNED)
+    payload = {"hosts": hosts, "updated_at": int(time.time())}
+    try:
+        _AD_GATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _AD_GATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log.debug("ad-gate persist file failed: %s", exc)
+    try:
+        from fno_storage import use_mongodb, _get_mongo_db
+        if use_mongodb():
+            _get_mongo_db().movie_ad_gates.update_one(
+                {"_id": "hosts"},
+                {"$set": payload},
+                upsert=True,
+            )
+    except Exception as exc:
+        log.debug("ad-gate persist mongo failed: %s", exc)
+
+
+def _learn_ad_gate_host(host: str) -> None:
+    """Remember a working ad-gate domain so the next rename is already known."""
+    host = (host or "").lower().strip().split(":")[0]
+    if not host or host in _AD_GATE_SEED:
+        return
+    if any(p in host for p in _AD_GATE_SKIP_HOST_PARTS):
+        return
+    if _is_final_host_url(f"https://{host}/"):
+        return
+    with _ad_gate_lock:
+        if host in _AD_GATE_LEARNED:
+            return
+        _AD_GATE_LEARNED.add(host)
+    log.info("ad-gate: learned host %s", host)
+    _persist_ad_gate_hosts()
+
+
+def init_ad_gate_hosts() -> None:
+    """Load previously learned ad-gate hosts (file + Mongo). Call at bot startup."""
+    hosts: set[str] = set()
+    try:
+        from fno_storage import use_mongodb, _get_mongo_db
+        if use_mongodb():
+            doc = _get_mongo_db().movie_ad_gates.find_one({"_id": "hosts"})
+            if doc and isinstance(doc.get("hosts"), list):
+                hosts.update(str(h).lower() for h in doc["hosts"] if h)
+    except Exception as exc:
+        log.debug("ad-gate mongo load skipped: %s", exc)
+    try:
+        if _AD_GATE_FILE.exists():
+            data = json.loads(_AD_GATE_FILE.read_text(encoding="utf-8"))
+            raw = data.get("hosts", []) if isinstance(data, dict) else []
+            if isinstance(raw, list):
+                hosts.update(str(h).lower() for h in raw if h)
+    except Exception as exc:
+        log.warning("ad-gate file load failed: %s", exc)
+    with _ad_gate_lock:
+        _AD_GATE_LEARNED.update(h for h in hosts if h not in _AD_GATE_SEED)
+    if hosts:
+        log.info("ad-gate: loaded %d learned host(s)", len(_AD_GATE_LEARNED))
+
+
+def _ad_gate_selfcheck() -> None:
+    """ponytail: smallest check that fails if dynamic detect regresses."""
+    assert _looks_like_ad_gate_id("Q1dxTzFnbjhrQm5kMG5lL01tQzcvdEhwZ0JtZVdjNUEvbXdPRHc9PQ==")
+    assert _is_gw_ad_url(
+        "https://totally-new-gate.example/?id=Q1dxTzFnbjhrQm5kMG5lL01tQzcvdEhwZ0JtZVdjNUEvbXdPRHc9PQ=="
+    )
+    assert not _is_gw_ad_url("https://hubcloud.ist/drive/abc")
+    assert not _is_gw_ad_url("https://4khdhub.one/some-movie/")
+    assert _is_gw_ad_url("https://greenmotors.club/?id=" + ("A" * 50))
 
 
 _MEDIATOR_BTN_SELECTORS = [
@@ -2121,6 +2263,8 @@ def _resolve_gadgetsweb_playwright(gw_url: str) -> list[dict]:
             if not final_url:
                 return []
 
+            _learn_ad_gate_host(urlparse(gw_url).netloc)
+
             # If it's an hblinks page, fetch and scrape it via HTTP
             if "hblinks" in urlparse(final_url).netloc.lower():
                 try:
@@ -2216,15 +2360,28 @@ def _decode_gw_o(o_val: str) -> str | None:
 
 def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
     """
-    Resolve a gadgetsweb.xyz / greenmountmotors.com ad-gate URL to final links.
-    Returns a list of {"label": str, "url": str} dicts.  On failure returns [].
-
-    Strategy:
-    1. Fast path: fetch greenmountmotors.com/?id= which embeds the 'o' value
-       in its HTML (no JS execution needed). Decode it to get the hblinks URL.
-    2. Fallback: Playwright navigates the full redirect chain like a real browser
+    Resolve an ad-gate URL (?id=…) to final hubcloud/hubdrive/… links.
+    Learns working hosts so the next domain rename is automatic.
     """
-    # ── Fast path: HTTP decode via greenmountmotors ───────────────────────────
+    def _links_from_o_html(html: str) -> list[dict]:
+        m = re.search(r"s\('o','([^']+)'", html or "")
+        if not m:
+            return []
+        final_url = _decode_gw_o(m.group(1))
+        if not final_url:
+            return []
+        if "hblinks.org" in final_url or "hblinks." in final_url:
+            try:
+                r3 = _get(final_url, timeout=20)
+                links = _scrape_hblinks_page(r3.text)
+                if links:
+                    return links
+            except Exception:
+                pass
+            return [{"label": "HBLinks Page", "url": final_url}]
+        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
+        return [{"label": f"{domain_hint} Download", "url": final_url}]
+
     try:
         parsed = urlparse(gw_url)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -2232,66 +2389,48 @@ def _resolve_gadgetsweb(gw_url: str) -> list[dict]:
         if not gw_id:
             return _resolve_gadgetsweb_playwright(gw_url)
 
-        # greenmountmotors.com embeds the 'o' value directly in its response HTML
-        gm_url = f"https://greenmountmotors.com/?id={gw_id}"
-        gm_text = None
-        try:
-            r2 = _get(gm_url, timeout=20)
-            gm_text = r2.text
-        except Exception:
-            pass
+        # Own host first, then learned, then seed — covers silent renames.
+        hosts: list[str] = []
+        if parsed.netloc:
+            hosts.append(parsed.netloc.lower())
+        with _ad_gate_lock:
+            learned = sorted(_AD_GATE_LEARNED)
+        for h in learned + list(_AD_GATE_TRY_ORDER):
+            if h not in hosts:
+                hosts.append(h)
 
-        if gm_text:
-            m = re.search(r"s\('o','([^']+)'", gm_text)
-            if m:
-                final_url = _decode_gw_o(m.group(1))
-                if final_url:
-                    if "hblinks.org" in final_url:
-                        try:
-                            r3 = _get(final_url, timeout=20)
-                            links = _scrape_hblinks_page(r3.text)
-                            if links:
-                                return links
-                        except Exception:
-                            pass
-                    else:
-                        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
-                        return [{"label": f"{domain_hint} Download", "url": final_url}]
-
-        # Legacy fallback: try cryptoinsights directly (may be down)
-        crypto_url = f"https://cryptoinsights.site/?id={gw_id}"
-        try:
-            r2 = _get(crypto_url, timeout=15)
-            m = re.search(r"s\('o','([^']+)'", r2.text)
-            if m:
-                final_url = _decode_gw_o(m.group(1))
-                if final_url:
-                    if "hblinks.org" in final_url:
-                        r3 = _get(final_url, timeout=20)
-                        links = _scrape_hblinks_page(r3.text)
-                        if links:
-                            return links
-                    else:
-                        domain_hint = urlparse(final_url).netloc.split(".")[0].capitalize()
-                        return [{"label": f"{domain_hint} Download", "url": final_url}]
-        except Exception:
-            pass
+        for host in hosts:
+            try:
+                # Direct GET — no ScraperAPI retries on dead rename hosts (DNS miss = skip).
+                r2 = requests.get(
+                    f"https://{host}/?id={gw_id}",
+                    headers=HEADERS,
+                    timeout=12,
+                    verify=False,
+                )
+                links = _links_from_o_html(r2.text)
+                if links:
+                    _learn_ad_gate_host(parsed.netloc)
+                    _learn_ad_gate_host(host)
+                    return links
+            except Exception:
+                continue
 
     except Exception as exc:
         log.debug("_resolve_gadgetsweb HTTP path %s failed: %s", gw_url, exc)
 
-    # ── Fallback: Playwright full redirect chain ──────────────────────────────
     return _resolve_gadgetsweb_playwright(gw_url)
 
 
 def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
     """
-    For a list of links, replace any gadgetsweb URLs with their resolved direct links.
-    Non-gadgetsweb links are passed through unchanged.
-    Runs multiple gadgetsweb resolves in parallel (up to 4 threads).
+    For a list of links, replace any gadgetsweb/greenmotors URLs with resolved
+    direct links. Non-ad-gate links pass through unchanged.
     """
-    gw_indices = [i for i, lk in enumerate(raw_links)
-                  if urlparse(lk["url"]).netloc in _GW_AD_DOMAINS]
+    gw_indices = [
+        i for i, lk in enumerate(raw_links)
+        if _is_gw_ad_url(lk.get("url") or "")
+    ]
 
     if not gw_indices:
         return raw_links
@@ -2316,7 +2455,7 @@ def _expand_gw_links(raw_links: list[dict], orig_label: str = "") -> list[dict]:
             else:
                 # Keep original if resolve failed, update label
                 result.append({
-                    "label": lk["label"] or orig_label,
+                    "label": lk.get("label") or lk.get("name") or orig_label,
                     "url":   lk["url"],
                 })
         else:
@@ -2388,9 +2527,17 @@ def _title_matches_query(title: str, query: str) -> bool:
 
 
 def _hdhub_page_url(permalink: str) -> str:
+    """Build a movie page URL on the configured HDHUB_BASE (Typesense mirrors die often)."""
+    base = HDHUB_BASE.rstrip("/")
+    if not permalink:
+        return base + "/"
     if permalink.startswith("http"):
+        p = urlparse(permalink)
+        # Keep path/query; force host to the live base so dead mirrors don't 404 the scrape.
+        if p.path and "hdhub4u" in (p.netloc or "").lower():
+            return base + p.path + (("?" + p.query) if p.query else "")
         return permalink
-    return HDHUB_BASE.rstrip("/") + "/" + permalink.lstrip("/")
+    return base + "/" + permalink.lstrip("/")
 
 
 def _hdhub_search_alert_chat_id() -> int | None:
@@ -2741,7 +2888,7 @@ def hdhub_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
     _EP_PAT = re.compile(r"EP(?:i?SODE)?\s*\d+", re.I)
 
     def _is_ad_url(href: str) -> bool:
-        return urlparse(href).netloc in _GW_AD_DOMAINS
+        return _is_gw_ad_url(href)
 
     # ── Flat pack/quality links (between DL and Single Episode markers) ────────
     end_pack = ep_sec if ep_sec > 0 else len(all_h)
@@ -2834,15 +2981,19 @@ def hdhub_movie_links(movie_url: str, *, fast: bool = False) -> dict[str, Any]:
             if current_ep and current_ep["qualities"]:
                 episodes.append(current_ep)
 
-    # ── Resolve gadgetsweb ad-gate links to real HubCloud/HubDrive/GoFile URLs ─
-    # For flat-episode series, expand gadgetsweb 📥 Download links per episode
+    # ── Resolve gadgetsweb/greenmotors ad-gate links to real HubCloud/HubDrive ─
     if flat_has_episodes and episodes:
         for ep_entry in episodes:
             for quality, ql in ep_entry["qualities"].items():
-                ep_entry["qualities"][quality] = _expand_gw_links(ql, ep_entry["ep"])
+                expanded = _expand_gw_links(ql, ep_entry["ep"])
+                ep_entry["qualities"][quality] = [
+                    lk for lk in expanded if not _is_gw_ad_url(lk.get("url") or "")
+                ]
     elif links:
-        # For movies / Lukkhe-style packs: expand any gadgetsweb pack links
-        links = _expand_gw_links(links)
+        links = [
+            lk for lk in _expand_gw_links(links)
+            if not _is_gw_ad_url(lk.get("url") or "")
+        ]
 
     return {
         "poster":    poster,
@@ -3573,670 +3724,6 @@ def format_atoz_message(movie_title: str, data: dict, footer: bool = True) -> st
     return "\n".join(lines)
 
 
-# ─── MkV Base (https://mkvbase.site/) ─────────────────────────────────────────
-# Next.js link vault behind Cloudflare Turnstile. A real (headful) Chrome driven
-# by nodriver clears Turnstile once; its cf_clearance + UA are cached and reused
-# by curl_cffi. Search is the site's signed /api/links call (XOR + PoW + HMAC).
-# Render: Dockerfile runs Xvfb + Google Chrome (see DISPLAY / CHROME_BIN).
-
-MKVBASE_BASE = os.getenv("MKVBASE_BASE_URL", "https://mkvbase.site").rstrip("/")
-
-
-def _mkvbase_cf_cache_path() -> Path:
-    # Render sets RENDER=true; prefer /tmp (writable). Override with MKVBASE_CF_CACHE.
-    default = (
-        Path("/tmp/mkvbase_cf.json")
-        if os.getenv("RENDER") or os.name == "posix"
-        else Path(__file__).with_name(".mkvbase_cf.json")
-    )
-    return Path(os.getenv("MKVBASE_CF_CACHE") or default)
-
-
-_MKVBASE_CF_FILE = _mkvbase_cf_cache_path()
-_mkvbase_lock = threading.Lock()
-_mkvbase_session: Any = None
-_mkvbase_solve_failed_at = 0.0  # skip Chrome briefly after a failed solve
-
-
-def _mkvbase_chrome_bin() -> str | None:
-    env = (os.getenv("CHROME_BIN") or "").strip().strip('"')
-    if env and Path(env).is_file():
-        return env
-    for name in (
-        "google-chrome-stable",
-        "google-chrome",
-        "chromium",
-        "chromium-browser",
-        "chrome",
-    ):
-        found = shutil.which(name)
-        if found:
-            return found
-    if os.name == "nt":
-        for base in (
-            os.environ.get("PROGRAMFILES"),
-            os.environ.get("PROGRAMFILES(X86)"),
-            os.environ.get("LOCALAPPDATA"),
-        ):
-            if not base:
-                continue
-            cand = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
-            if cand.is_file():
-                return str(cand)
-    return None
-
-
-def mkvbase_warm_cf() -> bool:
-    """Prime mkvbase: open session and seed /api/links cookies (skips cold first search)."""
-    try:
-        s = _mkvbase_http()
-        if s is None:
-            return False
-        # Provider path needs a real GET so mkv_* + cf_clearance land before user traffic.
-        if isinstance(s, _MkvProviderSession):
-            if s.cookies.get("mkv_client_key") and s.cookies.get("mkv_challenge"):
-                return True
-            r = s.get(f"{MKVBASE_BASE}/api/links", timeout=90)
-            _mkvbase_persist_provider(s)
-            ok = r is not None and getattr(r, "ok", False)
-            log.info("mkvbase warm seed HTTP %s", getattr(r, "status_code", None))
-            return bool(ok)
-        return True
-    except Exception as exc:
-        log.warning("mkvbase_warm_cf failed: %s", exc)
-        return False
-
-
-def _mkvbase_byparr_endpoint() -> str:
-    if not BYPARR_URL:
-        return ""
-    u = BYPARR_URL
-    if u.endswith("/v1"):
-        return u
-    return u + ("/v1" if u.endswith("/") else "/v1")
-
-
-def _mkvbase_solve_cf_byparr() -> dict[str, str] | None:
-    """FlareSolverr-compatible Byparr: returns {cf_clearance, ua} without local Chrome."""
-    endpoint = _mkvbase_byparr_endpoint()
-    if not endpoint:
-        return None
-    try:
-        r = requests.post(
-            endpoint,
-            json={"cmd": "request.get", "url": f"{MKVBASE_BASE}/", "maxTimeout": 60000},
-            timeout=75,
-        )
-        data = r.json() if r.content else {}
-    except Exception as exc:
-        log.warning("mkvbase Byparr solve failed: %s", exc)
-        return None
-    sol = data.get("solution") or {}
-    if data.get("status") not in ("ok", "OK", None) and not sol:
-        log.warning("mkvbase Byparr status=%s msg=%s", data.get("status"), data.get("message"))
-        return None
-    clearance = ""
-    for c in sol.get("cookies") or []:
-        if (c.get("name") or "") == "cf_clearance" and c.get("value"):
-            clearance = c["value"]
-            break
-    ua = (sol.get("userAgent") or "").strip()
-    if not clearance:
-        log.warning("mkvbase Byparr: no cf_clearance (status=%s)", data.get("status"))
-        return None
-    if not ua:
-        ua = HEADERS["User-Agent"]
-    log.info("mkvbase: Cloudflare cleared via Byparr")
-    return {"cf_clearance": clearance, "ua": ua}
-
-
-def _mkvbase_solve_cf_chrome() -> dict[str, str] | None:
-    """Open Chrome on DISPLAY, wait for Turnstile, return {cf_clearance, ua}."""
-    try:
-        import nodriver as uc
-    except ImportError:
-        log.warning("mkvbase: nodriver not installed — cannot clear Cloudflare")
-        return None
-
-    if not os.getenv("DISPLAY") and os.name == "posix":
-        log.warning("mkvbase: DISPLAY unset — Chrome cannot clear Turnstile (use Xvfb)")
-        return None
-
-    chrome = _mkvbase_chrome_bin()
-    if not chrome:
-        log.warning("mkvbase: Chrome/Chromium binary not found")
-        return None
-
-    async def run() -> dict[str, str] | None:
-        args = [
-            "--disable-dev-shm-usage",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--window-size=1280,900",
-            "--disable-gpu",
-        ]
-        extra = (os.getenv("CHROME_ARGS") or "").strip()
-        if extra:
-            args.extend(a for a in extra.split() if a)
-        browser = await uc.start(
-            headless=False,
-            sandbox=False,
-            browser_executable_path=chrome,
-            browser_args=args,
-        )
-        try:
-            tab = await browser.get(f"{MKVBASE_BASE}/")
-            title = ""
-            clearance = ""
-            for _ in range(50):
-                await asyncio.sleep(1.5)
-                try:
-                    title = await tab.evaluate("document.title") or ""
-                except Exception:
-                    title = ""
-                for c in await browser.cookies.get_all():
-                    if getattr(c, "name", None) == "cf_clearance" and getattr(c, "value", None):
-                        clearance = c.value
-                        break
-                if clearance and title and "moment" not in title.lower():
-                    break
-            if not clearance:
-                log.warning("mkvbase: Turnstile did not clear (title=%r)", title)
-                return None
-            try:
-                ua = await tab.evaluate("navigator.userAgent") or ""
-            except Exception:
-                ua = ""
-            if not ua:
-                ua = (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
-            return {"cf_clearance": clearance, "ua": ua}
-        finally:
-            try:
-                browser.stop()
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-
-    try:
-        return asyncio.run(run())
-    except Exception as exc:
-        log.warning("mkvbase: Chrome Cloudflare solve failed: %s", exc)
-        return None
-
-
-def _mkvbase_solve_cf_provider() -> dict[str, str] | None:
-    """Use ZenRows/ScrapingBee/ScraperAPI once to obtain cf_clearance, then curl_cffi."""
-    provider = _mkvbase_provider_name()
-    if not provider:
-        return None
-    try:
-        r = _mkvbase_provider_get(provider, f"{MKVBASE_BASE}/api/links", timeout=120)
-    except Exception as exc:
-        log.warning("mkvbase %s CF solve failed: %s", provider, exc)
-        return None
-    if r is None or getattr(r, "status_code", 0) != 200:
-        log.warning(
-            "mkvbase %s CF HTTP %s: %s",
-            provider,
-            getattr(r, "status_code", None),
-            ((r.text or "")[:160] if r is not None else ""),
-        )
-        return None
-    jar = _MkvCookieJar()
-    jar.update_from_response(r)
-    clearance = jar.get("cf_clearance")
-    if not clearance:
-        log.warning("mkvbase %s: no cf_clearance in Zr-Cookies", provider)
-        return None
-    log.info("mkvbase: Cloudflare cleared via %s", provider)
-    return {"cf_clearance": clearance, "ua": HEADERS["User-Agent"]}
-
-
-def _mkvbase_solve_cf() -> dict[str, str] | None:
-    """Clear Cloudflare: Byparr → scrape provider (ZenRows) → local Chrome."""
-    return (
-        _mkvbase_solve_cf_byparr()
-        or _mkvbase_solve_cf_provider()
-        or _mkvbase_solve_cf_chrome()
-    )
-
-
-class _MkvCookieJar:
-    """Minimal cookie jar so PoW can read mkv_* the same way as curl_cffi."""
-
-    def __init__(self) -> None:
-        self._d: dict[str, str] = {}
-
-    def get(self, name: str, default: str = "") -> str:
-        return self._d.get(name, default)
-
-    def set(self, name: str, value: str, **_kw: Any) -> None:
-        self._d[name] = value
-
-    def update_from_response(self, resp: Any) -> None:
-        try:
-            for c in resp.cookies:
-                n = getattr(c, "name", None) or (c[0] if isinstance(c, tuple) else None)
-                v = getattr(c, "value", None) or (c[1] if isinstance(c, tuple) else None)
-                if n and v:
-                    self._d[str(n)] = str(v)
-        except Exception:
-            pass
-        # ZenRows: Zr-Cookies is "a=b; c=d". Zr-Set-Cookie may list several Set-Cookie
-        # values joined with commas (Expires dates also contain commas).
-        for key in ("Zr-Cookies", "zr-cookies"):
-            raw = resp.headers.get(key) or ""
-            for part in raw.split(";"):
-                nv = part.strip()
-                if "=" not in nv:
-                    continue
-                n, v = nv.split("=", 1)
-                n, v = n.strip(), v.strip()
-                if n.startswith("mkv_") or n == "cf_clearance":
-                    self._d[n] = urllib.parse.unquote(v)
-        for key in ("Zr-Set-Cookie", "zr-set-cookie", "Set-Cookie", "set-cookie"):
-            raw = resp.headers.get(key)
-            if not raw:
-                continue
-            chunks = raw if isinstance(raw, (list, tuple)) else re.split(
-                r",(?=\s*(?:mkv_|cf_clearance)[^=]*=)", str(raw)
-            )
-            for chunk in chunks:
-                nv = str(chunk).split(";", 1)[0].strip()
-                if "=" not in nv:
-                    continue
-                n, v = nv.split("=", 1)
-                n, v = n.strip(), v.strip()
-                if n.startswith("mkv_") or n == "cf_clearance":
-                    self._d[n] = urllib.parse.unquote(v)
-
-
-# Sticky ZenRows/ScrapingBee IP across restarts (cf_clearance is IP-bound).
-_MKVBASE_SA_SESSION = max(
-    1,
-    int(
-        os.getenv("MKVBASE_SA_SESSION", "0")
-        or (42427 if os.getenv("RENDER") else (os.getpid() % 90_000 + 1))
-    ),
-)
-_MKVBASE_PROVIDER_TIMEOUT = max(30, int(os.getenv("MKVBASE_PROVIDER_TIMEOUT", "90") or 90))
-
-
-def _mkvbase_provider_name() -> str | None:
-    """ScraperAPI alternatives for free hosts (no Chrome). Prefer ZenRows → ScrapingBee → ScraperAPI."""
-    if ZENROWS_API_KEY:
-        return "zenrows"
-    if SCRAPINGBEE_API_KEY:
-        return "scrapingbee"
-    if SCRAPER_API_KEY:
-        return "scraperapi"
-    return None
-
-
-def _mkvbase_persist_provider(session: "_MkvProviderSession") -> None:
-    """Cache provider cookies so warm/restart can skip a seed GET."""
-    if not session.cookies._d:
-        return
-    try:
-        _MKVBASE_CF_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _MKVBASE_CF_FILE.write_text(
-            json.dumps(
-                {
-                    "provider": session.provider,
-                    "session_id": _MKVBASE_SA_SESSION,
-                    "cookies": session.cookies._d,
-                }
-            ),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        log.debug("mkvbase: cannot cache provider cookies: %s", exc)
-
-
-def _mkvbase_load_provider(session: "_MkvProviderSession") -> None:
-    try:
-        data = json.loads(_MKVBASE_CF_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return
-    if data.get("provider") != session.provider:
-        return
-    if int(data.get("session_id") or 0) != _MKVBASE_SA_SESSION:
-        return
-    cookies = data.get("cookies") or {}
-    if isinstance(cookies, dict):
-        session.cookies._d.update({str(k): str(v) for k, v in cookies.items() if v})
-
-
-def _mkvbase_provider_get(
-    provider: str,
-    url: str,
-    *,
-    timeout: int = 90,
-    headers: dict | None = None,
-) -> Any:
-    """GET url through a scrape provider that handles Cloudflare."""
-    fwd = {k: v for k, v in (headers or {}).items() if k.lower() != "referer"}
-    if provider == "zenrows":
-        params = {
-            "apikey": ZENROWS_API_KEY,
-            "url": url,
-            "js_render": "true",
-            "premium_proxy": "true",
-            "session_id": str(_MKVBASE_SA_SESSION),
-            # Skip heavy assets — cuts ZenRows time ~3–5× on mkvbase JSON.
-            "block_resources": "image,media,font,stylesheet",
-        }
-        # Forward Cookie / X-Requested-With so PoW search sees mkv_* cookies.
-        if fwd:
-            params["custom_headers"] = "true"
-        return requests.get(
-            "https://api.zenrows.com/v1/",
-            params=params,
-            timeout=timeout,
-            headers=fwd or None,
-        )
-    if provider == "scrapingbee":
-        params = {
-            "api_key": SCRAPINGBEE_API_KEY,
-            "url": url,
-            "render_js": "true",
-            "premium_proxy": "true",
-            "session_id": str(_MKVBASE_SA_SESSION),
-            "block_resources": "true",
-        }
-        return requests.get(
-            "https://app.scrapingbee.com/api/v1/",
-            params=params,
-            timeout=timeout,
-            headers=fwd or None,
-        )
-    if provider == "scraperapi":
-        params = {
-            "api_key": SCRAPER_API_KEY,
-            "url": url,
-            "render": "true",
-            "session_number": str(_MKVBASE_SA_SESSION),
-            "keep_headers": "true",
-        }
-        return requests.get(SCRAPER_API_URL, params=params, timeout=timeout, headers=fwd or None)
-    raise ValueError(f"unknown mkvbase provider {provider}")
-
-
-class _MkvProviderSession:
-    """Sticky scrape-provider session; cookies accumulate for PoW."""
-
-    def __init__(self, provider: str) -> None:
-        self.provider = provider
-        self.cookies = _MkvCookieJar()
-        self.headers: dict[str, str] = {"Referer": f"{MKVBASE_BASE}/"}
-        _mkvbase_load_provider(self)
-
-    def get(self, url: str, timeout: int | None = None, headers: dict | None = None, **_kw: Any) -> Any:
-        merged = dict(self.headers)
-        if headers:
-            merged.update(headers)
-        cookie_hdr = "; ".join(
-            f"{k}={v}" for k, v in self.cookies._d.items()
-            if k.startswith("mkv_") or k == "cf_clearance"
-        )
-        if cookie_hdr:
-            merged["Cookie"] = cookie_hdr
-        if "X-Requested-With" not in merged and "q=" in url:
-            merged["X-Requested-With"] = "XMLHttpRequest"
-        to = timeout if timeout is not None else _MKVBASE_PROVIDER_TIMEOUT
-        last_exc: Exception | None = None
-        # One retry only — double ZenRows burns 20–60s on free Render.
-        for attempt in range(2):
-            try:
-                r = _mkvbase_provider_get(self.provider, url, timeout=to, headers=merged)
-                self.cookies.update_from_response(r)
-                if self.cookies.get("mkv_client_key"):
-                    _mkvbase_persist_provider(self)
-                return r
-            except Exception as exc:
-                last_exc = exc
-                log.warning(
-                    "mkvbase %s GET attempt %d failed: %s",
-                    self.provider, attempt + 1, exc,
-                )
-                if attempt == 0:
-                    time.sleep(1)
-        raise last_exc  # type: ignore[misc]
-
-
-def _mkvbase_http(*, fresh: bool = False) -> Any:
-    """Session for mkvbase: ZenRows (Render free) or curl_cffi+cf_clearance."""
-    global _mkvbase_session, _mkvbase_solve_failed_at
-    with _mkvbase_lock:
-        if _mkvbase_session is not None and not fresh:
-            return _mkvbase_session
-
-        provider = _mkvbase_provider_name()
-        # ZenRows clearance is IP-bound — keep the whole session on the provider.
-        prefer_provider = bool(provider) and (
-            os.getenv("RENDER")
-            or os.getenv("MKVBASE_PREFER_PROVIDER", "").lower() in ("1", "true", "yes")
-            or not _mkvbase_chrome_bin()
-        )
-        if prefer_provider and provider:
-            log.info("mkvbase: using scrape provider %s", provider)
-            _mkvbase_session = _MkvProviderSession(provider)
-            _mkvbase_solve_failed_at = 0.0
-            return _mkvbase_session
-
-        if not _CFFI_AVAILABLE:
-            if provider:
-                log.info("mkvbase: using scrape provider %s", provider)
-                _mkvbase_session = _MkvProviderSession(provider)
-                _mkvbase_solve_failed_at = 0.0
-                return _mkvbase_session
-            log.warning("mkvbase: curl_cffi required")
-            return None
-
-        cf = None
-        if not fresh:
-            try:
-                cf = json.loads(_MKVBASE_CF_FILE.read_text(encoding="utf-8"))
-                if not cf.get("cf_clearance") or not cf.get("ua"):
-                    cf = None
-            except (OSError, ValueError, TypeError):
-                cf = None
-        if not cf:
-            if time.time() - _mkvbase_solve_failed_at < 120:
-                return None
-            cf = _mkvbase_solve_cf()
-            if not cf:
-                _mkvbase_solve_failed_at = time.time()
-                if provider:
-                    log.info("mkvbase: CF solve failed — falling back to %s", provider)
-                    _mkvbase_session = _MkvProviderSession(provider)
-                    _mkvbase_solve_failed_at = 0.0
-                    return _mkvbase_session
-                return None
-            try:
-                _MKVBASE_CF_FILE.parent.mkdir(parents=True, exist_ok=True)
-                _MKVBASE_CF_FILE.write_text(json.dumps(cf), encoding="utf-8")
-            except OSError as exc:
-                log.warning("mkvbase: cannot cache cf_clearance: %s", exc)
-        host = urlparse(MKVBASE_BASE).hostname or "mkvbase.site"
-        s = cffi_requests.Session(impersonate="chrome")
-        s.headers.update({"User-Agent": cf["ua"], "Referer": f"{MKVBASE_BASE}/"})
-        s.cookies.set("cf_clearance", cf["cf_clearance"], domain="." + host)
-        _mkvbase_session = s
-        _mkvbase_solve_failed_at = 0.0
-        return s
-
-
-def _mkvbase_get(path: str, **kwargs) -> Any:
-    """GET on mkvbase; re-solve once if Cloudflare challenge HTML comes back."""
-    global _mkvbase_session
-    for fresh in (False, True):
-        s = _mkvbase_http(fresh=fresh)
-        if s is None:
-            return None
-        try:
-            r = s.get(
-                MKVBASE_BASE + path,
-                timeout=kwargs.pop("timeout", _MKVBASE_PROVIDER_TIMEOUT),
-                **kwargs,
-            )
-        except Exception as exc:
-            log.warning("mkvbase GET %s failed: %s", path, exc)
-            return None
-        if "Just a moment" not in (r.text or "")[:500]:
-            return r
-        log.info("mkvbase: Cloudflare challenge — refreshing session")
-        _mkvbase_session = None
-        try:
-            _MKVBASE_CF_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return None
-
-
-def _mkvbase_links(query: str) -> list[dict[str, str]]:
-    """Raw /api/links rows (max 50). Empty query = most recent uploads."""
-    q = " ".join(re.sub(r"[^\w\s]", " ", query or "").split())  # site matches literally: "Title: X" → 0 rows
-    if not q:
-        r = _mkvbase_get("/api/links")
-        return (r.json().get("results") or []) if r is not None and r.ok else []
-    for attempt in range(2):
-        s = _mkvbase_http()
-        if s is None:
-            return []
-        ck = lambda n: urllib.parse.unquote(s.cookies.get(n) or "")
-        if attempt or not ck("mkv_client_key") or not ck("mkv_challenge"):
-            _mkvbase_get("/api/links")  # issues fresh mkv_* cookies, as the site's JS does
-            s = _mkvbase_http()
-        key, seq = ck("mkv_client_key"), ck("mkv_seq") or "1"
-        parts = ck("mkv_challenge").split(":")  # "<challenge>:<difficulty>:<expiry>:<mac>"
-        challenge = parts[0]
-        if not key or not challenge:
-            return []
-        zeros = "0" * (int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 2)
-        t_ms = int(time.time() * 1000)
-        q_hex = "".join(f"{b ^ (t_ms % 256):02x}" for b in q.encode())
-        nonce = 0
-        while nonce <= 500_000:
-            inner = hashlib.sha256(f"{challenge}:{nonce}".encode()).hexdigest()
-            if hashlib.sha256(f"{inner}:{q_hex}".encode()).hexdigest().startswith(zeros):
-                break
-            nonce += 1
-        # ponytail: `ent` is the site's mouse-movement score (10..50000); a plausible
-        # random value passes today. If they start scoring it, emulate real movement.
-        ent = random.randint(800, 4000)
-        sig = hmac.new(key.encode(), f"{q_hex}:{t_ms}:{seq}:{nonce}:{ent}".encode(), hashlib.sha256).hexdigest()
-        r = _mkvbase_get(
-            f"/api/links?q={q_hex}&t={t_ms}&seq={seq}&pow={nonce}&ent={ent}&sig={sig}",
-            headers={"X-Requested-With": "XMLHttpRequest"},
-        )
-        if r is None:
-            return []
-        try:
-            data = r.json()
-        except ValueError:
-            data = {}
-        if r.ok and not data.get("error"):
-            return data.get("results") or []
-        log.warning("mkvbase search HTTP %s: %s", r.status_code, data.get("error"))
-    return []
-
-
-def _mkvbase_rows(rows: list[dict]) -> list[dict]:
-    return [
-        {"title": str(r.get("title") or "").strip()[:140], "url": r["url"], "poster": "", "source": "mkvbase"}
-        for r in rows
-        if str(r.get("url") or "").startswith("http") and r.get("title")
-    ]
-
-
-def mkvbase_search(query: str, limit: int = 10) -> list[dict]:
-    """Search MkV Base vault; each hit is already a hoster (gdflix/hubcloud/…) URL."""
-    q = (query or "").strip()
-    if not q:
-        return []
-    try:
-        rows = _mkvbase_rows(_mkvbase_links(q))
-    except Exception as exc:
-        log.error("mkvbase_search '%s' failed: %s", q, exc)
-        return []
-    tokens = re.findall(r"[a-z0-9]+", q.lower())
-    need = max(1, (len(tokens) + 1) // 2)
-    return [m for m in rows if sum(1 for t in tokens if t in m["title"].lower()) >= need][:limit]
-
-
-def mkvbase_latest_movies(page: int = 1, limit: int = 10) -> list[dict]:
-    """Most recent vault uploads; the API returns 50, so paginate locally."""
-    try:
-        rows = _mkvbase_rows(_mkvbase_links(""))
-    except Exception as exc:
-        log.error("mkvbase_latest_movies failed: %s", exc)
-        return []
-    start = (max(page, 1) - 1) * limit
-    return rows[start:start + limit]
-
-
-_MKVBASE_HOSTER_SIZE_RE = re.compile(
-    r"(?:File\s*)?Size\s*:?\s*(\d+(?:\.\d+)?\s*(?:GB|MB))",
-    re.I,
-)
-
-
-def _mkvbase_hoster_size(url: str) -> str:
-    """File size from the gdflix/hubcloud/… page (mkvbase API has no size field)."""
-    try:
-        resp = _get(url, timeout=12, retries=0)
-        text = BeautifulSoup(resp.text, "html.parser").get_text(" ", strip=True)
-    except Exception as exc:
-        log.debug("mkvbase hoster size %s: %s", url, exc)
-        return ""
-    m = _MKVBASE_HOSTER_SIZE_RE.search(text or "")
-    if not m:
-        return ""
-    return f"{m.group(1).upper().replace(' ', '')}"
-
-
-def mkvbase_movie_links(page_url: str, title: str = "") -> dict[str, Any]:
-    """MkV Base rows are already hoster URLs — wrap + scrape size from the hoster."""
-    if not (page_url and page_url.startswith("http")):
-        return {"info": {}, "links": []}
-    title = (title or "").strip()
-    size = _mkvbase_hoster_size(page_url)
-    quality_m = re.search(r"(4K|2160p|1080p|720p|480p|360p)", title, re.I)
-    quality = quality_m.group(1).upper() if quality_m else ""
-    label = title[:100] if title else (page_url.rsplit("/", 1)[-1][:80] or "Download")
-    link: dict[str, str] = {"url": page_url, "label": label, "name": label}
-    if size:
-        link["size"] = size
-    if quality:
-        link["quality"] = quality
-    return {"info": {}, "links": [link]}
-
-
-def format_mkvbase_message(movie_title: str, data: dict, footer: bool = True) -> str:
-    links = data.get("links") or []
-    lines = [f"🎬 <b>{html.escape(movie_title)}</b>", "📦 <b>Source:</b> MkV Base", ""]
-    if not links:
-        lines.append("❌ No download links.")
-    else:
-        lines.append("📥 <b>Download Links</b>\n")
-        for lk in links[:20]:
-            label = html.escape(lk.get("label") or "Download")
-            url_ = lk.get("url") or ""
-            meta = " · ".join(
-                html.escape(x) for x in (lk.get("quality") or "", lk.get("size") or "") if x
-            )
-            suffix = f"  <i>({meta})</i>" if meta else ""
-            lines.append(f"🔗 <a href='{html.escape(url_)}'>{label}</a>{suffix}")
-    if footer:
-        lines.append("\n" + "━" * 32)
-        lines.append("⚡ <a href='https://t.me/CoursesDrivee'>Powered by @CoursesDrivee</a>")
-    return "\n".join(lines)
-
-
 # ─── ZeeFliz ─────────────────────────────────────────────────────────────────
 
 ZEEFLIZ_BASE = os.getenv("ZEEFLIZ_BASE_URL", "https://zeefliz.beer")
@@ -4616,8 +4103,6 @@ MOVIE_API_SOURCE_ALIASES: dict[str, str] = {
     "moviesmod": "moviesmod",
     "atoz": "atoz",
     "atozcinemas": "atoz",
-    "mkvbase": "mkvbase",
-    "mkv": "mkvbase",
 }
 
 MOVIE_API_SOURCE_LABELS: dict[str, str] = {
@@ -4630,7 +4115,6 @@ MOVIE_API_SOURCE_LABELS: dict[str, str] = {
     "bolly": "bollyflix",
     "moviesmod": "moviesmod",
     "atoz": "atoz",
-    "mkvbase": "mkvbase",
 }
 
 # Combined REST API sources (all movie sites except ZeeFliz)
@@ -4644,7 +4128,6 @@ MOVIE_API_SEARCH_SOURCES: tuple[tuple[str, Any, str], ...] = (
     ("bollyflix", bollyflix_search, "bolly"),
     ("moviesmod", moviesmod_search, "moviesmod"),
     ("atoz", atoz_search, "atoz"),
-    ("mkvbase", mkvbase_search, "mkvbase"),
 )
 
 MOVIE_API_LATEST_SOURCES: tuple[tuple[str, Any, str], ...] = (
@@ -4657,12 +4140,11 @@ MOVIE_API_LATEST_SOURCES: tuple[tuple[str, Any, str], ...] = (
     ("bollyflix", bollyflix_latest_movies, "bolly"),
     ("moviesmod", moviesmod_latest_movies, "moviesmod"),
     ("atoz", atoz_latest_movies, "atoz"),
-    ("mkvbase", mkvbase_latest_movies, "mkvbase"),
 )
 
 # Latest fetchers that accept (page, limit)
 _MOVIE_API_LATEST_WITH_LIMIT = frozenset({
-    "hdhub", "vega", "sdmp", "bolly", "moviesmod", "atoz", "mkvbase",
+    "hdhub", "vega", "sdmp", "bolly", "moviesmod", "atoz",
 })
 
 
@@ -4954,32 +4436,14 @@ def _flat_links_from_atoz(data: dict[str, Any]) -> list[dict[str, str]]:
     return _dedupe_api_links(out)
 
 
-def _flat_links_from_mkvbase(data: dict[str, Any]) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    for link in data.get("links", []):
-        href = link.get("url", "")
-        if not href.startswith("http"):
-            continue
-        label = _api_clean(link.get("label") or link.get("name") or "Download")
-        out.append(_api_link_entry(
-            href,
-            label=label,
-            quality=_api_clean(link.get("quality", "")) or _api_extract_quality(label),
-            size=_api_clean(link.get("size", "")) or _api_extract_size(label),
-            audio=_api_extract_audio(label),
-        ))
-    return _dedupe_api_links(out)
-
-
 def movie_page_download_links(
     source: str,
     page_url: str,
     *,
     fast: bool = True,
-    title: str = "",
 ) -> dict[str, Any]:
     """Scrape one movie page and return download links with size/audio metadata."""
-    cache_key = f"links:{source}:{page_url}:{'fast' if fast else 'full'}:{title[:40]}"
+    cache_key = f"links:{source}:{page_url}:{'fast' if fast else 'full'}"
     cached = _api_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -5012,9 +4476,6 @@ def movie_page_download_links(
     elif key == "atoz":
         data = atoz_movie_links(page_url, fast=fast)
         links = _flat_links_from_atoz(data)
-    elif key == "mkvbase":
-        data = mkvbase_movie_links(page_url, title=title)
-        links = _flat_links_from_mkvbase(data)
     else:
         raise ValueError(f"unsupported source '{source}'")
     result = {
@@ -5063,7 +4524,7 @@ def _movies_search_one_source(
             if not page_url:
                 continue
             title = movie.get("title", "Unknown")
-            if search_fn not in (hdhub_search, md_search, mkvbase_search) and not _title_matches_query(title, query):
+            if search_fn not in (hdhub_search, md_search) and not _title_matches_query(title, query):
                 continue
             rows.append({
                 "source": source_label,
@@ -5102,12 +4563,9 @@ def movies_search_combined(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for source_label, search_fn, source_key in sources:
             # MoviesDrive/4KHDHub need a bit more than the default fast budget.
-            # mkvbase may need a cold Cloudflare Turnstile solve (~60–90s) once.
             src_budget = per_src
             if fast and source_key in ("md", "hdh"):
                 src_budget = max(per_src, 14)
-            if source_key == "mkvbase":
-                src_budget = max(src_budget, 180)
             fut = pool.submit(
                 _call_timed,
                 src_budget,
@@ -5123,9 +4581,6 @@ def movies_search_combined(
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
         if fast:
             timeout = max(timeout, 14)
-        # ZenRows mkvbase: seed + PoW search can take ~3 minutes cold.
-        if any(k == "mkvbase" for _, _, k in sources):
-            timeout = max(timeout, 200)
         out = _parallel_collect_rows(
             futures_map, total_timeout=timeout, label="movies_search_combined",
         )
@@ -5288,12 +4743,7 @@ def _aggregate_one_item(item: dict[str, str], *, fast: bool) -> dict[str, Any]:
         "links": [],
     }
     try:
-        detail = movie_page_download_links(
-            item["source_key"],
-            item["page_url"],
-            fast=fast,
-            title=item.get("title", ""),
-        )
+        detail = movie_page_download_links(item["source_key"], item["page_url"], fast=fast)
         entry["links"] = detail["links"]
     except Exception as exc:
         log.error("movies_aggregate_links %s failed: %s", item["page_url"], exc)
@@ -5397,12 +4847,6 @@ MOVIE_SITE_REGISTRY: dict[str, dict[str, str]] = {
         "label": "AtoZ Cinemas",
         "env": "ATOZ_BASE_URL",
         "default": "https://atoz.cinemaz.workers.dev",
-        "health_path": "/",
-    },
-    "mkvbase": {
-        "label": "MkV Base",
-        "env": "MKVBASE_BASE_URL",
-        "default": "https://mkvbase.site",
         "health_path": "/",
     },
     "zeefliz": {

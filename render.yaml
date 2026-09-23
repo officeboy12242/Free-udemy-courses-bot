@@ -1,14 +1,10 @@
 services:
   - type: web
     name: telegram-course-bot
-    runtime: python
-    plan: free
-    branch: main
+    env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot_with_healthcheck.py
     envVars:
-      - key: MONGODB_URI
-        sync: false
       - key: BOT_TOKEN
         sync: false
       - key: CHANNEL_ID
@@ -18,12 +14,6 @@ services:
       - key: MOVIES_CHANNEL_ID
         sync: false
       - key: SCRAPER_API_KEY
-        sync: false
-      - key: ZENROWS_API_KEY
-        sync: false
-      - key: SCRAPINGBEE_API_KEY
-        sync: false
-      - key: BYPARR_URL
         sync: false
       - key: DIP_THRESHOLD_PERCENT
         value: "1"
@@ -35,18 +25,10 @@ services:
         value: "1"
       - key: PORT
         value: "10000"
-      - key: MOVIES_API_SOURCE_TIMEOUT
-        value: "45"
-      - key: MKVBASE_BASE_URL
-        value: "https://mkvbase.site"
-      - key: MKVBASE_SA_SESSION
-        value: "42427"
-      - key: MKVBASE_PROVIDER_TIMEOUT
-        value: "90"
       - key: HDHUB_BASE_URL
         sync: false
       - key: HDH_BASE_URL
-        sync: false
+        value: "https://4khdhub.one"
       - key: MD_BASE_URL
         sync: false
       - key: HDMOVIE2_BASE_URL

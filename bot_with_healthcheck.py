@@ -17,9 +17,6 @@ import re
 import requests
 from typing import Any
 from dotenv import load_dotenv
-
-load_dotenv()  # before movie_service — reads site base URLs from .env
-
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -116,8 +113,6 @@ from movie_service import (
     bollyflix_latest_movies, bollyflix_movie_links, format_bollyflix_message,
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
-    mkvbase_search, mkvbase_latest_movies, mkvbase_movie_links, format_mkvbase_message,
-    mkvbase_warm_cf,
     zeefliz_search, zeefliz_movie_links, zeefliz_latest_movies, format_zeefliz_message,
     hdhub_search, hdh_search, md_search, hdmovie2_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
@@ -125,7 +120,7 @@ from movie_service import (
     movie_page_download_links, movies_search_source, movies_search_with_links,
     list_movie_sites, set_site_url, format_sites_list_html,
     check_all_movie_sites, run_movie_site_monitor, MOVIE_SITE_REGISTRY,
-    init_movie_site_urls, run_startup_site_health,
+    init_movie_site_urls, init_ad_gate_hosts, run_startup_site_health,
 )
 from market_calendar import is_nse_trading_day
 from swing_service import (
@@ -145,6 +140,9 @@ from ai_analyzer import (
     daily_market_analysis, analyze_win_loss_pattern,
 )
 from market_regime import detect_regime, get_regime_emoji, get_strategy_description
+
+# ─── Load env ────────────────────────────────────────────────────────────────
+load_dotenv()
 
 BOT_TOKEN         = os.getenv("BOT_TOKEN")
 CHANNEL_ID        = os.getenv("CHANNEL_ID")
@@ -971,7 +969,6 @@ async def cmd_movies(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
         [InlineKeyboardButton("🚜 MoviesMod",                callback_data="msite_moviesmod")],
         [InlineKeyboardButton("🅰️ AtoZ Cinemas",            callback_data="msite_atoz")],
-        [InlineKeyboardButton("🗄️ MkV Base",               callback_data="msite_mkvbase")],
         [InlineKeyboardButton("🎬 ZeeFliz (Multi Audio)",    callback_data="msite_zeefliz")],
     ]
     await update.effective_message.reply_text(
@@ -1147,7 +1144,6 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     else bollyflix_latest_movies if source == "bolly"
                     else moviesmod_latest_movies if source == "moviesmod"
                     else atoz_latest_movies    if source == "atoz"
-                    else mkvbase_latest_movies if source == "mkvbase"
                     else zeefliz_latest_movies if source == "zeefliz"
                     else hdmovie2_latest_movies)
         movies = await asyncio.to_thread(fetch_fn, page)
@@ -1185,7 +1181,7 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         site_label = {"hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
                       "hdmovie2": "HDMovie2", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
                       "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
-                      "mkvbase": "MkV Base", "zeefliz": "ZeeFliz"}.get(source, source)
+                      "zeefliz": "ZeeFliz"}.get(source, source)
         await _edit_or_reply(
             f"🍿 <b>Latest Movies — {site_label}</b>  (page {page})\n\nTap a movie for download links:",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1210,7 +1206,6 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("🎞 BollyFlix",               callback_data="msite_bolly")],
             [InlineKeyboardButton("🚜 MoviesMod",               callback_data="msite_moviesmod")],
             [InlineKeyboardButton("🅰️ AtoZ Cinemas",            callback_data="msite_atoz")],
-            [InlineKeyboardButton("🗄️ MkV Base",               callback_data="msite_mkvbase")],
             [InlineKeyboardButton("🎬 ZeeFliz (Multi Audio)",    callback_data="msite_zeefliz")],
         ]
         await _edit_or_reply(
@@ -1271,11 +1266,6 @@ async def movie_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 elif source == "atoz":
                     detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
                     text = format_atoz_message(movie["title"], detail)
-                elif source == "mkvbase":
-                    detail = await asyncio.to_thread(
-                        mkvbase_movie_links, movie["url"], movie.get("title", ""),
-                    )
-                    text = format_mkvbase_message(movie["title"], detail)
                 elif source == "zeefliz":
                     detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
                     text = format_zeefliz_message(movie["title"], detail)
@@ -1374,8 +1364,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
          InlineKeyboardButton("🚜 MoviesMod",    callback_data="msrc_moviesmod")],
         [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz"),
-         InlineKeyboardButton("🗄️ MkV Base",    callback_data="msrc_mkvbase")],
-        [InlineKeyboardButton("🎬 ZeeFliz",      callback_data="msrc_zeefliz")],
+         InlineKeyboardButton("🎬 ZeeFliz",      callback_data="msrc_zeefliz")],
         [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
     ]
     await update.effective_message.reply_html(
@@ -1421,9 +1410,8 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("🎞 BollyFlix",    callback_data="msrc_bolly"),
              InlineKeyboardButton("🚜 MoviesMod",    callback_data="msrc_moviesmod")],
             [InlineKeyboardButton("🅰️ AtoZ Cinemas", callback_data="msrc_atoz"),
-             InlineKeyboardButton("🗄️ MkV Base",    callback_data="msrc_mkvbase")],
-            [InlineKeyboardButton("🎬 ZeeFliz",      callback_data="msrc_zeefliz"),
-             InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
+             InlineKeyboardButton("🎬 ZeeFliz",      callback_data="msrc_zeefliz")],
+            [InlineKeyboardButton("🔍 All Sites",    callback_data="msrc_both")],
         ]
         await _src_edit(
             f"🔍 Search for <b>{search_query}</b>\n\nChoose where to search:",
@@ -1441,7 +1429,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         "hdhub": "HDHub4u", "hdh": "4KHDHub", "md": "MoviesDrive",
         "hdmovie2": "HDMovie2", "vega": "Vegamovies", "sdmp": "SDMoviesPoint",
         "bolly": "BollyFlix", "moviesmod": "MoviesMod", "atoz": "AtoZ Cinemas",
-        "mkvbase": "MkV Base", "zeefliz": "ZeeFliz", "both": "All Sites",
+        "zeefliz": "ZeeFliz", "both": "All Sites",
     }.get(source, source)
     await _src_edit(
         f"🔍 Searching <b>{source_label}</b> for <b>{search_query}</b>…",
@@ -1458,7 +1446,6 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     bolly_results: list = []
     moviesmod_results: list = []
     atoz_results: list = []
-    mkvbase_results: list = []
     zeefliz_results: list = []
 
     if source == "hdhub":
@@ -1479,15 +1466,13 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
         moviesmod_results = await asyncio.to_thread(moviesmod_search, search_query, 10)
     elif source == "atoz":
         atoz_results = await asyncio.to_thread(atoz_search, search_query, 10)
-    elif source == "mkvbase":
-        mkvbase_results = await asyncio.to_thread(mkvbase_search, search_query, 10)
     elif source == "zeefliz":
         zeefliz_results = await asyncio.to_thread(zeefliz_search, search_query, 10)
     else:  # all sites
         (
             hdhub_results, hdh_results, md_results, hdmovie2_results,
             vega_results, sdmp_results, bolly_results, moviesmod_results,
-            atoz_results, mkvbase_results, zeefliz_results
+            atoz_results, zeefliz_results
         ) = await asyncio.gather(
             asyncio.to_thread(hdhub_search, search_query, 4),
             asyncio.to_thread(hdh_search,   search_query, 3),
@@ -1498,14 +1483,12 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             asyncio.to_thread(bollyflix_search, search_query, 3),
             asyncio.to_thread(moviesmod_search, search_query, 3),
             asyncio.to_thread(atoz_search, search_query, 3),
-            asyncio.to_thread(mkvbase_search, search_query, 3),
             asyncio.to_thread(zeefliz_search, search_query, 3),
         )
 
     if (not hdhub_results and not hdh_results and not md_results and not hdmovie2_results
             and not vega_results and not sdmp_results and not bolly_results
-            and not moviesmod_results and not atoz_results and not mkvbase_results
-            and not zeefliz_results):
+            and not moviesmod_results and not atoz_results and not zeefliz_results):
         await _src_edit(
             f"❌ No results found for <b>{search_query}</b> on {source_label}.",
             parse_mode="HTML",
@@ -1522,7 +1505,6 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     all_results.update({f"bolly_{i}": m for i, m in enumerate(bolly_results)})
     all_results.update({f"moviesmod_{i}": m for i, m in enumerate(moviesmod_results)})
     all_results.update({f"atoz_{i}": m for i, m in enumerate(atoz_results)})
-    all_results.update({f"mkvbase_{i}": m for i, m in enumerate(mkvbase_results)})
     all_results.update({f"zeefliz_{i}": m for i, m in enumerate(zeefliz_results)})
     context.user_data["search_results"] = all_results
 
@@ -1581,12 +1563,6 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
             title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
             keyboard.append([InlineKeyboardButton(f"🅰️ {title}", callback_data=f"msres_atoz_{i}")])
 
-    if mkvbase_results:
-        keyboard.append([InlineKeyboardButton("━━ MkV Base ━━", callback_data="msearch_noop")])
-        for i, m in enumerate(mkvbase_results):
-            title = m["title"][:50] + "…" if len(m["title"]) > 50 else m["title"]
-            keyboard.append([InlineKeyboardButton(f"🗄️ {title}", callback_data=f"msres_mkvbase_{i}")])
-
     if zeefliz_results:
         keyboard.append([InlineKeyboardButton("━━ ZeeFliz ━━", callback_data="msearch_noop")])
         for i, m in enumerate(zeefliz_results):
@@ -1600,8 +1576,7 @@ async def search_source_callback(update: Update, context: ContextTypes.DEFAULT_T
     total = (
         len(hdhub_results) + len(hdh_results) + len(md_results) + len(hdmovie2_results)
         + len(vega_results) + len(sdmp_results) + len(bolly_results)
-        + len(moviesmod_results) + len(atoz_results) + len(mkvbase_results)
-        + len(zeefliz_results)
+        + len(moviesmod_results) + len(atoz_results) + len(zeefliz_results)
     )
     await _src_edit(
         f"🔍 <b>{total} result{'s' if total != 1 else ''} for \"{search_query}\"</b>"
@@ -1644,7 +1619,7 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
     def _title_words(t: str) -> set:
         return set(_re.sub(r"[^a-z0-9 ]", "", t.lower()).split()[:5])
 
-    if source in ("hdmovie2", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "mkvbase", "zeefliz"):
+    if source in ("hdmovie2", "vega", "sdmp", "hdhub", "bolly", "moviesmod", "atoz", "zeefliz"):
         # Send processing message and run scraping in background
         processing_msg = await query.message.reply_text(
             "⏳ Fetching download links... This may take a moment.",
@@ -1673,11 +1648,6 @@ async def search_result_callback(update: Update, context: ContextTypes.DEFAULT_T
                 elif source == "atoz":
                     detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
                     text = format_atoz_message(movie["title"], detail)
-                elif source == "mkvbase":
-                    detail = await asyncio.to_thread(
-                        mkvbase_movie_links, movie["url"], movie.get("title", ""),
-                    )
-                    text = format_mkvbase_message(movie["title"], detail)
                 elif source == "zeefliz":
                     detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
                     text = format_zeefliz_message(movie["title"], detail)
@@ -1858,11 +1828,6 @@ async def _post_movie_to_channel(bot, channel: str, movie: dict, source: str) ->
         elif source == "atoz":
             detail = await asyncio.to_thread(atoz_movie_links, movie["url"])
             text = format_atoz_message(movie["title"], detail)
-        elif source == "mkvbase":
-            detail = await asyncio.to_thread(
-                mkvbase_movie_links, movie["url"], movie.get("title", ""),
-            )
-            text = format_mkvbase_message(movie["title"], detail)
         elif source == "zeefliz":
             detail = await asyncio.to_thread(zeefliz_movie_links, movie["url"])
             text = format_zeefliz_message(movie["title"], detail)
@@ -2004,8 +1969,6 @@ async def post_to_channel_callback(update: Update, context: ContextTypes.DEFAULT
                 src = "moviesmod"
             elif k.startswith("atoz_"):
                 src = "atoz"
-            elif k.startswith("mkvbase_"):
-                src = "mkvbase"
             elif k.startswith("zeefliz_"):
                 src = "zeefliz"
             else:
@@ -3575,15 +3538,6 @@ async def start_http_server(app: web.Application):
     )
 
 
-async def _warm_mkvbase_cf() -> None:
-    """Clear mkvbase Cloudflare once at boot so cold searches are not empty."""
-    try:
-        ok = await asyncio.to_thread(mkvbase_warm_cf)
-        log.info("mkvbase CF warm: %s", "ok" if ok else "failed (Chrome/Turnstile?)")
-    except Exception as exc:
-        log.warning("mkvbase CF warm error: %s", exc)
-
-
 async def _keep_alive() -> None:
     """Ping our own /health so Render's free tier doesn't idle-suspend us.
 
@@ -3792,9 +3746,10 @@ async def main():
     ensure_news_table()
     try:
         init_movie_site_urls()
-        log.info("Movie site URLs loaded (env + persisted overrides)")
+        init_ad_gate_hosts()
+        log.info("Movie site URLs + ad-gate hosts loaded")
     except Exception as exc:
-        log.warning("init_movie_site_urls failed: %s", exc)
+        log.warning("init_movie_site_urls/ad_gates failed: %s", exc)
     
     # Initialize bot pool for parallel downloads/uploads
     num_bots = await init_bot_pool()
@@ -3835,7 +3790,6 @@ async def main():
         asyncio.create_task(run_startup_site_health(bot)),
         asyncio.create_task(run_movie_site_monitor(bot)),
         asyncio.create_task(_keep_alive()),
-        asyncio.create_task(_warm_mkvbase_cf()),
     ]
     if MARKET_FEATURES_ENABLED:
         log.info(
