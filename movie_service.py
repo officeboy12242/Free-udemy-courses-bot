@@ -3627,9 +3627,21 @@ def _mkvbase_chrome_bin() -> str | None:
 
 
 def mkvbase_warm_cf() -> bool:
-    """Prime mkvbase access (Byparr/Chrome clearance or scrape-provider session)."""
+    """Prime mkvbase: open session and seed /api/links cookies (skips cold first search)."""
     try:
-        return _mkvbase_http() is not None
+        s = _mkvbase_http()
+        if s is None:
+            return False
+        # Provider path needs a real GET so mkv_* + cf_clearance land before user traffic.
+        if isinstance(s, _MkvProviderSession):
+            if s.cookies.get("mkv_client_key") and s.cookies.get("mkv_challenge"):
+                return True
+            r = s.get(f"{MKVBASE_BASE}/api/links", timeout=90)
+            _mkvbase_persist_provider(s)
+            ok = r is not None and getattr(r, "ok", False)
+            log.info("mkvbase warm seed HTTP %s", getattr(r, "status_code", None))
+            return bool(ok)
+        return True
     except Exception as exc:
         log.warning("mkvbase_warm_cf failed: %s", exc)
         return False
@@ -3842,7 +3854,15 @@ class _MkvCookieJar:
                     self._d[n] = urllib.parse.unquote(v)
 
 
-_MKVBASE_SA_SESSION = max(1, int(os.getenv("MKVBASE_SA_SESSION", "0") or (os.getpid() % 90_000 + 1)))
+# Sticky ZenRows/ScrapingBee IP across restarts (cf_clearance is IP-bound).
+_MKVBASE_SA_SESSION = max(
+    1,
+    int(
+        os.getenv("MKVBASE_SA_SESSION", "0")
+        or (42427 if os.getenv("RENDER") else (os.getpid() % 90_000 + 1))
+    ),
+)
+_MKVBASE_PROVIDER_TIMEOUT = max(30, int(os.getenv("MKVBASE_PROVIDER_TIMEOUT", "90") or 90))
 
 
 def _mkvbase_provider_name() -> str | None:
@@ -3856,11 +3876,45 @@ def _mkvbase_provider_name() -> str | None:
     return None
 
 
+def _mkvbase_persist_provider(session: "_MkvProviderSession") -> None:
+    """Cache provider cookies so warm/restart can skip a seed GET."""
+    if not session.cookies._d:
+        return
+    try:
+        _MKVBASE_CF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MKVBASE_CF_FILE.write_text(
+            json.dumps(
+                {
+                    "provider": session.provider,
+                    "session_id": _MKVBASE_SA_SESSION,
+                    "cookies": session.cookies._d,
+                }
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        log.debug("mkvbase: cannot cache provider cookies: %s", exc)
+
+
+def _mkvbase_load_provider(session: "_MkvProviderSession") -> None:
+    try:
+        data = json.loads(_MKVBASE_CF_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    if data.get("provider") != session.provider:
+        return
+    if int(data.get("session_id") or 0) != _MKVBASE_SA_SESSION:
+        return
+    cookies = data.get("cookies") or {}
+    if isinstance(cookies, dict):
+        session.cookies._d.update({str(k): str(v) for k, v in cookies.items() if v})
+
+
 def _mkvbase_provider_get(
     provider: str,
     url: str,
     *,
-    timeout: int = 120,
+    timeout: int = 90,
     headers: dict | None = None,
 ) -> Any:
     """GET url through a scrape provider that handles Cloudflare."""
@@ -3872,6 +3926,8 @@ def _mkvbase_provider_get(
             "js_render": "true",
             "premium_proxy": "true",
             "session_id": str(_MKVBASE_SA_SESSION),
+            # Skip heavy assets — cuts ZenRows time ~3–5× on mkvbase JSON.
+            "block_resources": "image,media,font,stylesheet",
         }
         # Forward Cookie / X-Requested-With so PoW search sees mkv_* cookies.
         if fwd:
@@ -3889,6 +3945,7 @@ def _mkvbase_provider_get(
             "render_js": "true",
             "premium_proxy": "true",
             "session_id": str(_MKVBASE_SA_SESSION),
+            "block_resources": "true",
         }
         return requests.get(
             "https://app.scrapingbee.com/api/v1/",
@@ -3915,8 +3972,9 @@ class _MkvProviderSession:
         self.provider = provider
         self.cookies = _MkvCookieJar()
         self.headers: dict[str, str] = {"Referer": f"{MKVBASE_BASE}/"}
+        _mkvbase_load_provider(self)
 
-    def get(self, url: str, timeout: int = 120, headers: dict | None = None, **_kw: Any) -> Any:
+    def get(self, url: str, timeout: int | None = None, headers: dict | None = None, **_kw: Any) -> Any:
         merged = dict(self.headers)
         if headers:
             merged.update(headers)
@@ -3928,13 +3986,15 @@ class _MkvProviderSession:
             merged["Cookie"] = cookie_hdr
         if "X-Requested-With" not in merged and "q=" in url:
             merged["X-Requested-With"] = "XMLHttpRequest"
+        to = timeout if timeout is not None else _MKVBASE_PROVIDER_TIMEOUT
         last_exc: Exception | None = None
+        # One retry only — double ZenRows burns 20–60s on free Render.
         for attempt in range(2):
             try:
-                r = _mkvbase_provider_get(
-                    self.provider, url, timeout=max(timeout, 180), headers=merged,
-                )
+                r = _mkvbase_provider_get(self.provider, url, timeout=to, headers=merged)
                 self.cookies.update_from_response(r)
+                if self.cookies.get("mkv_client_key"):
+                    _mkvbase_persist_provider(self)
                 return r
             except Exception as exc:
                 last_exc = exc
@@ -3942,7 +4002,8 @@ class _MkvProviderSession:
                     "mkvbase %s GET attempt %d failed: %s",
                     self.provider, attempt + 1, exc,
                 )
-                time.sleep(2 * (attempt + 1))
+                if attempt == 0:
+                    time.sleep(1)
         raise last_exc  # type: ignore[misc]
 
 
@@ -4017,7 +4078,11 @@ def _mkvbase_get(path: str, **kwargs) -> Any:
         if s is None:
             return None
         try:
-            r = s.get(MKVBASE_BASE + path, timeout=kwargs.pop("timeout", 150), **kwargs)
+            r = s.get(
+                MKVBASE_BASE + path,
+                timeout=kwargs.pop("timeout", _MKVBASE_PROVIDER_TIMEOUT),
+                **kwargs,
+            )
         except Exception as exc:
             log.warning("mkvbase GET %s failed: %s", path, exc)
             return None
