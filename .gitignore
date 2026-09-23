@@ -54,7 +54,14 @@ _append_*.py
 _quick_test.py
 _commit_msg.txt
 _*.html
+_*.py
+_*.json
+_*.txt
+_*.js
 *.html
 RENDER_ENV_SETUP.md
 
 .risk_bt_cache.pkl
+
+.mkvbase_cf.json
+.mkvbase_chrome_profile/
