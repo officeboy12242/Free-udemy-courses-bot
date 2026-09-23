@@ -1,9 +1,11 @@
 services:
   - type: web
     name: telegram-course-bot
-    runtime: docker  # Dockerfile: Chrome + Xvfb for mkvbase Cloudflare Turnstile
-    plan: standard   # Chrome needs RAM; starter/free often OOMs mid-Turnstile
+    runtime: python
+    plan: free
     branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_with_healthcheck.py
     envVars:
       - key: MONGODB_URI
         sync: false
@@ -17,6 +19,12 @@ services:
         sync: false
       - key: SCRAPER_API_KEY
         sync: false
+      - key: ZENROWS_API_KEY
+        sync: false
+      - key: SCRAPINGBEE_API_KEY
+        sync: false
+      - key: BYPARR_URL
+        sync: false
       - key: DIP_THRESHOLD_PERCENT
         value: "1"
       - key: MIN_DEEPER_STEP
@@ -27,6 +35,10 @@ services:
         value: "1"
       - key: PORT
         value: "10000"
+      - key: MOVIES_API_SOURCE_TIMEOUT
+        value: "45"
+      - key: MKVBASE_BASE_URL
+        value: "https://mkvbase.site"
       - key: HDHUB_BASE_URL
         sync: false
       - key: HDH_BASE_URL
@@ -45,13 +57,5 @@ services:
         sync: false
       - key: ZEEFLIZ_BASE_URL
         sync: false
-      - key: MKVBASE_BASE_URL
-        value: "https://mkvbase.site"
-      - key: MKVBASE_CF_CACHE
-        value: "/tmp/mkvbase_cf.json"
-      - key: CHROME_BIN
-        value: "/usr/bin/google-chrome-stable"
-      - key: DISPLAY
-        value: ":99"
     healthCheckPath: /health
     autoDeploy: true

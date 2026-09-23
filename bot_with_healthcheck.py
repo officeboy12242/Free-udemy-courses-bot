@@ -117,6 +117,7 @@ from movie_service import (
     moviesmod_latest_movies, moviesmod_movie_links, format_moviesmod_message,
     atoz_latest_movies, atoz_movie_links, format_atoz_message,
     mkvbase_search, mkvbase_latest_movies, mkvbase_movie_links, format_mkvbase_message,
+    mkvbase_warm_cf,
     zeefliz_search, zeefliz_movie_links, zeefliz_latest_movies, format_zeefliz_message,
     hdhub_search, hdh_search, md_search, hdmovie2_search, vega_search, sdmp_search,
     bollyflix_search, moviesmod_search, atoz_search,
@@ -3574,6 +3575,15 @@ async def start_http_server(app: web.Application):
     )
 
 
+async def _warm_mkvbase_cf() -> None:
+    """Clear mkvbase Cloudflare once at boot so cold searches are not empty."""
+    try:
+        ok = await asyncio.to_thread(mkvbase_warm_cf)
+        log.info("mkvbase CF warm: %s", "ok" if ok else "failed (Chrome/Turnstile?)")
+    except Exception as exc:
+        log.warning("mkvbase CF warm error: %s", exc)
+
+
 async def _keep_alive() -> None:
     """Ping our own /health so Render's free tier doesn't idle-suspend us.
 
@@ -3825,6 +3835,7 @@ async def main():
         asyncio.create_task(run_startup_site_health(bot)),
         asyncio.create_task(run_movie_site_monitor(bot)),
         asyncio.create_task(_keep_alive()),
+        asyncio.create_task(_warm_mkvbase_cf()),
     ]
     if MARKET_FEATURES_ENABLED:
         log.info(

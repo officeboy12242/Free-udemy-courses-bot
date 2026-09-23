@@ -57,6 +57,10 @@ log = logging.getLogger(__name__)
 # Sign up free at https://www.scraperapi.com  — 5,000 req/month free
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 SCRAPER_API_URL = "http://api.scraperapi.com"
+# ScraperAPI alternatives (mkvbase CF on Render free — no Chrome)
+ZENROWS_API_KEY = os.getenv("ZENROWS_API_KEY", "")
+SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY", "")
+BYPARR_URL = (os.getenv("BYPARR_URL") or os.getenv("FLARESOLVERR_URL") or "").rstrip("/")
 
 # Full browser-like headers to avoid 403 blocks
 HEADERS = {
@@ -3595,16 +3599,86 @@ _mkvbase_solve_failed_at = 0.0  # skip Chrome briefly after a failed solve
 
 
 def _mkvbase_chrome_bin() -> str | None:
-    return (
-        os.getenv("CHROME_BIN")
-        or shutil.which("google-chrome-stable")
-        or shutil.which("google-chrome")
-        or shutil.which("chromium")
-        or shutil.which("chromium-browser")
-    )
+    env = (os.getenv("CHROME_BIN") or "").strip().strip('"')
+    if env and Path(env).is_file():
+        return env
+    for name in (
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+    ):
+        found = shutil.which(name)
+        if found:
+            return found
+    if os.name == "nt":
+        for base in (
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            cand = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+            if cand.is_file():
+                return str(cand)
+    return None
 
 
-def _mkvbase_solve_cf() -> dict[str, str] | None:
+def mkvbase_warm_cf() -> bool:
+    """Prime mkvbase access (Byparr/Chrome clearance or scrape-provider session)."""
+    try:
+        return _mkvbase_http() is not None
+    except Exception as exc:
+        log.warning("mkvbase_warm_cf failed: %s", exc)
+        return False
+
+
+def _mkvbase_byparr_endpoint() -> str:
+    if not BYPARR_URL:
+        return ""
+    u = BYPARR_URL
+    if u.endswith("/v1"):
+        return u
+    return u + ("/v1" if u.endswith("/") else "/v1")
+
+
+def _mkvbase_solve_cf_byparr() -> dict[str, str] | None:
+    """FlareSolverr-compatible Byparr: returns {cf_clearance, ua} without local Chrome."""
+    endpoint = _mkvbase_byparr_endpoint()
+    if not endpoint:
+        return None
+    try:
+        r = requests.post(
+            endpoint,
+            json={"cmd": "request.get", "url": f"{MKVBASE_BASE}/", "maxTimeout": 60000},
+            timeout=75,
+        )
+        data = r.json() if r.content else {}
+    except Exception as exc:
+        log.warning("mkvbase Byparr solve failed: %s", exc)
+        return None
+    sol = data.get("solution") or {}
+    if data.get("status") not in ("ok", "OK", None) and not sol:
+        log.warning("mkvbase Byparr status=%s msg=%s", data.get("status"), data.get("message"))
+        return None
+    clearance = ""
+    for c in sol.get("cookies") or []:
+        if (c.get("name") or "") == "cf_clearance" and c.get("value"):
+            clearance = c["value"]
+            break
+    ua = (sol.get("userAgent") or "").strip()
+    if not clearance:
+        log.warning("mkvbase Byparr: no cf_clearance (status=%s)", data.get("status"))
+        return None
+    if not ua:
+        ua = HEADERS["User-Agent"]
+    log.info("mkvbase: Cloudflare cleared via Byparr")
+    return {"cf_clearance": clearance, "ua": ua}
+
+
+def _mkvbase_solve_cf_chrome() -> dict[str, str] | None:
     """Open Chrome on DISPLAY, wait for Turnstile, return {cf_clearance, ua}."""
     try:
         import nodriver as uc
@@ -3622,7 +3696,6 @@ def _mkvbase_solve_cf() -> dict[str, str] | None:
         return None
 
     async def run() -> dict[str, str] | None:
-        # Headless fails Turnstile. Containers: no sandbox + small /dev/shm.
         args = [
             "--disable-dev-shm-usage",
             "--no-first-run",
@@ -3643,7 +3716,7 @@ def _mkvbase_solve_cf() -> dict[str, str] | None:
             tab = await browser.get(f"{MKVBASE_BASE}/")
             title = ""
             clearance = ""
-            for _ in range(50):  # ~75s — Turnstile can be slow on cold Render dynos
+            for _ in range(50):
                 await asyncio.sleep(1.5)
                 try:
                     title = await tab.evaluate("document.title") or ""
@@ -3676,69 +3749,182 @@ def _mkvbase_solve_cf() -> dict[str, str] | None:
             await asyncio.sleep(1)
 
     try:
-        # Fresh loop: bot calls us via asyncio.to_thread (no running loop here).
         return asyncio.run(run())
     except Exception as exc:
         log.warning("mkvbase: Chrome Cloudflare solve failed: %s", exc)
         return None
 
 
+def _mkvbase_solve_cf() -> dict[str, str] | None:
+    """Clear Cloudflare: Byparr (no Chrome) → local Chrome."""
+    return _mkvbase_solve_cf_byparr() or _mkvbase_solve_cf_chrome()
+
+
+class _MkvCookieJar:
+    """Minimal cookie jar so PoW can read mkv_* the same way as curl_cffi."""
+
+    def __init__(self) -> None:
+        self._d: dict[str, str] = {}
+
+    def get(self, name: str, default: str = "") -> str:
+        return self._d.get(name, default)
+
+    def set(self, name: str, value: str, **_kw: Any) -> None:
+        self._d[name] = value
+
+    def update_from_response(self, resp: Any) -> None:
+        try:
+            for c in resp.cookies:
+                n = getattr(c, "name", None) or (c[0] if isinstance(c, tuple) else None)
+                v = getattr(c, "value", None) or (c[1] if isinstance(c, tuple) else None)
+                if n and v:
+                    self._d[str(n)] = str(v)
+        except Exception:
+            pass
+        raw = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie") or ""
+        for part in re.split(r",(?=\s*[^;=]+=)", raw) if raw else []:
+            nv = part.split(";", 1)[0]
+            if "=" in nv:
+                n, v = nv.split("=", 1)
+                n, v = n.strip(), v.strip()
+                if n.startswith("mkv_") or n == "cf_clearance":
+                    self._d[n] = urllib.parse.unquote(v)
+
+
+_MKVBASE_SA_SESSION = max(1, int(os.getenv("MKVBASE_SA_SESSION", "0") or (os.getpid() % 90_000 + 1)))
+
+
+def _mkvbase_provider_name() -> str | None:
+    """ScraperAPI alternatives for free hosts (no Chrome). Prefer ZenRows → ScrapingBee → ScraperAPI."""
+    if ZENROWS_API_KEY:
+        return "zenrows"
+    if SCRAPINGBEE_API_KEY:
+        return "scrapingbee"
+    if SCRAPER_API_KEY:
+        return "scraperapi"
+    return None
+
+
+def _mkvbase_provider_get(provider: str, url: str, *, timeout: int = 60, headers: dict | None = None) -> Any:
+    """GET url through a scrape provider that handles Cloudflare."""
+    if provider == "zenrows":
+        params = {
+            "apikey": ZENROWS_API_KEY,
+            "url": url,
+            "js_render": "true",
+            "premium_proxy": "true",
+            "session_id": str(_MKVBASE_SA_SESSION),
+        }
+        return requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout, headers=headers or {})
+    if provider == "scrapingbee":
+        params = {
+            "api_key": SCRAPINGBEE_API_KEY,
+            "url": url,
+            "render_js": "true",
+            "premium_proxy": "true",
+            "session_id": str(_MKVBASE_SA_SESSION),
+        }
+        return requests.get("https://app.scrapingbee.com/api/v1/", params=params, timeout=timeout, headers=headers or {})
+    if provider == "scraperapi":
+        params = {
+            "api_key": SCRAPER_API_KEY,
+            "url": url,
+            "render": "true",
+            "session_number": str(_MKVBASE_SA_SESSION),
+            "keep_headers": "true",
+        }
+        return requests.get(SCRAPER_API_URL, params=params, timeout=timeout, headers=headers or {})
+    raise ValueError(f"unknown mkvbase provider {provider}")
+
+
+class _MkvProviderSession:
+    """Sticky scrape-provider session; cookies accumulate for PoW."""
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        self.cookies = _MkvCookieJar()
+        self.headers: dict[str, str] = {"Referer": f"{MKVBASE_BASE}/"}
+
+    def get(self, url: str, timeout: int = 60, headers: dict | None = None, **_kw: Any) -> Any:
+        merged = dict(self.headers)
+        if headers:
+            merged.update(headers)
+        # Pass known mkv_* cookies when the provider supports a Cookie header.
+        cookie_hdr = "; ".join(f"{k}={v}" for k, v in self.cookies._d.items() if k.startswith("mkv_") or k == "cf_clearance")
+        if cookie_hdr:
+            merged["Cookie"] = cookie_hdr
+        r = _mkvbase_provider_get(self.provider, url, timeout=timeout, headers=merged)
+        self.cookies.update_from_response(r)
+        return r
+
+
 def _mkvbase_http(*, fresh: bool = False) -> Any:
-    """curl_cffi session carrying cf_clearance (cached file, else a Chrome solve)."""
+    """Session for mkvbase: curl_cffi+cf_clearance, else ZenRows/ScrapingBee/ScraperAPI."""
     global _mkvbase_session, _mkvbase_solve_failed_at
-    if not _CFFI_AVAILABLE:
-        log.warning("mkvbase: curl_cffi required")
-        return None
     with _mkvbase_lock:
         if _mkvbase_session is not None and not fresh:
             return _mkvbase_session
-        cf = None
-        if not fresh:
-            try:
-                cf = json.loads(_MKVBASE_CF_FILE.read_text(encoding="utf-8"))
-                if not cf.get("cf_clearance") or not cf.get("ua"):
+
+        # 1) Byparr/Chrome → curl_cffi with cf_clearance
+        if _CFFI_AVAILABLE:
+            cf = None
+            if not fresh:
+                try:
+                    cf = json.loads(_MKVBASE_CF_FILE.read_text(encoding="utf-8"))
+                    if not cf.get("cf_clearance") or not cf.get("ua"):
+                        cf = None
+                except (OSError, ValueError, TypeError):
                     cf = None
-            except (OSError, ValueError, TypeError):
-                cf = None
-        if not cf:
-            # Short backoff so a failed deploy can retry within a couple minutes
-            if time.time() - _mkvbase_solve_failed_at < 120:
-                return None
-            cf = _mkvbase_solve_cf()
             if not cf:
-                _mkvbase_solve_failed_at = time.time()
-                return None
-            try:
-                _MKVBASE_CF_FILE.parent.mkdir(parents=True, exist_ok=True)
-                _MKVBASE_CF_FILE.write_text(json.dumps(cf), encoding="utf-8")
-            except OSError as exc:
-                log.warning("mkvbase: cannot cache cf_clearance: %s", exc)
-        host = urlparse(MKVBASE_BASE).hostname or "mkvbase.site"
-        s = cffi_requests.Session(impersonate="chrome")
-        s.headers.update({"User-Agent": cf["ua"], "Referer": f"{MKVBASE_BASE}/"})
-        # Only cf_clearance: the site issues its own mkv_* crypto cookies, and
-        # seeding stale ones creates duplicates that fail its PoW check.
-        s.cookies.set("cf_clearance", cf["cf_clearance"], domain="." + host)
-        _mkvbase_session = s
-        _mkvbase_solve_failed_at = 0.0
-        return s
+                if time.time() - _mkvbase_solve_failed_at >= 120:
+                    cf = _mkvbase_solve_cf()
+                    if not cf:
+                        _mkvbase_solve_failed_at = time.time()
+                    else:
+                        try:
+                            _MKVBASE_CF_FILE.parent.mkdir(parents=True, exist_ok=True)
+                            _MKVBASE_CF_FILE.write_text(json.dumps(cf), encoding="utf-8")
+                        except OSError as exc:
+                            log.warning("mkvbase: cannot cache cf_clearance: %s", exc)
+            if cf:
+                host = urlparse(MKVBASE_BASE).hostname or "mkvbase.site"
+                s = cffi_requests.Session(impersonate="chrome")
+                s.headers.update({"User-Agent": cf["ua"], "Referer": f"{MKVBASE_BASE}/"})
+                s.cookies.set("cf_clearance", cf["cf_clearance"], domain="." + host)
+                _mkvbase_session = s
+                _mkvbase_solve_failed_at = 0.0
+                return s
+
+        # 2) Scrape-provider path (Render free — no Chrome; ScraperAPI alternative)
+        provider = _mkvbase_provider_name()
+        if provider:
+            log.info("mkvbase: using scrape provider %s", provider)
+            _mkvbase_session = _MkvProviderSession(provider)
+            _mkvbase_solve_failed_at = 0.0
+            return _mkvbase_session
+
+        log.warning(
+            "mkvbase: no CF path (set BYPARR_URL, ZENROWS_API_KEY, SCRAPINGBEE_API_KEY, "
+            "or Chrome+DISPLAY)"
+        )
+        return None
 
 
 def _mkvbase_get(path: str, **kwargs) -> Any:
-    """GET on mkvbase; one Chrome re-solve if Cloudflare rejects the clearance."""
+    """GET on mkvbase; re-solve once if Cloudflare challenge HTML comes back."""
     global _mkvbase_session
     for fresh in (False, True):
         s = _mkvbase_http(fresh=fresh)
         if s is None:
             return None
         try:
-            r = s.get(MKVBASE_BASE + path, timeout=25, **kwargs)
+            r = s.get(MKVBASE_BASE + path, timeout=kwargs.pop("timeout", 60), **kwargs)
         except Exception as exc:
             log.warning("mkvbase GET %s failed: %s", path, exc)
             return None
         if "Just a moment" not in (r.text or "")[:500]:
             return r
-        log.info("mkvbase: cf_clearance rejected — re-solving with Chrome")
+        log.info("mkvbase: Cloudflare challenge — refreshing session")
         _mkvbase_session = None
         try:
             _MKVBASE_CF_FILE.unlink(missing_ok=True)
@@ -4752,9 +4938,12 @@ def movies_search_combined(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for source_label, search_fn, source_key in sources:
             # MoviesDrive/4KHDHub need a bit more than the default fast budget.
+            # mkvbase may need a cold Cloudflare Turnstile solve (~60–90s) once.
             src_budget = per_src
             if fast and source_key in ("md", "hdh"):
                 src_budget = max(per_src, 14)
+            if source_key == "mkvbase":
+                src_budget = max(src_budget, 90)
             fut = pool.submit(
                 _call_timed,
                 src_budget,
@@ -4770,6 +4959,9 @@ def movies_search_combined(
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
         if fast:
             timeout = max(timeout, 14)
+        # Allow mkvbase CF solve to finish in the combined wait.
+        if any(k == "mkvbase" for _, _, k in sources):
+            timeout = max(timeout, 95)
         out = _parallel_collect_rows(
             futures_map, total_timeout=timeout, label="movies_search_combined",
         )
