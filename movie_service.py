@@ -3781,12 +3781,29 @@ class _MkvCookieJar:
                     self._d[str(n)] = str(v)
         except Exception:
             pass
-        raw = resp.headers.get("Set-Cookie") or resp.headers.get("set-cookie") or ""
-        for part in re.split(r",(?=\s*[^;=]+=)", raw) if raw else []:
-            nv = part.split(";", 1)[0]
-            if "=" in nv:
+        # ZenRows forwards target cookies as Zr-Cookies / Zr-Set-Cookie (not Set-Cookie).
+        chunks: list[str] = []
+        for key in (
+            "Set-Cookie", "set-cookie",
+            "Zr-Cookies", "Zr-Set-Cookie", "zr-cookies", "zr-set-cookie",
+        ):
+            val = resp.headers.get(key)
+            if not val:
+                continue
+            if isinstance(val, (list, tuple)):
+                chunks.extend(str(x) for x in val)
+            else:
+                chunks.append(str(val))
+        for raw in chunks:
+            # Cookie header: a=b; c=d  OR Set-Cookie: a=b; Path=/; ...
+            for part in re.split(r";(?=\s*[^;=]+=)", raw):
+                nv = part.split(";", 1)[0].strip()
+                if "=" not in nv:
+                    continue
                 n, v = nv.split("=", 1)
                 n, v = n.strip(), v.strip()
+                if n.lower() in ("path", "domain", "expires", "max-age", "secure", "httponly", "samesite"):
+                    continue
                 if n.startswith("mkv_") or n == "cf_clearance":
                     self._d[n] = urllib.parse.unquote(v)
 
@@ -3807,29 +3824,32 @@ def _mkvbase_provider_name() -> str | None:
 
 def _mkvbase_provider_get(provider: str, url: str, *, timeout: int = 60, headers: dict | None = None) -> Any:
     """GET url through a scrape provider that handles Cloudflare."""
+    # /api/* is JSON — premium proxy clears CF; js_render burns credits and is unnecessary.
+    need_js = "/api/" not in url
     if provider == "zenrows":
         params = {
             "apikey": ZENROWS_API_KEY,
             "url": url,
-            "js_render": "true",
             "premium_proxy": "true",
             "session_id": str(_MKVBASE_SA_SESSION),
         }
+        if need_js:
+            params["js_render"] = "true"
         return requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout, headers=headers or {})
     if provider == "scrapingbee":
         params = {
             "api_key": SCRAPINGBEE_API_KEY,
             "url": url,
-            "render_js": "true",
             "premium_proxy": "true",
             "session_id": str(_MKVBASE_SA_SESSION),
+            "render_js": "true" if need_js else "false",
         }
         return requests.get("https://app.scrapingbee.com/api/v1/", params=params, timeout=timeout, headers=headers or {})
     if provider == "scraperapi":
         params = {
             "api_key": SCRAPER_API_KEY,
             "url": url,
-            "render": "true",
+            "render": "true" if need_js else "false",
             "session_number": str(_MKVBASE_SA_SESSION),
             "keep_headers": "true",
         }
