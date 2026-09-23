@@ -39,6 +39,10 @@ services:
         value: "45"
       - key: MKVBASE_BASE_URL
         value: "https://mkvbase.site"
+      - key: MKVBASE_SA_SESSION
+        value: "42427"
+      - key: MKVBASE_PROVIDER_TIMEOUT
+        value: "90"
       - key: HDHUB_BASE_URL
         sync: false
       - key: HDH_BASE_URL
