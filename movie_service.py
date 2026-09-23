@@ -3928,9 +3928,22 @@ class _MkvProviderSession:
             merged["Cookie"] = cookie_hdr
         if "X-Requested-With" not in merged and "q=" in url:
             merged["X-Requested-With"] = "XMLHttpRequest"
-        r = _mkvbase_provider_get(self.provider, url, timeout=max(timeout, 150), headers=merged)
-        self.cookies.update_from_response(r)
-        return r
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                r = _mkvbase_provider_get(
+                    self.provider, url, timeout=max(timeout, 180), headers=merged,
+                )
+                self.cookies.update_from_response(r)
+                return r
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "mkvbase %s GET attempt %d failed: %s",
+                    self.provider, attempt + 1, exc,
+                )
+                time.sleep(2 * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
 
 
 def _mkvbase_http(*, fresh: bool = False) -> Any:
