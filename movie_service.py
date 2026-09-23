@@ -4004,7 +4004,7 @@ def _mkvbase_get(path: str, **kwargs) -> Any:
         if s is None:
             return None
         try:
-            r = s.get(MKVBASE_BASE + path, timeout=kwargs.pop("timeout", 120), **kwargs)
+            r = s.get(MKVBASE_BASE + path, timeout=kwargs.pop("timeout", 150), **kwargs)
         except Exception as exc:
             log.warning("mkvbase GET %s failed: %s", path, exc)
             return None
@@ -5029,7 +5029,7 @@ def movies_search_combined(
             if fast and source_key in ("md", "hdh"):
                 src_budget = max(per_src, 14)
             if source_key == "mkvbase":
-                src_budget = max(src_budget, 90)
+                src_budget = max(src_budget, 180)
             fut = pool.submit(
                 _call_timed,
                 src_budget,
@@ -5045,9 +5045,9 @@ def movies_search_combined(
         timeout = MOVIES_API_SOURCE_TIMEOUT if fast else 45
         if fast:
             timeout = max(timeout, 14)
-        # Allow mkvbase CF solve to finish in the combined wait.
+        # ZenRows mkvbase: seed + PoW search can take ~3 minutes cold.
         if any(k == "mkvbase" for _, _, k in sources):
-            timeout = max(timeout, 95)
+            timeout = max(timeout, 200)
         out = _parallel_collect_rows(
             futures_map, total_timeout=timeout, label="movies_search_combined",
         )
